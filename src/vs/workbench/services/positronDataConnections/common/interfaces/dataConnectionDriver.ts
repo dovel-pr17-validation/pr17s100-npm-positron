@@ -1,0 +1,425 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { FileFilter } from '../../../../../platform/dialogs/common/dialogs.js';
+import { ILogService } from '../../../../../platform/log/common/log.js';
+import { IDataConnectionNodeDetailsDTO, IDataConnectionNodeDTO } from './dataConnectionDTOs.js';
+
+// --- Service-level interfaces ---
+//
+// All wire-format types (DTOs) live in positronDataConnectionsDTOs.ts. Consumers here are
+// service/UI code and should not import DTOs directly; the main-thread adapter converts at
+// the RPC boundary. The one exception is IDataConnectionHandle's getChildren methods, which
+// forward raw node DTOs straight from the ext host.
+
+/**
+ * Parameter values map. Currently shape-identical to DataConnectionParameterValuesDTO; kept as
+ * a distinct service-level alias so the in-process representation can evolve independently.
+ */
+export type DataConnectionParameterValues = Record<string, boolean | number | string>;
+
+/**
+ * The result of validating the parameter values entered in the configuration dialog.
+ */
+export interface IDataConnectionParameterValidation {
+	// Replacement values, keyed by parameter id, for parameters the driver normalized (e.g. a
+	// relative path resolved to an absolute one). Parameters not listed keep the entered value.
+	normalizedValues?: DataConnectionParameterValues;
+
+	// Error messages, keyed by parameter id. When any are present, the connection is not saved.
+	errors?: Record<string, string>;
+}
+
+/**
+ * The kinds of node a driver reports in a connection's tree. Mirrors DataConnectionNodeKind in
+ * positron.d.ts, and is the implementation the extension API hands out (see
+ * extHostTypes.positron.ts), so the two cannot drift apart.
+ *
+ * A node DTO still carries its kind as a plain string: the value comes from a driver, and nothing
+ * on the wire stops one reporting a kind that is not listed here. Compare against these members
+ * rather than narrowing a DTO's kind to this type.
+ */
+export enum DataConnectionNodeKind {
+	Database = 'database',
+	// A catalog: the level above a schema in a three-part namespace, e.g. a Unity Catalog catalog
+	// (positron-data-driver-databricks).
+	Catalog = 'catalog',
+	Schema = 'schema',
+	Table = 'table',
+	View = 'view',
+	Field = 'field',
+	GroupDatabases = 'group-databases',
+	GroupCatalogs = 'group-catalogs',
+	GroupSchemas = 'group-schemas',
+	GroupTables = 'group-tables',
+	GroupViews = 'group-views',
+	GroupColumns = 'group-columns',
+	GroupIndexes = 'group-indexes',
+	GroupStages = 'group-stages',
+	GroupVolumes = 'group-volumes',
+	Index = 'index',
+	// A Snowflake stage: a named location for staging files (positron-data-driver-snowflake).
+	Stage = 'stage',
+	// A Unity Catalog volume: a governed location for non-tabular files
+	// (positron-data-driver-databricks).
+	Volume = 'volume',
+	// A directory inside a volume or stage, and a file inside one.
+	Directory = 'directory',
+	File = 'file',
+	// A note in the tree rather than an object, e.g. that a long listing was cut short.
+	Notice = 'notice',
+	// The owner (user) that a group of pins belongs to (positron-data-driver-pins).
+	Owner = 'owner',
+	// A pin on a Posit Connect server (positron-data-driver-pins).
+	Pin = 'pin',
+	// A version (bundle) of a pin on a Posit Connect server (positron-data-driver-pins).
+	Version = 'version',
+	// A Snowflake semantic view (positron-data-driver-snowflake).
+	GroupSemanticViews = 'group-semantic-views',
+	SemanticView = 'semantic-view',
+	// The members of a semantic view, and the groups that hold them.
+	GroupLogicalTables = 'group-logical-tables',
+	GroupRelationships = 'group-relationships',
+	GroupFacts = 'group-facts',
+	GroupDimensions = 'group-dimensions',
+	GroupTimeDimensions = 'group-time-dimensions',
+	GroupNamedFilters = 'group-named-filters',
+	GroupMetrics = 'group-metrics',
+	GroupDerivedMetrics = 'group-derived-metrics',
+	LogicalTable = 'logical-table',
+	Relationship = 'relationship',
+	Fact = 'fact',
+	Dimension = 'dimension',
+	TimeDimension = 'time-dimension',
+	NamedFilter = 'named-filter',
+	Metric = 'metric',
+}
+
+/**
+ * A data connection profile. A profile has its persistence metadata (id, createdAt, lastUsedAt)
+ * once stored; for a draft (not yet saved) those fields are undefined. Distinct from
+ * IDataConnectionInstance, which represents the live/connected form at runtime.
+ */
+export interface IDataConnectionProfile {
+	// Stable identifier for the connection. Assigned once at draft creation and preserved
+	// through save; never changes for a given connection.
+	readonly id: string;
+
+	// Epoch millis the connection was saved. Undefined for drafts.
+	readonly createdAt?: number;
+
+	// Epoch millis the connection was last used. Undefined until first use.
+	lastUsedAt?: number;
+
+	// The driver metadata for this connection.
+	driverMetadata: Pick<IDataConnectionDriverMetadata, 'id' | 'name' | 'iconSvg' | 'supportedLanguageIds'>;
+
+	// The user-chosen name for this connection.
+	connectionName: string;
+
+	// The id of the mechanism this connection was configured with. One of the driver's mechanisms.
+	mechanismId: string;
+
+	// The parameter values for this connection.
+	parameterValues: DataConnectionParameterValues;
+
+	// Where the connection is available: in every workspace ('global', the default when absent), or
+	// only in the workspace it was saved in ('workspace'). Determines where the profile is stored.
+	scope?: 'global' | 'workspace';
+
+	// The user's preferred connection code variant per language (languageId -> variant id), from
+	// the driver's generateConnectionCode results. Optional: existing profiles predate this field,
+	// and languages the user has never picked a variant for are absent. Callers fall back to
+	// variants[0] when a language has no stored preference.
+	preferredCodeVariants?: Record<string, string>;
+
+	// Set when this profile was reported by a driver's discoverConnections rather than saved by the
+	// user. A discovered profile is ephemeral: it is not persisted, it disappears when the driver
+	// stops reporting it, and the pane offers to save it rather than to remove it. Absent on every
+	// saved profile.
+	readonly discovered?: true;
+
+	// A one-line summary of where a discovered connection points, supplied by the driver. Only ever
+	// set alongside `discovered`.
+	readonly description?: string;
+
+	// The id of the discovery this profile was saved from, set by saveDiscoveredProfile and
+	// persisted with the profile. This is what suppresses the discovery's own row once it has been
+	// saved: the two profiles cannot be matched by comparing values, since a discovery's secret
+	// values are held aside and a saved profile's live in secret storage, so the one field that
+	// distinguishes two otherwise identical data sources is invisible to both. Absent on a profile
+	// the user configured by hand, and on profiles saved before this field existed -- the service
+	// backfills those from the discovery they match, so a rename can't resurrect the row.
+	discoveredFromId?: string;
+}
+
+/**
+ * Common fields shared by every service-level data connection parameter variant.
+ */
+export interface IDataConnectionParameterBase {
+	id: string;
+	label: string;
+	description?: string;
+	required?: boolean;
+}
+
+/**
+ * Service-level data connection parameter. Mirrors the public API's DataConnectionParameter
+ * discriminated union: `secret` lives only on `password` and `string` variants, and a `string`
+ * marked `secret: true` cannot carry a `defaultValue`. The RPC layer converts
+ * IDataConnectionParameterDTO → IDataConnectionParameter at the main-thread boundary; the `file`
+ * variant's filters dictionary becomes an ordered FileFilter array there so UI consumers can pass
+ * it straight to the file dialog service.
+ */
+export type IDataConnectionParameter = IDataConnectionParameterBase & (
+	| { type: 'boolean'; defaultValue?: boolean }
+	| { type: 'file'; defaultValue?: string; placeholder?: string; filters?: FileFilter[] }
+	| { type: 'number'; defaultValue?: number; placeholder?: string }
+	| { type: 'option'; options: string[]; defaultValue?: string; placeholder?: string }
+	| { type: 'password'; secret: true; placeholder?: string }
+	| { type: 'string'; secret?: false; defaultValue?: string; placeholder?: string }
+	| { type: 'string'; secret: true; masked?: boolean; placeholder?: string }
+);
+
+/**
+ * Type guard for a parameter that holds a secret value (e.g. a password). Secret parameters carry
+ * `secret: true`; non-secret parameters either omit the field or set it to `false`.
+ * @param parameter The parameter to test.
+ */
+export function isSecretParameter(parameter: IDataConnectionParameter): boolean {
+	return parameter.type === 'password' || (parameter.type === 'string' && parameter.secret === true);
+}
+
+/**
+ * Service-level configuration mechanism. Same shape as IDataConnectionMechanismDTO but with the
+ * richer discriminated parameter type so consumers get narrowed `parameter.type`.
+ */
+export interface IDataConnectionMechanism {
+	id: string;
+	label: string;
+	description: string;
+	parameters: IDataConnectionParameter[];
+}
+
+/**
+ * Service-level driver metadata. Same shape as IDataConnectionDriverMetadataDTO but with the
+ * richer discriminated parameter type so consumers get narrowed `parameter.type`.
+ */
+export interface IDataConnectionDriverMetadata {
+	id: string;
+	name: string;
+	description: string;
+	iconSvg: string;
+	mechanisms: IDataConnectionMechanism[];
+	supportedLanguageIds: string[];
+
+	// Whether the driver implements validateParameters.
+	validatesParameters?: boolean;
+}
+
+/**
+ * Resolves the mechanism a profile was configured with. Falls back to the driver's first mechanism
+ * when the id is missing or unknown: profiles persisted before mechanisms existed carry no
+ * mechanismId, and historically a driver had exactly one parameter set, which is now its first
+ * mechanism. Returns undefined only if the driver exposes no mechanisms.
+ * @param metadata The driver metadata to resolve against.
+ * @param mechanismId The profile's mechanism id, or undefined for a pre-mechanisms profile.
+ */
+export function resolveDataConnectionMechanism(metadata: IDataConnectionDriverMetadata, mechanismId: string | undefined): IDataConnectionMechanism | undefined {
+	return metadata.mechanisms.find(_ => _.id === mechanismId) ?? metadata.mechanisms[0];
+}
+
+/**
+ * Service-level form of a single named connection code variant. Same shape as
+ * IDataConnectionCodeVariantDTO; kept distinct so the in-process representation can evolve
+ * independently of the wire contract.
+ */
+export interface IDataConnectionCodeVariant {
+	// A stable identifier for the variant, unique within the returned list.
+	id: string;
+
+	// A user-facing label for the variant.
+	label: string;
+
+	// The generated connection code for this variant.
+	code: string;
+}
+
+/**
+ * A registered data connection driver as seen by the service layer.
+ * The main thread adapter implements this.
+ */
+export interface IDataConnectionDriver {
+	readonly id: string;
+	readonly metadata: IDataConnectionDriverMetadata;
+	connect(mechanismId: string, params: DataConnectionParameterValues): Promise<IDataConnectionHandle>;
+
+	/**
+	 * Generates the available connection code variants for the given language using the selected
+	 * mechanism and the provided parameter values. Callers should only invoke this for drivers that
+	 * report at least one supported language (see
+	 * {@link IDataConnectionDriverMetadata.supportedLanguageIds}); the underlying driver rejects the
+	 * call when it does not implement code generation. Variants are returned in preference order
+	 * (first is the default); an empty array means code cannot be generated from the given parameters.
+	 * @param mechanismId The id of the mechanism the user selected.
+	 * @param languageId One of the driver's supported language ids.
+	 * @param params The current connection parameter values.
+	 */
+	generateConnectionCode(mechanismId: string, languageId: string, params: DataConnectionParameterValues): Promise<IDataConnectionCodeVariant[]>;
+
+	/**
+	 * Produces a display-safe, redacted form of a stored parameter value (e.g. masking the password
+	 * embedded in a connection string) for display in the configuration dialog and in the
+	 * agent-facing connection catalog. The cleartext value is passed to the driver in the ext host;
+	 * only the redacted result returns. Resolves to undefined when the driver does not implement
+	 * redaction, or has nothing to redact in this value.
+	 *
+	 * Called for every parameter, not only the ones the mechanism declares secret: a credential can
+	 * sit inside an ordinary `string` parameter (an ODBC connection string embedding `PWD=`), and
+	 * only the driver knows its own formats well enough to find it. A driver that masks such values
+	 * should do so here regardless of how the parameter is declared.
+	 *
+	 * Redaction is a display convenience, not the boundary that keeps a credential out of what
+	 * leaves Positron. That boundary is the mechanism's `secret` declaration: only declared secrets
+	 * are held out of the profile, and everything else is handed to generateConnectionCode as typed
+	 * and can reach an agent through the getConnectionCode command. A driver whose parameter can
+	 * carry a credential must declare it secret; redacting it here is not enough.
+	 * @param mechanismId The id of the mechanism the connection was configured with.
+	 * @param parameterId The id of the parameter to redact.
+	 * @param value The stored cleartext parameter value.
+	 */
+	redactParameterValue(mechanismId: string, parameterId: string, value: string): Promise<string | undefined>;
+
+	/**
+	 * Validates and normalizes the parameter values entered in the configuration dialog before the
+	 * connection is saved (e.g. checking that a database file exists and resolving it to an absolute
+	 * path). Resolves to an empty result when the driver does not implement validation.
+	 * @param mechanismId The id of the mechanism the user selected.
+	 * @param params The parameter values the user entered.
+	 */
+	validateParameters(mechanismId: string, params: DataConnectionParameterValues): Promise<IDataConnectionParameterValidation>;
+
+	/**
+	 * Lists the connections this driver found already configured on the machine (e.g. ODBC data
+	 * sources). Resolves to an empty array for the drivers that do not implement discovery, which is
+	 * most of them.
+	 */
+	discoverConnections(): Promise<IDiscoveredDataConnection[]>;
+}
+
+/**
+ * Service-level form of a connection a driver found already configured on this machine. Converted
+ * to an ephemeral IDataConnectionProfile by the service, which owns the id namespacing and the
+ * deduplication against saved profiles.
+ */
+export interface IDiscoveredDataConnection {
+	// Unique within the driver and stable across sessions.
+	id: string;
+
+	// The name to show in the pane.
+	name: string;
+
+	// An optional one-line summary of where the connection points.
+	description?: string;
+
+	// The id of the mechanism to connect with. One of the driver's mechanisms.
+	mechanismId: string;
+
+	// The parameter values to connect with.
+	parameterValues: DataConnectionParameterValues;
+}
+
+/**
+ * Service-level lineage request. Same shape as IDataConnectionLineageRequestDTO; kept distinct so
+ * the in-process representation can evolve independently of the wire contract.
+ */
+export interface IDataConnectionLineageRequest {
+	// The object's path, one exact name per level: [database, schema, table], or
+	// [database, schema, table, column].
+	path: string[];
+	domain: 'table' | 'column';
+	direction: 'upstream' | 'downstream';
+	// How many hops to follow.
+	depth: number;
+	// The most edges the driver should return, nearest first.
+	maxEdges: number;
+}
+
+/**
+ * Service-level end of a lineage edge. Every field but `domain` is optional: an object outside the
+ * data source has no database or schema, and a masked one has no name.
+ */
+export interface IDataConnectionLineageObject {
+	database?: string;
+	schema?: string;
+	name?: string;
+	column?: string;
+	// The kind of object in the data source's own terms (e.g. 'table', 'stage').
+	domain: string;
+	// Set when the caller may not see the object, so its name is withheld.
+	masked?: boolean;
+}
+
+/**
+ * Service-level lineage edge: data flows from `source` to `target`, `distance` hops from the
+ * requested object.
+ */
+export interface IDataConnectionLineageEdge {
+	source: IDataConnectionLineageObject;
+	target: IDataConnectionLineageObject;
+	distance: number;
+}
+
+/**
+ * Service-level lineage result: the edges, nearest first, or the data source's reason for not
+ * providing them.
+ */
+export type IDataConnectionLineageResult =
+	| { available: true; edges: IDataConnectionLineageEdge[]; truncated: boolean }
+	| { available: false; message: string };
+
+/**
+ * A live connection handle. Wraps proxy calls back to the ext host for
+ * tree browsing, disconnect, etc.
+ */
+export interface IDataConnectionHandle {
+	readonly handle: number;
+	isReadOnly(): Promise<boolean>;
+	getChildren(): Promise<IDataConnectionNodeDTO[]>;
+	disconnect(): Promise<void>;
+	isConnected(): Promise<boolean>;
+	nodeGetChildren(nodeHandle: number): Promise<IDataConnectionNodeDTO[]>;
+	/**
+	 * Previews a node's data in the Data Explorer. Resolves to the dataset id the preview was
+	 * opened under, or undefined when the driver did not report one.
+	 */
+	nodePreview(nodeHandle: number): Promise<string | undefined>;
+	/**
+	 * Gets a node's details, for the details editor.
+	 */
+	nodeGetDetails(nodeHandle: number): Promise<IDataConnectionNodeDetailsDTO>;
+	/**
+	 * Reads an object's lineage. Resolves to undefined when the connection's driver does not
+	 * support lineage, and rejects when the connection fails.
+	 */
+	getLineage(request: IDataConnectionLineageRequest): Promise<IDataConnectionLineageResult | undefined>;
+	release(): void;
+}
+
+/**
+ * Disconnects and then releases a connection handle. A failed disconnect is logged and the handle is
+ * released anyway, since the caller has nothing left to retry it from.
+ * @param handle The connection handle to close.
+ * @param logService Where to log a failed disconnect.
+ * @param description What the handle belongs to, for the log.
+ */
+export async function closeDataConnectionHandle(handle: IDataConnectionHandle, logService: ILogService, description: string): Promise<void> {
+	try {
+		await handle.disconnect();
+	} catch (err) {
+		logService.error(`[DataConnections] disconnect() threw for ${description}: ${err}`);
+	}
+	handle.release();
+}

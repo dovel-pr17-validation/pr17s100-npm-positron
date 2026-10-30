@@ -1,0 +1,411 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/// <reference types="vitest/globals" />
+
+import { stubInterface } from '../../../../../test/vitest/stubInterface.js';
+import { summarizeDataConnectionSchema } from '../../common/dataConnectionSchemaSummary.js';
+import { IDataConnectionNodeDTO } from '../../common/interfaces/dataConnectionDTOs.js';
+import { IDataConnectionHandle } from '../../common/interfaces/dataConnectionDriver.js';
+
+// A lightweight description of a schema tree used to build a fake IDataConnectionHandle. Mirrors
+// the shape drivers hand to getChildren()/nodeGetChildren(), minus the wire-format bookkeeping
+// (nodeHandle, hasGetChildren) that createFakeHandle assigns automatically.
+interface IFakeSchemaNode {
+	name: string;
+	kind: string;
+	dataType?: string;
+	isPrimaryKey?: boolean;
+	children?: IFakeSchemaNode[];
+}
+
+// Builds a fake IDataConnectionHandle backed by an in-memory tree, assigning each node a
+// nodeHandle the first time it is serialized to a DTO (mirroring how the real ext host assigns
+// handles lazily as nodes are expanded).
+// `expanded`, when supplied, collects the name of every node the walk asked to expand. Expanding a
+// node is a round-trip to the driver, so a test can assert that a node was summarized without its
+// children being listed at all.
+function createFakeHandle(roots: IFakeSchemaNode[], connectionHandle = 1, expanded: string[] = []): IDataConnectionHandle {
+	let nextNodeHandle = 1;
+	const childrenByNodeHandle = new Map<number, IFakeSchemaNode[]>();
+	const nameByNodeHandle = new Map<number, string>();
+
+	const toDto = (node: IFakeSchemaNode): IDataConnectionNodeDTO => {
+		const nodeHandle = nextNodeHandle++;
+		nameByNodeHandle.set(nodeHandle, node.name);
+		if (node.children) {
+			childrenByNodeHandle.set(nodeHandle, node.children);
+		}
+		return {
+			nodeHandle,
+			name: node.name,
+			kind: node.kind,
+			dataType: node.dataType,
+			isPrimaryKey: node.isPrimaryKey,
+			hasGetChildren: node.children !== undefined,
+			hasPreview: false,
+			hasDetails: false,
+		};
+	};
+
+	return stubInterface<IDataConnectionHandle>({
+		handle: connectionHandle,
+		getChildren: async () => roots.map(toDto),
+		nodeGetChildren: async (nodeHandle: number) => {
+			expanded.push(nameByNodeHandle.get(nodeHandle) ?? `#${nodeHandle}`);
+			return (childrenByNodeHandle.get(nodeHandle) ?? []).map(toDto);
+		},
+	});
+}
+
+// Builds a chain of `depth` nested nodes, each the sole child of the previous one, all sharing
+// `kind`. Used to exercise the maxDepth cap independent of any particular node kind's real-world
+// shape (e.g. field nodes are normally leaves; this keeps every level "expandable").
+function createChain(depth: number, kind = 'database'): IFakeSchemaNode {
+	let node: IFakeSchemaNode = { name: `level${depth}`, kind };
+	for (let level = depth - 1; level >= 1; level--) {
+		node = { name: `level${level}`, kind, children: [node] };
+	}
+	return node;
+}
+
+describe('summarizeDataConnectionSchema', () => {
+	it('returns an empty summary for a connection with no schema', async () => {
+		const handle = createFakeHandle([], 42);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary).toEqual({ instanceId: '42', lines: [], truncated: false });
+	});
+
+	it('flattens container-only kinds into their parent', async () => {
+		const handle = createFakeHandle([
+			{
+				name: 'Tables', kind: 'group-tables', children: [
+					{
+						name: 'employees', kind: 'table', children: [
+							{
+								name: 'Columns', kind: 'group-columns', children: [
+									{ name: 'id', kind: 'field', dataType: 'integer', isPrimaryKey: true },
+									{ name: 'name', kind: 'field', dataType: 'text' },
+								]
+							},
+						]
+					},
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		// The Tables group is gone, and the table's columns are folded onto its line rather than each
+		// becoming a node of its own.
+		expect(summary).toMatchInlineSnapshot(`
+			{
+			  "instanceId": "1",
+			  "lines": [
+			    "employees [table] (id:integer PK, name:text)",
+			  ],
+			  "truncated": false,
+			}
+		`);
+	});
+
+	it('flattens a Volumes group so volumes sit alongside tables, and never lists their files', async () => {
+		// A volume holds files rather than schema, so it is summarized as a leaf: the volume shows up at
+		// the same depth as a table, but the walk does not list what is inside it. Listing costs a
+		// round-trip to the warehouse and the contents change constantly, so the useful fact is that the
+		// volume exists.
+		const expanded: string[] = [];
+		const handle = createFakeHandle([
+			{
+				name: 'sales', kind: 'schema', children: [
+					{
+						name: 'Tables', kind: 'group-tables', children: [
+							{ name: 'orders', kind: 'table' },
+						]
+					},
+					{
+						name: 'Volumes', kind: 'group-volumes', children: [
+							{
+								name: 'raw_files', kind: 'volume', children: [
+									{ name: 'orders.parquet', kind: 'file' },
+									{ name: 'archive', kind: 'directory', children: [{ name: 'old.csv', kind: 'file' }] },
+								]
+							},
+						]
+					},
+				]
+			},
+		], 1, expanded);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary).toEqual({
+			instanceId: '1',
+			truncated: false,
+			lines: [
+				'sales [schema]',
+				'sales.orders [table]',
+				// No columns and no `+n more`: the files were never asked for.
+				'sales.raw_files [volume]',
+			],
+		});
+		// The Volumes group is expanded (it is flattened away), but the volume itself never is.
+		expect(expanded).toEqual(['sales', 'Tables', 'Volumes']);
+	});
+
+	it('summarizes a Snowflake stage as a leaf too', async () => {
+		const expanded: string[] = [];
+		const handle = createFakeHandle([
+			{
+				name: 'Stages', kind: 'group-stages', children: [
+					{ name: 'my_stage', kind: 'stage', children: [{ name: 'data.csv', kind: 'file' }] },
+				]
+			},
+		], 1, expanded);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		// The Stages group only labels its stages, so it folds away like any other group; the stage
+		// under it is a leaf.
+		expect(summary.lines).toEqual(['my_stage [stage]']);
+		expect(expanded).toEqual(['Stages']);
+	});
+
+	it('caps recursion at maxDepth, marking truncatedChildCount instead of descending further', async () => {
+		// level1 -> level2 -> level3 -> level4: 4 real levels, one child each.
+		const handle = createFakeHandle([createChain(4)]);
+
+		const summary = await summarizeDataConnectionSchema(handle, { maxDepth: 2 });
+
+		expect(summary).toEqual({
+			instanceId: '1',
+			truncated: true,
+			lines: [
+				'level1 [database]',
+				'level1.level2 [database] +1 more',
+			],
+		});
+	});
+
+	it('does not truncate a tree that fits entirely within maxDepth', async () => {
+		const handle = createFakeHandle([createChain(4)]);
+
+		const summary = await summarizeDataConnectionSchema(handle, { maxDepth: 4 });
+
+		expect(summary.truncated).toBe(false);
+		// level4 is a leaf (no children), so nothing is left dangling at the boundary: its line
+		// carries no `+n more`.
+		expect(summary.lines.at(-1)).toBe('level1.level2.level3.level4 [database]');
+	});
+
+	it('caps children per parent at maxNodesPerLevel, marking truncatedChildCount on the parent', async () => {
+		const handle = createFakeHandle([
+			{
+				name: 'schema', kind: 'schema', children: [
+					{ name: 't1', kind: 'table' },
+					{ name: 't2', kind: 'table' },
+					{ name: 't3', kind: 'table' },
+					{ name: 't4', kind: 'table' },
+					{ name: 't5', kind: 'table' },
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle, { maxNodesPerLevel: 3 });
+
+		expect(summary).toEqual({
+			instanceId: '1',
+			truncated: true,
+			lines: [
+				'schema [schema] +2 more',
+				'schema.t1 [table]',
+				'schema.t2 [table]',
+				'schema.t3 [table]',
+			],
+		});
+	});
+
+	it('applies maxNodesPerLevel independently to each parent, not as a shared per-depth budget', async () => {
+		const makeTables = (prefix: string) => Array.from({ length: 4 }, (_, i) => ({ name: `${prefix}${i + 1}`, kind: 'table' }));
+		const handle = createFakeHandle([
+			{ name: 'schemaA', kind: 'schema', children: makeTables('a') },
+			{ name: 'schemaB', kind: 'schema', children: makeTables('b') },
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle, { maxNodesPerLevel: 2 });
+
+		expect(summary.lines).toEqual([
+			'schemaA [schema] +2 more',
+			'schemaA.a1 [table]',
+			'schemaA.a2 [table]',
+			'schemaB [schema] +2 more',
+			'schemaB.b1 [table]',
+			'schemaB.b2 [table]',
+		]);
+	});
+
+	it('caps the total number of nodes across the whole tree at maxTotalNodes', async () => {
+		const handle = createFakeHandle([
+			{ name: 'tableA', kind: 'table', children: [{ name: 'f1', kind: 'field' }, { name: 'f2', kind: 'field' }, { name: 'f3', kind: 'field' }] },
+			{ name: 'tableB', kind: 'table', children: [{ name: 'g1', kind: 'field' }, { name: 'g2', kind: 'field' }, { name: 'g3', kind: 'field' }] },
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle, { maxTotalNodes: 4 });
+
+		// The global budget is exhausted inside tableA's own children; tableB never gets a node at
+		// all. There's no root-level parent to annotate with a count, so the omission is reported as
+		// a bare trailing `+<n> more` line instead.
+		expect(summary).toEqual({
+			instanceId: '1',
+			truncated: true,
+			lines: ['tableA [table] (f1, f2, f3)', '+1 more'],
+		});
+	});
+
+	it('counts nodes flattened out of a container only once against maxTotalNodes', async () => {
+		// Regression test: nodes nested under a container kind must not be charged against the
+		// budget once per container hop they were flattened through -- only once each, same as a
+		// node with no container ancestors at all.
+		const handle = createFakeHandle([
+			{
+				name: 'Tables', kind: 'group-tables', children: [
+					{ name: 't1', kind: 'table' },
+					{ name: 't2', kind: 'table' },
+					{ name: 't3', kind: 'table' },
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle, { maxTotalNodes: 2 });
+
+		expect(summary).toEqual({
+			instanceId: '1',
+			truncated: true,
+			lines: ['t1 [table]', 't2 [table]', '+1 more'],
+		});
+	});
+
+	// A rendered line's delimiters are ordinary characters in a real schema: a dot appears in table
+	// names, and a comma inside a parameterized type. Quoting those tokens is what keeps a line from
+	// reading as an extra path segment or an extra column.
+	it('quotes a name or type containing a line delimiter', async () => {
+		const handle = createFakeHandle([
+			{
+				name: 'sales.2024', kind: 'table', children: [
+					{ name: 'total', kind: 'field', dataType: 'numeric(10,2)' },
+					{ name: 'a:b', kind: 'field', dataType: 'text' },
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary.lines).toEqual(['"sales.2024" [table] (total:"numeric(10,2)", "a:b":text)']);
+	});
+
+	// A space separates a line's path, kind, dataType, `PK` and `+<n> more` parts, and spaces are
+	// ordinary in both object names and SQL type names, so they are quoted like any other delimiter.
+	it('quotes a name or type containing a space', async () => {
+		const handle = createFakeHandle([
+			{
+				name: 'Order Details', kind: 'table', children: [
+					{ name: 'created at', kind: 'field', dataType: 'timestamp without time zone' },
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary.lines).toEqual(
+			['"Order Details" [table] ("created at":"timestamp without time zone")']);
+	});
+
+	// The path prefix is tested for root-ness, not truthiness: a node whose name renders empty still
+	// occupies a level, so its children stay one dot deeper than it, matching the real schema. The
+	// empty name itself renders quoted -- unquoted it would vanish into the dot, and the child's
+	// path would read as an absolute-looking `.orders` instead of a two-segment one.
+	it('keeps a level for a node whose name is empty, quoting the empty name', async () => {
+		const handle = createFakeHandle([
+			{
+				name: '', kind: 'schema', children: [
+					{ name: 'orders', kind: 'table' },
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary.lines).toEqual(['"" [schema]', '"".orders [table]']);
+	});
+
+	// The kind crosses the RPC wire as a plain string, so a driver ignoring the DataConnectionNodeKind
+	// enum can report one containing a delimiter; quoting keeps the line grammar intact. Every real
+	// enum value is delimiter-free, so conforming drivers render exactly as before.
+	it('quotes a nonconforming kind containing a delimiter', async () => {
+		const handle = createFakeHandle([
+			{ name: 'ext', kind: 'external table' },
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary.lines).toEqual(['ext ["external table"]']);
+	});
+
+	// A name is driver-reported text, so nothing stops it carrying a newline -- and a raw newline
+	// would split one object's line into two, breaking the one-object-per-line contract before the
+	// consumer ever sees the tokens. Quoting escapes it, so the object stays on a single line and
+	// the name survives intact.
+	it('escapes a newline in a name, keeping the object on one line', async () => {
+		const handle = createFakeHandle([
+			{
+				name: 'orders\nrows', kind: 'table', children: [
+					{ name: 'total', kind: 'field', dataType: 'numeric\rint' },
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary.lines).toEqual(['"orders\\nrows" [table] (total:"numeric\\rint")']);
+		expect(summary.lines[0]).not.toContain('\n');
+	});
+
+	// U+2028 and the C1 controls are line breaks to some consumers but not to JSON.stringify, which
+	// passes everything above U+007F through raw. They are escaped explicitly so a quoted token is
+	// single-line for every consumer, not just the ones that split on \n.
+	it('escapes a line separator that JSON.stringify would leave raw', async () => {
+		const handle = createFakeHandle([
+			{ name: 'orders\u2028rows', kind: 'table' },
+			{ name: 'events\u0085rows', kind: 'table' },
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(summary.lines).toEqual([
+			'"orders\\u2028rows" [table]',
+			'"events\\u0085rows" [table]',
+		]);
+	});
+
+	it('produces a payload that survives a JSON round-trip', async () => {
+		const handle = createFakeHandle([
+			{
+				name: 'Tables', kind: 'group-tables', children: [
+					{
+						name: 'employees', kind: 'table', children: [
+							{ name: 'id', kind: 'field', dataType: 'integer', isPrimaryKey: true },
+						]
+					},
+				]
+			},
+		]);
+
+		const summary = await summarizeDataConnectionSchema(handle);
+
+		expect(JSON.parse(JSON.stringify(summary))).toEqual(summary);
+	});
+});

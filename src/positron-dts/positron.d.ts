@@ -1,0 +1,5378 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2023-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/// <reference path="../vscode-dts/vscode.proposed.chatParticipantAdditions.d.ts" />
+/// <reference path="../vscode-dts/vscode.proposed.chatParticipantPrivate.d.ts" />
+/// <reference path="../vscode-dts/vscode.proposed.chatProvider.d.ts" />
+/// <reference path="../vscode-dts/vscode.proposed.languageModelThinkingPart.d.ts" />
+
+declare module 'positron' {
+
+	import * as vscode from 'vscode';
+
+	/**
+	 * The current Positron version. This is the Positron calendar version, e.g. "2028.10.2"
+	 */
+	export const version: string;
+
+	/**
+	 * The Positron build number. This is a monotonically increasing number that uniquely
+	 * identifies a build of Positron within a release.
+	 */
+	export const buildNumber: number;
+
+	/** The set of possible language runtime messages */
+	export enum LanguageRuntimeMessageType {
+		/** A message instructing the frontend to clear the output of a runtime execution. */
+		ClearOutput = 'clear_output',
+
+		/** A message representing output (text, plots, etc.) */
+		Output = 'output',
+
+		/** A message representing the computational result of a runtime execution */
+		Result = 'result',
+
+		/** A message representing output from one of the standard streams (stdout or stderr) */
+		Stream = 'stream',
+
+		/** A message representing echoed user input */
+		Input = 'input',
+
+		/** A message representing an error that occurred while executing user code */
+		Error = 'error',
+
+		/** A message representing a prompt for user input */
+		Prompt = 'prompt',
+
+		/** A message representing a change in the runtime's online state */
+		State = 'state',
+
+		/** A message representing a runtime event */
+		Event = 'event',
+
+		/** A message representing a new comm (client instance) being opened from the runtime side */
+		CommOpen = 'comm_open',
+
+		/** A message representing data received via a comm (to a client instance) */
+		CommData = 'comm_data',
+
+		/** A message indicating that a comm (client instance) was closed from the server side */
+		CommClosed = 'comm_closed',
+
+		/** A message representing a debug event to the frontend */
+		DebugEvent = 'debug_event',
+
+		/** A message representing a debug reply to the frontend */
+		DebugReply = 'debug_reply',
+
+		/** A message that should be handled by an IPyWidget */
+		IPyWidget = 'ipywidget',
+
+		/** A message representing a request to update an output */
+		UpdateOutput = 'update_output',
+
+		/**
+		 * A message announcing that something other than Positron submitted
+		 * code to the runtime, sent before the code's echo and output arrive.
+		 */
+		ExecutionRequested = 'execution_requested',
+	}
+
+	/**
+	 * The set of possible statuses for a language runtime while online
+	 */
+	export enum RuntimeOnlineState {
+		/** The runtime is starting up */
+		Starting = 'starting',
+
+		/** The runtime is ready to execute code. */
+		Idle = 'idle',
+
+		/** The runtime is busy executing code. */
+		Busy = 'busy',
+	}
+
+	/**
+	 * The set of possible statuses for a language runtime
+	 */
+	export enum RuntimeState {
+		/** The runtime has not been started or initialized yet. */
+		Uninitialized = 'uninitialized',
+
+		/** The runtime is initializing (preparing to start). */
+		Initializing = 'initializing',
+
+		/** The runtime is in the process of starting up. It isn't ready for messages. */
+		Starting = 'starting',
+
+		/** The runtime has a heartbeat and is ready for messages. */
+		Ready = 'ready',
+
+		/** The runtime is ready to execute code. */
+		Idle = 'idle',
+
+		/** The runtime is busy executing code. */
+		Busy = 'busy',
+
+		/** The runtime is in the process of restarting. */
+		Restarting = 'restarting',
+
+		/** The runtime is in the process of shutting down. */
+		Exiting = 'exiting',
+
+		/** The runtime's host process has ended. */
+		Exited = 'exited',
+
+		/** The runtime is not responding to heartbeats and is presumed offline. */
+		Offline = 'offline',
+
+		/** The user has interrupted a busy runtime, but the runtime is not idle yet. */
+		Interrupting = 'interrupting',
+	}
+
+	/**
+	 * Results of analyzing code fragment for completeness
+	 */
+	export enum RuntimeCodeFragmentStatus {
+		/** The code fragment is complete: it is a valid, self-contained expression */
+		Complete = 'complete',
+
+		/** The code is incomplete: it is an expression that is missing elements or operands, such as "1 +" or "foo(" */
+		Incomplete = 'incomplete',
+
+		/** The code is invalid: an expression that cannot be parsed because of a syntax error */
+		Invalid = 'invalid',
+
+		/** It was not possible to ascertain the code fragment's status */
+		Unknown = 'unknown'
+	}
+
+	/**
+	 * Possible code execution modes for a language runtime
+	 */
+	export enum RuntimeCodeExecutionMode {
+		/**
+		 * Interactive code execution:
+		 *          Displayed to user: Yes
+		 * Combined with pending code: Yes
+		 *          Stored in history: Yes
+		 */
+		Interactive = 'interactive',
+
+		/**
+		 * Non-interactive code execution:
+		 *          Displayed to user: Yes
+		 * Combined with pending code: No
+		 *          Stored in history: Yes
+		 */
+		NonInteractive = 'non-interactive',
+
+		/**
+		 * Transient code execution:
+		 *          Displayed to user: Yes
+		 * Combined with pending code: No
+		 *          Stored in history: No
+		 */
+		Transient = 'transient',
+
+		/**
+		 * Silent code execution:
+		 *          Displayed to user: No
+		 * Combined with pending code: No
+		 *          Stored in history: No
+		 */
+		Silent = 'silent',
+
+		/**
+		 * Unprocessed code execution: behaves exactly like `Interactive`
+		 * (displayed to the user, stored in history), except the code has NOT
+		 * been checked for completeness. A session receiving this mode must
+		 * check completeness itself before executing; if the code is
+		 * incomplete it must not execute it and must reject the `execute()`
+		 * call with an error whose `name` is `'CodeIncompleteError'`. Sessions
+		 * that cannot check completeness should treat `Unprocessed` exactly as
+		 * `Interactive` (the interpreter will surface a syntax error for
+		 * incomplete code).
+		 *
+		 *          Displayed to user: Yes
+		 * Combined with pending code: Yes
+		 *          Stored in history: Yes
+		 */
+		Unprocessed = 'unprocessed'
+	}
+
+	/**
+	 * Possible error dispositions for a language runtime
+	 */
+	export enum RuntimeErrorBehavior {
+		/** The runtime should stop when an error is encountered. */
+		Stop = 'stop',
+
+		/** The runtime should continue execution when an error is encountered */
+		Continue = 'continue',
+	}
+
+	/**
+	 * Describes what should happen when code is submitted for evaluation while
+	 * the target runtime is busy (i.e. not idle).
+	 */
+	export enum RuntimeBusyBehavior {
+		/**
+		 * The code should be queued and evaluated when the runtime next becomes
+		 * idle. This is the default behavior.
+		 */
+		Queue = 'queue',
+
+		/**
+		 * The evaluation should be rejected with an error instead of being
+		 * queued. Use this when running code against a stale view of the
+		 * session state is unacceptable and the caller would rather fail closed.
+		 */
+		Reject = 'reject',
+	}
+
+	/**
+	 * Possible reasons a language runtime could exit.
+	 */
+	export enum RuntimeExitReason {
+		/** The runtime exited because it could not start correctly. */
+		StartupFailed = 'startupFailed',
+
+		/** The runtime is shutting down at the request of the user. */
+		Shutdown = 'shutdown',
+
+		/** The runtime exited because it was forced to quit. */
+		ForcedQuit = 'forcedQuit',
+
+		/** The runtime is exiting in order to restart. */
+		Restart = 'restart',
+
+		/** The runtime is exiting in order to switch to a new runtime. */
+		SwitchRuntime = 'switchRuntime',
+
+		/** The runtime exited because of an error, most often a crash. */
+		Error = 'error',
+
+		/**
+		 * The runtime session was transferred somewhere else. This happens when
+		 * it is loaded into a different Positron window; it 'exits' from the
+		 * old window and is reconnected in the new window.
+		 */
+		Transferred = 'transferred',
+
+		/** The runtime exited because the extension hosting it was stopped. */
+		ExtensionHost = 'extensionHost',
+
+		/**
+		 * The runtime exited for an unknown reason. This typically means that
+		 * it exited unexpectedly but with a normal exit code (0).
+		 */
+		Unknown = 'unknown',
+	}
+
+	/**
+	 * A position in a document using UTF-8 byte offsets.
+	 * This is used to losslessly communicate file or line offsets to backends.
+	 */
+	export interface Utf8Position {
+		/** 0-based line number */
+		readonly line: number;
+		/** 0-based column offset in UTF-8 bytes */
+		readonly character: number;
+	}
+
+	/**
+	 * A range in a document using UTF-8 byte offsets for character positions.
+	 */
+	export interface Utf8Range {
+		readonly start: Utf8Position;
+		readonly end: Utf8Position;
+	}
+
+	/**
+	 * A location in a document using UTF-8 byte offsets for character positions.
+	 *
+	 * This is a variant of vscode.Location where character offsets are in UTF-8 bytes
+	 * rather than UTF-16 code units. Use this when communicating with kernels that
+	 * need byte-based source positions.
+	 */
+	export interface Utf8Location {
+		readonly uri: vscode.Uri;
+		readonly range: Utf8Range;
+	}
+
+	/**
+	 * LanguageRuntimeExit is an interface that defines an event occurring when a
+	 * language runtime exits.
+	 */
+	export interface LanguageRuntimeExit {
+		/** Runtime name */
+		runtime_name: string;
+
+		/** Session name */
+		session_name: string;
+
+		/**
+		 * The process exit code, if the runtime is backed by a process. If the
+		 * runtime is not backed by a process, this should just be 0 for a
+		 * succcessful exit and 1 for an error.
+		 */
+		exit_code: number;
+
+		/**
+		 * The reason the runtime exited.
+		 */
+		reason: RuntimeExitReason;
+
+		/** The exit message, if any. */
+		message: string;
+	}
+
+	/**
+	 * LanguageRuntimeMessage is an interface that defines an event occurring in a
+	 * language runtime, such as outputting text or plots.
+	 */
+	export interface LanguageRuntimeMessage {
+		/** The event ID */
+		id: string;
+
+		/** The ID of this event's parent (the event that caused it), if applicable */
+		parent_id: string;
+
+		/** The message's date and time, in ISO 8601 format */
+		when: string;
+
+		/** The type of event */
+		type: LanguageRuntimeMessageType;
+
+		/** Additional metadata, if any */
+		metadata?: Record<string, unknown>;
+
+		/** Additional binary data, if any */
+		buffers?: Array<Uint8Array>;
+	}
+
+	/**
+	 * RuntimeResourceUsage represents resource usage information for a language runtime.
+	 */
+	export interface RuntimeResourceUsage {
+		/**
+		 * CPU usage percentage for the kernel and its children.
+		 */
+		cpu_percent: number;
+
+		/**
+		 * Memory usage in bytes for the kernel and its children.
+		 */
+		memory_bytes: number;
+
+		/**
+		 * Number of threads used by the kernel and its children.
+		 */
+		thread_count: number;
+
+		/**
+		 * Sampling period in milliseconds for the resource usage data.
+		 */
+		sampling_period_ms: number;
+
+		/**
+		 * Timestamp of the resource usage data in milliseconds since epoch.
+		 */
+		timestamp: number;
+
+		/**
+		 * The OS process ID of the kernel, if known. Used to avoid
+		 * double-counting kernel memory in the Positron process tree.
+		 */
+		process_id?: number;
+	}
+
+	/**
+	 * LanguageRuntimeClearOutput is a LanguageRuntimeMessage instructing the frontend to clear the
+	 * output of a runtime execution. */
+	export interface LanguageRuntimeClearOutput extends LanguageRuntimeMessage {
+		/** Wait to clear the output until new output is available. */
+		wait: boolean;
+	}
+
+	/** LanguageRuntimeOutput is a LanguageRuntimeMessage representing output (text, plots, etc.) */
+	export interface LanguageRuntimeOutput extends LanguageRuntimeMessage {
+		/** A record of data MIME types to the associated data, e.g. `text/plain` => `'hello world'` */
+		data: Record<string, unknown>;
+
+		/**
+		 * Optional metadata about the output itself, keyed by MIME type. This is
+		 * distinct from {@link LanguageRuntimeMessage.metadata}, which describes
+		 * the message more generally. It corresponds to the `metadata` field of a
+		 * Jupyter `display_data`/`execute_result` message, e.g.
+		 * `{ 'image/png': { width: 640, height: 480 } }`.
+		 */
+		outputMetadata?: Record<string, unknown>;
+
+		/**
+		 * The optional identifier of the output. If specified, this output can be referenced
+		 * in future messages e.g. when {@link LanguageRuntimeUpdateOutput updating an output}.
+		 */
+		output_id?: string;
+	}
+
+	/**
+	 * LanguageRuntimeUpdateOutput is a LanguageRuntimeMessage instructing the frontend
+	 * to update an existing output.
+	 */
+	export interface LanguageRuntimeUpdateOutput extends LanguageRuntimeMessage {
+		/** The updated output data */
+		data: Record<string, unknown>;
+
+		/** The identifier of the output to update */
+		output_id: string;
+	}
+
+	/**
+	 * LanguageRuntimeResult is a LanguageRuntimeOutput representing the computational result of a
+	 * runtime execution.
+	 */
+	export interface LanguageRuntimeResult extends LanguageRuntimeOutput {
+		/** The execution count. */
+		execution_count: number;
+	}
+
+	/**
+	 * The set of possible output locations for a LanguageRuntimeOutput.
+	 */
+	export enum PositronOutputLocation {
+		/** The output should be displayed inline in Positron's Console */
+		Console = 'console',
+
+		/** The output should be displayed in Positron's Viewer pane */
+		Viewer = 'viewer',
+
+		/** The output should be displayed in Positron's Plots pane */
+		Plot = 'plot',
+	}
+
+	/**
+	 * LanguageRuntimeWebOutput amends LanguageRuntimeOutput with additional information needed
+	 * to render web content in Positron.
+	 */
+	export interface LanguageRuntimeWebOutput extends LanguageRuntimeOutput {
+		/** Where the web output should be displayed */
+		output_location: PositronOutputLocation;
+
+		/** The set of resource roots needed to display the output */
+		resource_roots: vscode.Uri[];
+	}
+
+	/**
+	 * The set of standard stream names supported for streaming textual output.
+	 */
+	export enum LanguageRuntimeStreamName {
+		Stdout = 'stdout',
+		Stderr = 'stderr'
+	}
+
+	/**
+	 * LanguageRuntimeStream is a LanguageRuntimeMessage representing output from a standard stream
+	 * (stdout or stderr).
+	 */
+	export interface LanguageRuntimeStream extends LanguageRuntimeMessage {
+		/** The stream name */
+		name: LanguageRuntimeStreamName;
+
+		/** The stream's text */
+		text: string;
+	}
+
+	/** LanguageRuntimeInput is a LanguageRuntimeMessage representing echoed user input */
+	export interface LanguageRuntimeInput extends LanguageRuntimeMessage {
+		/** The code that was input */
+		code: string;
+
+		/** The execution count */
+		execution_count: number;
+	}
+
+	/**
+	 * LanguageRuntimeExecutionRequested is a LanguageRuntimeMessage announcing
+	 * that code was submitted to the runtime by something other than Positron,
+	 * such as an external coding agent working through Positron's MCP server.
+	 *
+	 * Its `parent_id` is the ID of the announced execution, which every message
+	 * the execution produces also carries, so Positron can attribute them. The
+	 * runtime protocol carries no provenance of its own, so without this
+	 * message foreign code appears in the Console unattributed.
+	 */
+	export interface LanguageRuntimeExecutionRequested extends LanguageRuntimeMessage {
+		/** The code that is about to run. */
+		code: string;
+
+		/** Who asked for the execution. */
+		attribution: CodeAttribution;
+	}
+
+	/** LanguageRuntimePrompt is a LanguageRuntimeMessage representing a prompt for input */
+	export interface LanguageRuntimePrompt extends LanguageRuntimeMessage {
+		/** The prompt text */
+		prompt: string;
+
+		/** Whether this is a password prompt (and typing should be hidden)  */
+		password: boolean;
+	}
+
+	/**
+	 * The CPU architecture of an interpreter.
+	 * Used to detect architecture mismatches between the interpreter and the system.
+	 */
+	export enum LanguageRuntimeArchitecture {
+		/** 64-bit ARM architecture (Apple Silicon, ARM64 Windows, etc.) */
+		Arm64 = 'arm64',
+		/** 64-bit x86 architecture (Intel/AMD) */
+		X64 = 'x64',
+		/** Architecture was detected but is not arm64 or x64 */
+		Other = 'other'
+	}
+
+	/** LanguageRuntimeInfo contains metadata about the runtime after it has started. */
+	export interface LanguageRuntimeInfo {
+		/** A startup banner */
+		banner: string;
+
+		/** The implementation version number */
+		implementation_version: string;
+
+		/** The language version number */
+		language_version: string;
+
+		/** List of supported features (e.g., 'debugger' for Jupyter debugging protocol support) */
+		supported_features?: string[];
+
+		/** Initial prompt string in case user customized it */
+		input_prompt?: string;
+
+		/** Continuation prompt string in case user customized it */
+		continuation_prompt?: string;
+
+		/**
+		 * The interpreter's CPU architecture.
+		 * Used to detect architecture mismatches with the system.
+		 */
+		interpreterArch?: LanguageRuntimeArchitecture;
+
+		/**
+		 * The runtime's full build version, if it reports one. Distinct from
+		 * `implementation_version`: this may carry extra build metadata (e.g.
+		 * `0.1.252+14.6618e9a`) used to detect version mismatches.
+		 */
+		build_version?: string;
+
+		/** The short git commit hash the runtime was built from, if known. */
+		commit?: string;
+	}
+
+	/**
+	 * Describes the kernel launch parameters used to start a runtime session.
+	 */
+	export interface LanguageRuntimeLaunchInfo {
+		/** The command line used to start the kernel */
+		argv: string[];
+
+		/** Environment variables set for the kernel process */
+		env: Record<string, string>;
+
+		/** Optional preflight command run before starting the kernel */
+		startupCommand?: string;
+
+		/** How the kernel handles interrupts */
+		interruptMode?: string;
+
+		/** The Jupyter protocol version in use */
+		protocolVersion?: string;
+	}
+
+	/** LanguageRuntimeState is a LanguageRuntimeMessage representing a new runtime state */
+	export interface LanguageRuntimeState extends LanguageRuntimeMessage {
+		/** The new state */
+		state: RuntimeOnlineState;
+	}
+
+	/** LanguageRuntimeError is a LanguageRuntimeMessage that represents a run-time error */
+	export interface LanguageRuntimeError extends LanguageRuntimeMessage {
+		/** The error name */
+		name: string;
+
+		/** The error message */
+		message: string;
+
+		/** The error stack trace */
+		traceback: Array<string>;
+	}
+
+	/**
+	 * LanguageRuntimeMessageIPyWidget is a wrapped LanguageRuntimeMessage that should be handled
+	 * by an IPyWidget.
+	 *
+	 * Output widgets may intercept replies to an execution and instead render them inside the
+	 * output widget. See https://ipywidgets.readthedocs.io/en/latest/examples/Output%20Widget.html
+	 * for more.
+	 */
+	export interface LanguageRuntimeMessageIPyWidget extends LanguageRuntimeMessage {
+		/** The original runtime message that was intercepted by an IPyWidget */
+		original_message: LanguageRuntimeMessage;
+	}
+
+	/**
+	 * LanguageRuntimeCommOpen is a LanguageRuntimeMessage that indicates a
+	 * comm (client instance) was opened from the server side
+	 */
+	export interface LanguageRuntimeCommOpen extends LanguageRuntimeMessage {
+		/** The unique ID of the comm being opened */
+		comm_id: string;
+
+		/** The name (type) of the comm being opened, e.g. 'jupyter.widget' */
+		target_name: string;
+
+		/** The data from the back-end */
+		data: object;
+	}
+
+	/** LanguageRuntimeCommMessage is a LanguageRuntimeMessage that represents data for a comm (client instance) */
+	export interface LanguageRuntimeCommMessage extends LanguageRuntimeMessage {
+		/** The unique ID of the client comm ID for which the message is intended */
+		comm_id: string;
+
+		/** The data from the back-end */
+		data: object;
+	}
+
+	/**
+	 * LanguageRuntimeCommClosed is a LanguageRuntimeMessage that indicates a
+	 * comm (client instance) was closed from the server side
+	 */
+	export interface LanguageRuntimeCommClosed extends LanguageRuntimeMessage {
+		/** The unique ID of the client comm ID for which the message is intended */
+		comm_id: string;
+
+		/** The data from the back-end */
+		data: object;
+	}
+
+	/** A DebugProtocolRequest is an opaque stand-in type for the [Request](https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_Request) type defined in the Debug Adapter Protocol. */
+	export interface DebugProtocolRequest {
+		// Properties: see [Request details](https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_Request).
+	}
+
+	/** A DebugProtocolResponse is an opaque stand-in type for the [Response](https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_Response) type defined in the Debug Adapter Protocol. */
+	export interface DebugProtocolResponse {
+		// Properties: see [Response details](https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_Response).
+	}
+
+	/**
+	 * A DebugProtocolEvent is an opaque stand-in type for the [Event](https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_Event) type defined in the Debug Adapter Protocol.
+	 */
+	export interface DebugProtocolEvent {
+		// Properties: see [Event details](https://microsoft.github.io/debug-adapter-protocol/specification#Base_Protocol_Event).
+	}
+
+	/**
+	 * LanguageRuntimeDebugReply is a LanguageRuntimeMessage that represents a reply to a runtime debugger.
+	 */
+	export interface LanguageRuntimeDebugReply extends LanguageRuntimeMessage {
+		/** The debug adapter protocol response.  */
+		content: DebugProtocolResponse;
+	}
+
+	/**
+	 * LanguageRuntimeDebugEvent is a LanguageRuntimeMessage that represents an event from the runtime debugger.
+	 */
+	export interface LanguageRuntimeDebugEvent extends LanguageRuntimeMessage {
+		/** The debug adapter protocol event. */
+		content: DebugProtocolEvent;
+	}
+
+	/**
+	 * How the interpreter picker groups and labels a runtime.
+	 */
+	export interface RuntimePickerInfo {
+		/** Header of the picker group, e.g. 'Project environments' or 'R'. */
+		group: string;
+		/** Orders groups within a language; lower first. */
+		groupOrder: number;
+		/** Orders rows within a group, before version; lower first. Default 0. */
+		rowOrder?: number;
+		/** Short row label, e.g. 'Python 3.12.4'. */
+		label: string;
+		/** Gray text after the label, e.g. 'uv: myproject'. */
+		description?: string;
+		/**
+		 * Why the runtime is recommended for the workspace, e.g. 'project environment'.
+		 * Set only on the runtime returned as the workspace recommendation.
+		 */
+		recommendationReason?: string;
+	}
+
+	/**
+	 * LanguageRuntimeMetadata contains information about a language runtime that is known
+	 * before the runtime is started.
+	 */
+	export interface LanguageRuntimeMetadata {
+		/**
+		 * The absolute path to the runtime executable. Always a fully-expanded
+		 * path suitable for use with execFile or equivalent; never contains ~
+		 * or other shorthand.
+		 */
+		runtimePath: string;
+
+		/** A unique identifier for this runtime; takes the form of a GUID */
+		runtimeId: string;
+
+		/**
+		 * The fully qualified name of the runtime displayed to the user; e.g. "R 4.2 (64-bit)".
+		 * Should be unique across languages.
+		 */
+		runtimeName: string;
+
+		/**
+		 * A language specific runtime name displayed to the user; e.g. "4.2 (64-bit)".
+		 * Should be unique within a single language.
+		 */
+		runtimeShortName: string;
+
+		/** The version of the runtime itself (e.g. kernel or extension version) as a string; e.g. "0.1" */
+		runtimeVersion: string;
+
+		/** The runtime's source or origin; e.g. PyEnv, System, Homebrew, Conda, etc. */
+		runtimeSource: string;
+
+		/**
+		 * How useful this runtime's source is to the user, lowest first; used to
+		 * order the source headings in the interpreter picker. Sources left
+		 * unranked are listed after ranked ones.
+		 * The scale is shared by every extension that contributes runtimes for a
+		 * language, so ranking one source and not another mixes them up.
+		 */
+		runtimeSourceOrder?: number;
+
+		/** How the interpreter picker shows this runtime. Runtimes without it use `runtimeSource` and `runtimeName`. */
+		picker?: RuntimePickerInfo;
+
+		/** The free-form, user-friendly name of the language this runtime can execute; e.g. "R" */
+		languageName: string;
+
+		/**
+		 * The Visual Studio Code Language ID of the language this runtime can execute; e.g. "r"
+		 *
+		 * See here for a list of known language IDs:
+		 * https://code.visualstudio.com/docs/languages/identifiers#_known-language-identifiers
+		 */
+		languageId: string;
+
+		/** The version of the language; e.g. "4.2" */
+		languageVersion: string;
+
+		/** The Base64-encoded icon SVG for the language. */
+		base64EncodedIconSvg: string | undefined;
+
+		/** Whether the runtime should start up automatically or wait until explicitly requested */
+		startupBehavior: LanguageRuntimeStartupBehavior;
+
+		/** Where sessions will be located; used as a hint to control session restoration */
+		sessionLocation: LanguageRuntimeSessionLocation;
+
+		/**
+		 * Extra data supplied by the runtime provider; not read by Positron but supplied
+		 * when creating a new session from the metadata.
+		 */
+		extraRuntimeData: any;
+
+		/**
+		 * Subscriptions to notifications from the UI. When subscribed, the frontend sends
+		 * notifications to the backend via the UI client.
+		 */
+		uiSubscriptions?: UiRuntimeNotifications[];
+
+		/**
+		 * Whether this runtime is eligible to be stored in Positron's cross-window
+		 * discovery cache. Defaults to `false` when omitted. Set to `true` only for
+		 * system-scoped runtimes whose `runtimePath` resolves to a real on-disk
+		 * executable and whose behavior is not bound to a specific workspace
+		 * (i.e. not a venv, renv library, pyenv/asdf shim, or proxy/remote runtime).
+		 */
+		cacheable?: boolean;
+
+		/**
+		 * When set, this runtime is a variant of another runtime, created from the
+		 * `interpreters.definitions` entry with this label.
+		 */
+		interpreterDefinition?: string;
+
+		/**
+		 * When true, this runtime was found only because an
+		 * `interpreters.definitions` entry points at it. It is not shown; only
+		 * its variants are.
+		 */
+		definitionOnly?: boolean;
+	}
+
+	/**
+	 * UI notifications from frontend to backends.
+	 */
+	export enum UiRuntimeNotifications {
+		/** Notification that the settings for rendering a plot have changed, typically because the plot area did */
+		DidChangePlotsRenderSettings = 'did_change_plots_render_settings',
+	}
+
+	/**
+	 * One root that a `LanguageRuntimeManager` scans for interpreters. The
+	 * `path` should be resolved (symlinks followed) before being reported;
+	 * `mtimeMs` is 0 when the path does not exist.
+	 */
+	export interface RuntimeRootEntry {
+		readonly path: string;
+		readonly exists: boolean;
+		readonly mtimeMs: number;
+	}
+
+	/**
+	 * Fingerprint of every directory a `LanguageRuntimeManager` scans for
+	 * interpreters. Returned by `getDiscoveryRootSignature` to let Positron
+	 * detect newly-installed interpreters between startups without rerunning
+	 * full discovery.
+	 */
+	export interface RuntimeRootSignature {
+		/** Roots in stable insertion order. Order is part of the signature. */
+		readonly entries: readonly RuntimeRootEntry[];
+		/**
+		 * Optional opaque blob folded into equality. Lets a manager mix in
+		 * non-stat-able state (env-modules version, conda config hash) without
+		 * exposing the details to Positron.
+		 */
+		readonly opaque?: string;
+	}
+
+	export interface RuntimeSessionMetadata {
+		/** The ID of this session */
+		readonly sessionId: string;
+
+		/** The session's mode */
+		readonly sessionMode: LanguageRuntimeSessionMode;
+
+		/** The URI of the notebook document associated with the session, if any */
+		readonly notebookUri?: vscode.Uri;
+
+		/**
+		 * The URI of the hidden notebook that holds the cells of this session's
+		 * Quarto document, if the session is for a Quarto document. Its cells are
+		 * the ones this session's language client should select and serve.
+		 * Undefined for console sessions and for real notebook sessions.
+		 */
+		readonly quartoNotebookUri?: vscode.Uri;
+
+		/** The starting working directory of the session, if any */
+		readonly workingDirectory?: string;
+
+		/**
+		 * True when the session is being created because the user explicitly
+		 * selected this runtime, e.g. from a session picker. Absent or false for
+		 * automatic, restored, duplicated, and programmatic starts.
+		 */
+		readonly userSelected?: boolean;
+
+		/**
+		 * Who the session belongs to. `user` for sessions the user starts;
+		 * `agent` for sessions an AI agent starts for itself. When absent, the
+		 * session belongs to the user.
+		 */
+		readonly owner?: RuntimeSessionOwner;
+	}
+
+	/**
+	 * Who a session belongs to. `user` for sessions the user starts;
+	 * `agent` for sessions an AI agent starts for itself.
+	 */
+	export type RuntimeSessionOwner = 'user' | 'agent';
+
+	/** Options for {@link runtime.startLanguageRuntime}. */
+	export interface RuntimeSessionStartOptions {
+		/** Who the session belongs to. Defaults to `user`. */
+		readonly owner?: RuntimeSessionOwner;
+
+		/**
+		 * Whether the session becomes the foreground session once started.
+		 * Defaults to `true`. Pass `false` to start it in the background and
+		 * leave the user's selected session in place.
+		 */
+		readonly activate?: boolean;
+	}
+
+	/**
+	 * LanguageRuntimeSessionMode is an enum representing the set of possible
+	 * modes for a language runtime session.
+	 */
+	export enum LanguageRuntimeSessionMode {
+		/**
+		 * The runtime session is bound to a Positron console. Typically,
+		 * there's only one console session per language.
+		 */
+		Console = 'console',
+
+		/** The runtime session backs a notebook. */
+		Notebook = 'notebook',
+
+		/** The runtime session is a background session (not attached to any UI). */
+		Background = 'background',
+	}
+
+
+	/**
+	 * LanguageRuntimeDynState contains information about a language runtime that may
+	 * change after a runtime has started.
+	 */
+	export interface LanguageRuntimeDynState {
+		/** The text the language's interpreter uses to prompt the user for input, e.g. ">" or ">>>" */
+		inputPrompt: string;
+
+		/** The text the language's interpreter uses to prompt the user for continued input, e.g. "+" or "..." */
+		continuationPrompt: string;
+
+		/** The user-facing name of this session */
+		sessionName: string;
+	}
+
+	export enum LanguageRuntimeStartupBehavior {
+		/**
+		 * The runtime should be started immediately after registration; usually used for runtimes
+		 * that are affiliated with the current workspace.
+		 */
+		Immediate = 'immediate',
+
+		/**
+		 * The runtime should start automatically; usually used for runtimes that provide LSPs
+		 */
+		Implicit = 'implicit',
+
+		/**
+		 * The runtime should start when the user explicitly requests it;
+		 * usually used for runtimes that only provide REPLs
+		 */
+		Explicit = 'explicit',
+
+		/**
+		 * The runtime only starts up if manually requested by the user.
+		 * The difference from Explicit, is that Manual startup never
+		 * starts automatically, even if the run time is affiliated to the
+		 * workspace.
+		 */
+		Manual = 'manual'
+	}
+
+	/**
+	 * An enumeration of possible locations for runtime sessions.
+	 */
+	export enum LanguageRuntimeSessionLocation {
+		/**
+		 * The runtime session is persistent on the machine; it should be
+		 * restored when the workspace is re-opened, and may persist across
+		 * Positron sessions.
+		 */
+		Machine = 'machine',
+
+		/**
+		 * The runtime session is located in the current workspace (usually a
+		 * terminal); it should be restored when the workspace is re-opened in
+		 * the same Positron session (e.g. during a browser reload or
+		 * reconnect)
+		 */
+		Workspace = 'workspace',
+
+		/**
+		 * The runtime session is browser-only; it should not be restored when the
+		 * workspace is re-opened.
+		 */
+		Browser = 'browser',
+	}
+
+	/**
+	 * The set of client types that can be generated by a language runtime. Note
+	 * that, because client types can share a namespace with other kinds of
+	 * widgets, each client type in Positron's API is prefixed with the string
+	 * "positron".
+	 */
+	export enum RuntimeClientType {
+		Variables = 'positron.variables',
+		Lsp = 'positron.lsp',
+		Plot = 'positron.plot',
+		DataExplorer = 'positron.dataExplorer',
+		ObjectExplorer = 'positron.objectExplorer',
+		Ui = 'positron.ui',
+		Help = 'positron.help',
+		Connection = 'positron.connection',
+		Reticulate = 'positron.reticulate',
+		IPyWidget = 'jupyter.widget',
+		IPyWidgetControl = 'jupyter.widget.control',
+
+		// Future client types may include:
+		// - Watch window/variable explorer
+		// - Code inspector
+		// - etc.
+	}
+
+	/**
+	 * The possible states for a language runtime client instance. These
+	 * represent the state of the communications channel between the client and
+	 * the runtime.
+	 */
+	export enum RuntimeClientState {
+		/** The client has not yet been initialized */
+		Uninitialized = 'uninitialized',
+
+		/** The connection between the server and the client is being opened */
+		Opening = 'opening',
+
+		/** The connection between the server and the client has been established */
+		Connected = 'connected',
+
+		/** The connection between the server and the client is being closed */
+		Closing = 'closing',
+
+		/** The connection between the server and the client is closed */
+		Closed = 'closed',
+	}
+
+	/**
+	 * A variable in the runtime's memory or environment.
+	 */
+	export interface RuntimeVariable {
+		/** An internal access key for the variable */
+		access_key: string;
+
+		/** A human-readable display name for the variable */
+		display_name: string;
+
+		/** The type of the variable (string, number, etc.) */
+		display_type: string;
+
+		/** A string representation of the value of the variable */
+		display_value: string;
+
+		/**
+		 * Extended type information naming e.g. the exact class name of the
+		 * variable
+		 */
+		type_info?: string;
+
+		/** The length of the variable, e.g. number of elements in an array */
+		length: number;
+
+		/** The size of a variable, e.g. in bytes */
+		size: number;
+
+		/** Whether the variable has child variables, e.g columns in a data frame */
+		has_children: boolean;
+	}
+
+	/**
+	 * A result of calling the QuerySessionTables API.
+	 */
+	export interface QueryTableSummaryResult {
+		/**
+		 * The total number of rows in the table.
+		 */
+		num_rows: number;
+
+		/**
+		 * The total number of columns in the table.
+		 */
+		num_columns: number;
+
+		/**
+		 * The column schemas in the table.
+		 */
+		column_schemas: Array<string>;
+
+		/**
+		 * The column profiles in the table.
+		 */
+		column_profiles: Array<string>;
+
+	}
+
+	/**
+	 * The possible locations a Positron Assistant chat request can be invoked from.
+	 */
+	export enum PositronChatAgentLocation {
+		Panel = 'panel',
+		Terminal = 'terminal',
+		Notebook = 'notebook',
+		Editor = 'editor',
+	}
+
+	/**
+	 * The possible modes for a Positron Assistant chat request.
+	 */
+	export enum PositronChatMode {
+		Ask = 'ask',
+		Edit = 'edit',
+		Agent = 'agent',
+	}
+
+	/**
+	 * A message received from a runtime client instance.
+	 */
+	export interface RuntimeClientOutput<T> {
+		/** The message data */
+		data: T;
+
+		/** Raw binary data associated with the message, if any */
+		buffers?: Array<Uint8Array>;
+	}
+
+	/**
+	 * An instance of a client widget generated by a language runtime. See
+	 * RuntimeClientType for the set of possible client types.
+	 *
+	 * The client is responsible for disposing itself when it is no longer
+	 * needed; this will trigger the closure of the communications channel
+	 * between the client and the runtime.
+	 */
+	export interface RuntimeClientInstance extends vscode.Disposable {
+		onDidChangeClientState: vscode.Event<RuntimeClientState>;
+		onDidSendEvent: vscode.Event<RuntimeClientOutput<object>>;
+		performRpcWithBuffers<T>(data: object): Thenable<RuntimeClientOutput<T>>;
+		performRpc<T>(data: object): Thenable<T>;
+		getClientState(): RuntimeClientState;
+		getClientId(): string;
+		getClientType(): RuntimeClientType;
+	}
+
+	/**
+	 * Code attribution sources for code executed by Positron.
+	 */
+	export enum CodeAttributionSource {
+		/** The code was executed by an AI assistant. */
+		Assistant = 'assistant',
+
+		/** The code was executed by a Positron extension. */
+		Extension = 'extension',
+
+		/** The code was executed interactively (the user typed it in). */
+		Interactive = 'interactive',
+
+		/** The code was executed from a notebook cell. */
+		Notebook = 'notebook',
+
+		/** The code was pasted into the Console. */
+		Paste = 'paste',
+
+		/** The code was run as a fragment or whole of a script. */
+		Script = 'script',
+
+		/**
+		 * The code was executed by an external coding agent, working through
+		 * Positron's MCP server rather than the Positron API.
+		 */
+		Agent = 'agent',
+	}
+
+	/**
+	 * Code attribution metadata for code executed by Positron.
+	 */
+	export interface CodeAttribution {
+		/** The code's origin */
+		source: CodeAttributionSource;
+
+		/**
+		 * Additional metadata specific to the attribution source, if any. For
+		 * example, when code is executed from an extension, it names the
+		 * extension, and when code is executed from a script, it names the
+		 * script.
+		 */
+		metadata?: Record<string, any>;
+	}
+
+	/**
+	 * An event that is emitted when code is executed in Positron.
+	 */
+	export interface CodeExecutionEvent {
+		/** The ID of the code execution. */
+		executionId: string;
+
+		/** The ID of the session that executed the code. */
+		sessionId: string;
+
+		/** The ID of the language in which the code was executed (e.g. 'python') */
+		languageId: string;
+
+		/** The name of the runtime that executed the code (e.g. 'Python 3.12') */
+		runtimeName: string;
+
+		/** The mode in which the code was executed. */
+		mode: RuntimeCodeExecutionMode;
+
+		/** The actual code that was executed. */
+		code: string;
+
+		/**
+		 * An object describing the origin of the code. When a caller passes
+		 * `attributionMetadata` to `executeCode`, those fields are merged into
+		 * `attribution.metadata`.
+		 */
+		attribution: CodeAttribution;
+	}
+
+	export interface LanguageRuntimeManager {
+		/**
+		 * Returns a generator that yields metadata about all the language
+		 * runtimes that are available to the user.
+		 *
+		 * This metadata will be passed to `createSession` to create new runtime
+		 * sessions.
+		 */
+		discoverAllRuntimes(): AsyncGenerator<LanguageRuntimeMetadata>;
+
+		/**
+		 * Returns a single runtime metadata object representing the runtime
+		 * that should be used in the current workspace, if any.
+		 *
+		 * Note that this is called before `discoverAllRuntimes` during
+		 * startup, and should return `undefined` if no runtime is recommended.
+		 *
+		 * If a runtime is returned, `startupBehavior` property of the runtime
+		 * metadata is respected here; use `Immediately` to start the runtime
+		 * right away, or any other value to save the runtime as the project
+		 * default without starting it.
+		 *
+		 * Core asks once during startup, before discovery. If a language has no
+		 * recommendation then, core asks again once discovery has completed,
+		 * with `afterDiscovery` set; that answer is used as the preferred runtime
+		 * but never saved as the project default. An `Immediate` answer starts
+		 * only when no console is starting or running and the language has no
+		 * affiliated runtime that was started or used (in `Recommended` mode,
+		 * its affiliation is ignored); an `Implicit` one starts when a file of its
+		 * language is open.
+		 *
+		 * @param afterDiscovery Whether runtime discovery has completed.
+		 */
+		recommendedWorkspaceRuntime(afterDiscovery?: boolean): Thenable<LanguageRuntimeMetadata | undefined>;
+
+		/**
+		 * Whether a recommendation that is not started right away is saved as
+		 * the project default (an affiliation that has never been started or
+		 * used). Defaults to `true`. Set to `false` when the manager decides its
+		 * recommendation afresh every time the folder opens: core then uses the
+		 * recommendation for this window only and never saves it, so it can't
+		 * start on a later open as "the last interpreter used".
+		 */
+		readonly recommendationIsProjectDefault?: boolean;
+
+		/**
+		 * The runtime metadata for the interpreter pinned for this workspace:
+		 * the one that the extension's default interpreter setting names.
+		 * Returns `undefined` if the setting isn't set, the path doesn't lead to
+		 * an interpreter this extension can start, or a filter setting blocks it.
+		 *
+		 * A pinned interpreter starts in place of the one the workspace used
+		 * last. Positron calls this right after it activates the extension, and
+		 * writes the answer over the workspace's affiliated runtime for the
+		 * language. Positron doesn't call it when the language has no affiliated
+		 * runtime, when the New Folder flow just picked the interpreter, or when
+		 * the language's startup behavior is `recommended`, so
+		 * `recommendedWorkspaceRuntime` must return the pinned interpreter too.
+		 *
+		 * Positron waits for this answer before it starts the workspace's
+		 * interpreters, for at most 20 seconds. After that, it starts the
+		 * affiliated runtime as saved. The pin decides which interpreter starts,
+		 * not when, so Positron treats the answer as `Implicit`, whatever its
+		 * `startupBehavior`.
+		 */
+		pinnedWorkspaceRuntime?(): Thenable<LanguageRuntimeMetadata | undefined>;
+
+		/**
+		 * An optional snapshot of the directories this manager scans for
+		 * interpreters. Called on every warm start to detect newly-installed
+		 * interpreters before deciding whether to skip full discovery.
+		 *
+		 * The snapshot must be cheap to compute -- on the order of one stat
+		 * per scan root. Implementations whose discovery sources cannot be
+		 * fingerprinted that cheaply (e.g. those that need to invoke a
+		 * subprocess like `conda env list`) should not implement this method;
+		 * the periodic-refresh cap will catch their changes within ~24h.
+		 *
+		 * Returning `{ entries: [] }` is a valid stable signature and means
+		 * "I have no stat-able roots." Throwing or rejecting causes the
+		 * manager to fall back to the periodic-refresh trigger.
+		 */
+		getDiscoveryRootSignature?(): Thenable<RuntimeRootSignature>;
+
+		/**
+		 * Opt out of the discovery cache's warm-start fast path. When `true`,
+		 * `discoverAllRuntimes()` is invoked on every Positron window open --
+		 * even when the cache would otherwise have considered the manager
+		 * satisfied.
+		 *
+		 * Set this when your runtimes are dynamic, ephemeral, or not backed by
+		 * a stat-able binary (so they can never be cached): the cache has no
+		 * record of them, but skipping discovery would leave them unregistered
+		 * on warm starts. Managers whose runtimes set `cacheable: true` should
+		 * leave this unset.
+		 */
+		alwaysRediscover?: boolean;
+
+		/**
+		 * An optional event that fires when a new runtime is discovered.
+		 *
+		 * Not fired during `discoverRuntimes()`; used to notify Positron of a
+		 * new runtime or environment after the initial discovery has completed.
+		 */
+		onDidDiscoverRuntime?: vscode.Event<LanguageRuntimeMetadata>;
+
+		/**
+		 * An optional event that fires when a previously registered runtime
+		 * should be removed, carrying the `runtimeId` of the runtime to remove.
+		 *
+		 * Used to retract a runtime that a manager previously surfaced (via
+		 * `discoverAllRuntimes()` or `onDidDiscoverRuntime`) but that no longer
+		 * exists or has been superseded -- for example when the underlying
+		 * environment is deleted, or when de-duplication collapses several
+		 * aliases of one interpreter and the alias already registered is not the
+		 * survivor. Without this, such stale runtimes linger in the picker until
+		 * the window is reloaded.
+		 */
+		onDidRemoveRuntime?: vscode.Event<string>;
+
+		/**
+		 * An optional metadata validation function. If provided, Positron will
+		 * validate any stored metadata before attempting to use it to create a
+		 * new session. This happens when a workspace is re-opened, for example.
+		 *
+		 * If the metadata is invalid, the function should return a new version
+		 * of the metadata with the necessary corrections.
+		 *
+		 * If it is not possible to correct the metadata, the function should
+		 * reject with an error.
+		 *
+		 * @param metadata The metadata to validate
+		 * @returns A Thenable that resolves with an updated version of the
+		 *   metadata.
+		 */
+		validateMetadata?(metadata: LanguageRuntimeMetadata):
+			Thenable<LanguageRuntimeMetadata>;
+
+		/**
+		 * An optional function that makes the interpreter at the given path
+		 * available, e.g. one that discovery did not find. Positron registers
+		 * the returned runtime. Implementations should remember the path (for
+		 * example, in a setting) so future discovery finds it too.
+		 *
+		 * @param path The path to the interpreter.
+		 * @returns A Thenable that resolves with the runtime's metadata, or
+		 *   rejects with an error explaining why the interpreter can't be used.
+		 */
+		registerRuntimeFromPath?(path: string): Thenable<LanguageRuntimeMetadata>;
+
+		/**
+		 * An optional session validation function. If provided, Positron will
+		 * validate any stored session metadata before reconnecting to the
+		 * session.
+		 *
+		 * @param metadata The metadata to validate
+		 * @returns A Thenable that resolves with true (the session is valid) or
+		 *  false (the session is invalid).
+		 */
+		validateSession?(sessionId: string): Thenable<boolean>;
+
+		/**
+		 * Creates a new runtime session.
+		 *
+		 * @param runtimeMetadata One of the runtime metadata items returned by
+		 * `discoverRuntimes`.
+		 * @param sessionMetadata The metadata for the new session.
+		 *
+		 * @returns A Thenable that resolves with the new session, or rejects with an error.
+		 */
+		createSession(runtimeMetadata: LanguageRuntimeMetadata,
+			sessionMetadata: RuntimeSessionMetadata):
+			Thenable<LanguageRuntimeSession>;
+
+		/**
+		 * Reconnects to a runtime session using the given metadata.
+		 *
+		 * Implementing this method is optional, since not all sessions can be
+		 * reconnected; for example, sessions that run in the browser cannot be
+		 * reconnected.
+		 *
+		 * @param runtimeMetadata The metadata for the runtime that owns the
+		 * session.
+		 * @param sessionMetadata The metadata for the session to reconnect.
+		 * @param sessionName The name of the session to reconnect.
+		 * @returns A Thenable that resolves with the reconnected session, or
+		 * rejects with an error.
+		 */
+		restoreSession?(runtimeMetadata: LanguageRuntimeMetadata,
+			sessionMetadata: RuntimeSessionMetadata,
+			sessionName: string):
+			Thenable<LanguageRuntimeSession>;
+	}
+
+	/**
+	 * An enum representing the set of runtime method error codes; these map to
+	 * JSON-RPC error codes.
+	 */
+	export enum RuntimeMethodErrorCode {
+		ParseError = -32700,
+		InvalidRequest = -32600,
+		MethodNotFound = -32601,
+		InvalidParams = -32602,
+		InternalError = -32603,
+		ServerErrorStart = -32000,
+		ServerErrorEnd = -32099
+	}
+
+	/**
+	 * An error returned by a runtime method call.
+	 */
+	export interface RuntimeMethodError {
+		/** An error code */
+		code: RuntimeMethodErrorCode;
+
+		/** A human-readable error message */
+		message: string;
+
+		/**
+		 * A name for the error, for compatibility with the Error object.
+		 * Usually `RPC Error ${code}`.
+		 */
+		name: string;
+
+		/** Additional error information (optional) */
+		data: any | undefined;
+	}
+
+	/**
+	 * Enum of available channels for a language runtime session.
+	 * Used to enumerate available channels for users.
+	 */
+	export enum LanguageRuntimeSessionChannel {
+		Console = 'console',
+		Kernel = 'kernel',
+		LSP = 'lsp',
+	}
+
+	export interface LanguageRuntimePackage {
+		id: string;
+		name: string;
+		displayName: string;
+		version: string;
+
+		/** License information */
+		license?: string;
+
+		/** Latest available version from repository */
+		latestVersion?: string;
+
+		/** Publication/release date */
+		publishedDate?: string;
+
+		/**
+		 * Whether the package is currently attached to the runtime's search
+		 * path (e.g. R's `search()`, Python's bound names in the user
+		 * namespace). Distinct from "loaded" in R parlance, where a package
+		 * can be loaded as a transitive dependency without being attached.
+		 */
+		attached?: boolean;
+
+		/**
+		 * Whether the installed version is strictly older than the latest
+		 * available version. Computed by the language runtime using its own
+		 * native version semantics (`numeric_version` for R, PEP 440 for
+		 * Python) and surfaced as a precomputed boolean so the frontend
+		 * never re-implements version comparison.
+		 */
+		outdated?: boolean;
+
+		/** Optional short description or summary shown in the Packages pane card view. */
+		description?: string;
+
+		/**
+		 * The package's primary external URL (its homepage, falling back to its
+		 * repository, etc.). Runtimes should pick the single best link from
+		 * whatever metadata they have; the Packages pane validates it
+		 * (http/https only) and surfaces it via the row's external-link button.
+		 */
+		url?: string;
+
+		/** One-line title/summary, richer than `description`. From the detail RPC. */
+		title?: string;
+
+		/** Display-ready author/maintainer string (already normalized by the runtime). */
+		author?: string;
+
+		/** Source repository label or URL (e.g. "CRAN", or a Project-URL). */
+		sourceRepository?: string;
+	}
+
+	/**
+	 * Represents a package to install or update, with an optional version.
+	 */
+	export interface PackageSpec {
+		/** The package name */
+		name: string;
+		/** Optional version to install (if not specified, installs latest) */
+		version?: string;
+	}
+
+	/**
+	 * Interface for package management functionality.
+	 *
+	 * Provides package management operations for a language runtime session.
+	 * Runtimes that support package management should implement this interface
+	 * and return it from getPackageManager().
+	 */
+	export interface LanguageRuntimePackageManager {
+		/**
+		 * Get list of installed packages.
+		 * @param token Optional cancellation token
+		 */
+		getPackages(token?: vscode.CancellationToken): Thenable<LanguageRuntimePackage[]>;
+
+		/**
+		 * Install the list of packages.
+		 * @param packages Array of package install requests with name and optional version
+		 * @param token Optional cancellation token
+		 */
+		installPackages(packages: PackageSpec[], token?: vscode.CancellationToken): Thenable<void>;
+
+		/**
+		 * Uninstall the list of packages.
+		 * @param packageNames Array of package names to uninstall
+		 * @param token Optional cancellation token
+		 */
+		uninstallPackages(packageNames: string[], token?: vscode.CancellationToken): Thenable<void>;
+
+		/**
+		 * Update the list of packages.
+		 * @param packages Array of package install requests with name and optional version
+		 * @param token Optional cancellation token
+		 */
+		updatePackages(packages: PackageSpec[], token?: vscode.CancellationToken): Thenable<void>;
+
+		/**
+		 * Update all installed packages.
+		 * @param token Optional cancellation token
+		 */
+		updateAllPackages(token?: vscode.CancellationToken): Thenable<void>;
+
+		/**
+		 * Search a repository for packages matching the query.
+		 * @param query Search query string
+		 * @param token Optional cancellation token
+		 */
+		searchPackages(query: string, token?: vscode.CancellationToken): Thenable<LanguageRuntimePackage[]>;
+
+		/**
+		 * Search a repository for available versions of a package.
+		 * @param name Package name
+		 * @param token Optional cancellation token
+		 */
+		searchPackageVersions(name: string, token?: vscode.CancellationToken): Thenable<string[]>;
+
+		/**
+		 * Fetch additional metadata for packages from external sources (e.g., P3M).
+		 * This is called separately from getPackages() to allow the UI to display
+		 * the basic package list quickly while metadata loads in the background.
+		 * @param packageNames Array of package names to fetch metadata for
+		 * @param token Optional cancellation token
+		 * @returns Map of package name (lowercase) to partial package metadata
+		 */
+		getPackageMetadata?(
+			packageNames: string[],
+			token?: vscode.CancellationToken,
+		): Thenable<Map<string, Partial<LanguageRuntimePackage>>>;
+
+		/**
+		 * The repository (R) or package index (Python) URL this environment
+		 * installs from, when the runtime can determine it.
+		 *
+		 * Positron uses this to decide which Posit Package Manager instance, if
+		 * any, to ask for security advisories about the installed packages. Only
+		 * the runtime knows the full precedence its installer follows -- an
+		 * r-versions `Repo:` field, `repos.conf`, `pip config`, environment
+		 * variables -- so the resolution stays here rather than being guessed
+		 * from settings.
+		 *
+		 * Return the repository URL as configured (e.g.
+		 * `https://ppm.example.com/cran/latest`). Positron probes it to see
+		 * whether it is a Package Manager instance and never contacts a
+		 * different host than the one returned. Resolve `undefined` when nothing
+		 * is configured beyond the language's public default; Positron then
+		 * decides for itself whether a public lookup is appropriate.
+		 *
+		 * @param token Optional cancellation token
+		 */
+		packageRepositoryUrl?(token?: vscode.CancellationToken): Thenable<string | undefined>;
+
+		/**
+		 * Fetch detailed metadata for a single package, called when the package
+		 * detail editor opens. Cheap, kernel-local fields only. Returns a partial
+		 * package to merge over the list entry, or undefined when unsupported.
+		 * @param name Package name
+		 * @param token Optional cancellation token
+		 */
+		getPackageDetail?(
+			name: string,
+			token?: vscode.CancellationToken,
+		): Thenable<Partial<LanguageRuntimePackage> | undefined>;
+	}
+
+	/**
+	 * Describes a package that is referenced by code but not installed in a
+	 * session's environment, and that the session knows how to install.
+	 */
+	export interface RuntimeMissingPackage {
+		/** Name to pass to installPackages (the installable/repository name). */
+		readonly name: string;
+
+		/**
+		 * The symbol as referenced in code, when it differs from `name` (e.g.
+		 * python import `cv2` -> install `opencv-python`). Used for display only.
+		 */
+		readonly referencedName?: string;
+	}
+
+	/**
+	 * Describes the code to analyze for missing packages. Supply `code`,
+	 * `uri`, or both. When both are set, `code` is analyzed and `uri`
+	 * identifies the document it came from (for example, so the runtime
+	 * can resolve local imports relative to it); the runtime must not
+	 * read the code from `uri` in that case.
+	 */
+	export interface RuntimeMissingPackagesTarget {
+		/** Raw code to analyze (notebook cells, quarto chunks, unsaved buffers). Takes precedence over `uri`. */
+		readonly code?: string;
+
+		/**
+		 * URI of the source document. When `code` is not set, the runtime may
+		 * read and parse it directly. When `code` is set, it is context only.
+		 */
+		readonly uri?: string;
+	}
+
+	/**
+	 * A runtime error surfaced in the console, passed to `getMissingPackageProbe`
+	 * so the runtime can recognize its own missing-package error format.
+	 */
+	export interface RuntimeConsoleError {
+		/** The error name, e.g. "ModuleNotFoundError". May be empty. */
+		readonly name: string;
+		/** The error message, e.g. "No module named 'foo'". */
+		readonly message: string;
+		/** The error traceback, one entry per line. */
+		readonly traceback: string[];
+	}
+
+	/**
+	 * Basic metadata about an active language runtime session, including
+	 * immutable metadata about the session itself and metadata about the
+	 * runtime with which it is associated.
+	 */
+	export interface ActiveRuntimeSessionMetadata {
+		/** An object supplying immutable metadata about this specific session */
+		readonly metadata: RuntimeSessionMetadata;
+
+		/**
+		 * An object supplying metadata about the runtime with which this
+		 * session is associated.
+		 */
+		readonly runtimeMetadata: LanguageRuntimeMetadata;
+	}
+
+	/**
+	 * Base interface for a language runtime session.
+	 *
+	 * This is the version of a language runtime session that is returned by
+	 * Positron's API methods; it provides basic access to the session for use
+	 * by extensions other that the one that created the session.
+	 */
+	export interface BaseLanguageRuntimeSession extends ActiveRuntimeSessionMetadata {
+
+		/** The state of the runtime that changes during a user session */
+		getDynState(): Thenable<LanguageRuntimeDynState>;
+
+		/**
+		 * Returns the current runtime state of the session.
+		 *
+		 * This is a synchronous accessor that reflects the session's last known
+		 * runtime state. Unlike `onDidChangeRuntimeState` (which only emits on
+		 * transitions), this can be read at any time, making it suitable for
+		 * gating logic that must verify the session is idle before dispatching
+		 * work.
+		 */
+		getRuntimeState?(): RuntimeState;
+
+		/**
+		 * An event that fires when the session's runtime state changes.
+		 *
+		 * Unlike `getRuntimeState()` (which reports the last known state at any
+		 * time), this only emits on transitions. Pair the two: read
+		 * `getRuntimeState()` for the current value, and subscribe here to be
+		 * notified of subsequent changes.
+		 */
+		onDidChangeRuntimeState?: vscode.Event<RuntimeState>;
+
+		/**
+		 * An event that fires when the session's connection to the underlying
+		 * runtime is lost. This can happen if, for example, the transport to the
+		 * kernel supervisor drops while the runtime itself keeps running.
+		 *
+		 * When this fires, any previously observed runtime state may be stale.
+		 * Callers should treat the session's state as unknown until either the
+		 * runtime state changes or `onDidReconnect` fires.
+		 */
+		onDidDisconnect?: vscode.Event<void>;
+
+		/**
+		 * An event that fires when the session's connection to the underlying
+		 * runtime is re-established after an `onDidDisconnect`. Callers should
+		 * re-synchronize by reading `getRuntimeState()`, since transitions that
+		 * happened while disconnected may not have been observed.
+		 */
+		onDidReconnect?: vscode.Event<void>;
+
+		/**
+		 * Calls a method in the runtime and returns the result.
+		 *
+		 * Throws a RuntimeMethodError if the method call fails.
+		 *
+		 * @param method The name of the method to call
+		 * @param args Arguments to pass to the method
+		 */
+		callMethod?(method: string, ...args: any[]): Thenable<any>;
+
+		/**
+		 * Execute code in the runtime
+		 *
+		 * @param code The code to execute
+		 * @param id The ID of the code
+		 * @param mode The code execution mode
+		 * @param errorBehavior The code execution error behavior
+		 * @param codeLocation Optionally, the location of `code` in the source editor.
+		 * @param executionMetadata Optionally, a record of additional metadata to associate with this execution.
+		 * Note: The errorBehavior parameter is currently ignored by kernels
+		 *
+		 * The returned Thenable (if any) signals ACCEPTANCE of the code for
+		 * execution, not completion of the execution. When `mode` is
+		 * `RuntimeCodeExecutionMode.Unprocessed`, the session must check the
+		 * code for completeness first; if it is incomplete, reject with an
+		 * error whose `name` is `'CodeIncompleteError'`. Returning `void`
+		 * (the historical behavior) is treated as immediate acceptance.
+		 */
+		execute(
+			code: string,
+			id: string,
+			mode: RuntimeCodeExecutionMode,
+			errorBehavior: RuntimeErrorBehavior,
+			codeLocation?: Utf8Location,
+			executionMetadata?: Record<string, any>,
+		): Thenable<void> | void;
+
+		/**
+		 * Shut down the runtime; returns a Thenable that resolves when the
+		 * runtime shutdown sequence has been successfully started (not
+		 * necessarily when it has completed).
+		 */
+		shutdown(exitReason: RuntimeExitReason): Thenable<void>;
+	}
+
+	/**
+	 * LanguageRuntimeSession is the full interface implemented by extensions
+	 * that provide a set of common tools for interacting with a language
+	 * runtime, such as code execution, LSP implementation, and plotting.
+	 */
+	export interface LanguageRuntimeSession extends BaseLanguageRuntimeSession, vscode.Disposable {
+
+		/** Information about the runtime that is only available after starting. */
+		readonly runtimeInfo: LanguageRuntimeInfo | undefined;
+
+		/** An object that emits language runtime events */
+		onDidReceiveRuntimeMessage: vscode.Event<LanguageRuntimeMessage>;
+
+		/** An object that emits the current state of the runtime */
+		onDidChangeRuntimeState: vscode.Event<RuntimeState>;
+
+		/** An object that emits an event when the user's session ends and the runtime exits */
+		onDidEndSession: vscode.Event<LanguageRuntimeExit>;
+
+		/** An object that emits an event when the runtime's resource usage is updated */
+		onDidUpdateResourceUsage: vscode.Event<RuntimeResourceUsage>;
+
+		/**
+		 * Opens a resource in the runtime.
+		 * @param resource The resource to open.
+		 * @returns true if the resource was opened; otherwise, false.
+		 */
+		openResource?(resource: vscode.Uri | string): Thenable<boolean>;
+
+		/**
+		 * Sends a Debug Adapter Protocol request to the runtime's debugger.
+		 *
+		 * @param request The Debug Adapter Protocol request.
+		 * @returns The Debug Adapter Protocol response.
+		 */
+		debug(request: DebugProtocolRequest): Thenable<DebugProtocolResponse>;
+
+		/** Test a code fragment for completeness */
+		isCodeFragmentComplete(code: string): Thenable<RuntimeCodeFragmentStatus>;
+
+		/**
+		 * Create a new instance of a client; return null if the client type
+		 * is not supported by this runtime, or a string containing the ID of
+		 * the client if it is supported.
+		 *
+		 * @param id The unique, client-supplied ID of the client instance. Can be any
+		 *   unique string.
+		 * @param type The type of client to create
+		 * @param params A set of parameters to pass to the client; specific to the client type
+		 * @param metadata A set of metadata to pass to the client; specific to the client type
+		 */
+		createClient(id: string, type: RuntimeClientType, params: Record<string, unknown>, metadata?: Record<string, unknown>): Thenable<void>;
+
+		/**
+		 * List all clients, optionally filtered by type.
+		 *
+		 * @param type If specified, only clients of this type will be returned.
+		 * @returns A Thenable that resolves with a map of client IDs to client types.
+		 */
+		listClients(type?: RuntimeClientType): Thenable<Record<string, string>>;
+
+		/** Remove an instance of a client (created with `createClient`) */
+		removeClient(id: string): void;
+
+		/**
+		 * Send a message to the server end of a client instance. Any replies to the message
+		 * will be sent back to the client via the `onDidReceiveRuntimeMessage` event, with
+		 * the `parent_id` field set to the `message_id` given here.
+		 */
+		sendClientMessage(client_id: string, message_id: string, message: Record<string, unknown>): void;
+
+		/** Reply to a prompt issued by the runtime */
+		replyToPrompt(id: string, reply: string): void;
+
+		/**
+		 * Set the current working directory of the session.
+		 */
+		setWorkingDirectory(dir: string): Thenable<void>;
+
+		/**
+		 * Start the session; returns a Thenable that resolves with information about the runtime.
+		 * If the runtime fails to start for any reason, the Thenable should reject with an error
+		 * object containing a `message` field with a human-readable error message and an optional
+		 * `details` field with additional information.
+		 */
+		start(): Thenable<LanguageRuntimeInfo>;
+
+		/**
+		 * Interrupt the runtime; returns a Thenable that resolves when the interrupt has been
+		 * successfully sent to the runtime (not necessarily when it has been processed)
+		 */
+		interrupt(): Thenable<void>;
+
+		/**
+		 * Restart the runtime; returns a Thenable that resolves when the runtime restart sequence
+		 * has been successfully started (not necessarily when it has completed). A restart will
+		 * cause the runtime to be shut down and then started again; its status will change from
+		 * `Restarting` => `Exited` => `Initializing` => `Starting` => `Ready`.
+		 *
+		 * @param workingDirectory The new working directory to use for the
+		 * restarted runtime, if any. Use `undefined` to keep the current
+		 * working directory.
+		 */
+		restart(workingDirectory?: string): Thenable<void>;
+
+		/**
+		 * Forcibly quits the runtime; returns a Thenable that resolves when the
+		 * runtime has been terminated. This may be called by Positron if the
+		 * runtime fails to respond to an interrupt and/or shutdown call, and
+		 * should forcibly terminate any underlying processes.
+		 */
+		forceQuit(): Thenable<void>;
+
+		/**
+		 * Update the session name.
+		 *
+		 * @param sessionName The new session name
+		 */
+		updateSessionName(sessionName: string): void;
+
+		/**
+		 * Update the URI of the notebook this session belongs to, for example
+		 * after an untitled notebook or Quarto document is saved to a file.
+		 *
+		 * A session whose language client selects cells by notebook URI should
+		 * implement this and select them again.
+		 *
+		 * @param notebookUri The notebook's new URI
+		 * @param quartoNotebookUri For a Quarto session, the URI of the hidden
+		 *   notebook that holds the document's cells at its new URI
+		 */
+		updateNotebookUri?(notebookUri: vscode.Uri, quartoNotebookUri: vscode.Uri | undefined): Thenable<void>;
+
+		/**
+		 * Returns the kernel launch parameters used to start this session,
+		 * if available.
+		 */
+		getLaunchInfo?(): LanguageRuntimeLaunchInfo | undefined;
+
+
+		/**
+		 * Show runtime log in output panel.
+		 *
+		 * @param channel The channel to show the output in
+		 */
+		showOutput?(channel?: LanguageRuntimeSessionChannel): void;
+
+		/**
+		 * Return a list of output channels
+		 *
+		 * @returns A list of output channels available on this runtime
+		 */
+		listOutputChannels?(): LanguageRuntimeSessionChannel[];
+
+		/**
+		 * Show profiler log if supported.
+		 */
+		showProfile?(): Thenable<void>;
+
+		/**
+		 * Get the package manager for this session, if available.
+		 *
+		 * Returns undefined if the runtime does not support package management.
+		 */
+		getPackageManager?(): LanguageRuntimePackageManager;
+
+		/**
+		 * Statically analyze code (or a file) and return packages that are
+		 * referenced but NOT installed AND that can be installed in this
+		 * session's environment.
+		 *
+		 * MUST NOT return packages that cannot be resolved/installed (e.g.
+		 * GitHub-only R packages, unknown PyPI names). SHOULD be fast and cache
+		 * internally; callers will not block UI on it.
+		 *
+		 * @param target The code or file to analyze.
+		 * @param token Optional cancellation token.
+		 */
+		listMissingPackages?(target: RuntimeMissingPackagesTarget, token?: vscode.CancellationToken): Thenable<RuntimeMissingPackage[]>;
+
+		/**
+		 * Given a console error produced by this session, return a minimal code
+		 * snippet that references the missing package (e.g. `import foo`), for
+		 * the frontend to feed back through `listMissingPackages` and confirm the
+		 * package is installable. Return undefined when the error is not a
+		 * recognized missing-package error.
+		 *
+		 * Owning error-message parsing here (rather than in the frontend) keeps
+		 * the frontend language-agnostic.
+		 *
+		 * @param error The console error to inspect.
+		 * @param token Optional cancellation token.
+		 */
+		getMissingPackageProbe?(error: RuntimeConsoleError, token?: vscode.CancellationToken): string | undefined | Thenable<string | undefined>;
+	}
+
+
+	/**
+	 * A data structure that describes a handler for a runtime client instance,
+	 * and is called when an instance is created.
+	 *
+	 * @param client The client instance that was created
+	 * @param params A set of parameters passed to the client
+	 * @returns true if the handler took ownership of the client, false otherwise
+	 */
+	export type RuntimeClientHandlerCallback = (
+		client: RuntimeClientInstance,
+		params: Object,) => boolean;
+
+	/**
+	 * A data structure that describes a handler for a runtime client instance.
+	 */
+	export interface RuntimeClientHandler {
+		/**
+		 * The type of client that this handler handles.
+		 */
+		clientType: string;
+
+		/**
+		 * A callback that is called when a client of the given type is created;
+		 * returns whether the handler took ownership of the client.
+		 */
+		callback: RuntimeClientHandlerCallback;
+	}
+
+	/**
+	 * Content settings for webviews hosted in the Preview panel.
+	 *
+	 * This interface mirrors the `WebviewOptions` & `WebviewPanelOptions` interfaces, with
+	 * the following exceptions:
+	 *
+	 * - `enableFindWidget` is not supported (we never show it in previews)
+	 * - `retainContextWhenHidden` is not supported (we always retain context)
+	 * - `enableCommandUris` is not supported (we never allow commands in previews)
+	 */
+	export interface PreviewOptions {
+		/**
+		 * Controls whether scripts are enabled in the webview content or not.
+		 *
+		 * Defaults to false (scripts-disabled).
+		 */
+		readonly enableScripts?: boolean;
+
+		/**
+		 * Controls whether forms are enabled in the webview content or not.
+		 *
+		 * Defaults to true if {@link PreviewOptions.enableScripts scripts are enabled}. Otherwise defaults to false.
+		 * Explicitly setting this property to either true or false overrides the default.
+		 */
+		readonly enableForms?: boolean;
+
+		/**
+		 * Root paths from which the webview can load local (filesystem) resources using uris from `asWebviewUri`
+		 *
+		 * Default to the root folders of the current workspace plus the extension's install directory.
+		 *
+		 * Pass in an empty array to disallow access to any local resources.
+		 */
+		readonly localResourceRoots?: readonly vscode.Uri[];
+
+		/**
+		 * Mappings of localhost ports used inside the webview.
+		 *
+		 * Port mapping allow webviews to transparently define how localhost ports are resolved. This can be used
+		 * to allow using a static localhost port inside the webview that is resolved to random port that a service is
+		 * running on.
+		 *
+		 * If a webview accesses localhost content, we recommend that you specify port mappings even if
+		 * the `webviewPort` and `extensionHostPort` ports are the same.
+		 *
+		 * *Note* that port mappings only work for `http` or `https` urls. Websocket urls (e.g. `ws://localhost:3000`)
+		 * cannot be mapped to another port.
+		 */
+		readonly portMapping?: readonly vscode.WebviewPortMapping[];
+	}
+
+	/**
+	 * A preview panel that contains a webview. This interface mirrors the
+	 * `WebviewPanel` interface, but omits elements that don't apply to
+	 * preview panels, such as `viewColumn`.
+	 */
+	export interface PreviewPanel {
+		/**
+		 * Identifies the type of the preview panel, such as `'markdown.preview'`.
+		 */
+		readonly viewType: string;
+
+		/**
+		 * Title of the panel shown in UI.
+		 */
+		title: string;
+
+		/**
+		 * {@linkcode Webview} belonging to the panel.
+		 */
+		readonly webview: vscode.Webview;
+
+		/**
+		 * Whether the panel is active (focused by the user).
+		 */
+		readonly active: boolean;
+
+		/**
+		 * Whether the panel is visible.
+		 */
+		readonly visible: boolean;
+
+		/**
+		 * Fired when the panel's view state changes.
+		 */
+		readonly onDidChangeViewState: vscode.Event<PreviewPanelOnDidChangeViewStateEvent>;
+
+		/**
+		 * Fired when the panel is disposed.
+		 *
+		 * This may be because the user closed the panel or because `.dispose()` was
+		 * called on it.
+		 *
+		 * Trying to use the panel after it has been disposed throws an exception.
+		 */
+		readonly onDidDispose: vscode.Event<void>;
+
+		/**
+		 * Whether the Viewer shows a stop button for this preview. Set this to
+		 * `true` while the process that serves the preview's content is
+		 * running, and to `false` when it stops. When the user clicks the
+		 * button, the Viewer sets this to `false` and fires
+		 * {@link onDidRequestStop}. Defaults to `false`.
+		 *
+		 * Applies only to panels from {@link window.createPreviewPanel}.
+		 * Panels from {@link window.previewUrl} get a stop button from their
+		 * `source` instead.
+		 */
+		stoppable: boolean;
+
+		/**
+		 * Fired when the user clicks the Viewer's stop button. The extension
+		 * stops its process, and disposes the panel if it wants to close the
+		 * preview; clicking stop does not close the preview.
+		 *
+		 * The user can also close the preview with the Viewer's clear button,
+		 * which fires {@link onDidDispose} but not this event. Stop the process
+		 * in an `onDidDispose` handler too if it should not outlive the preview.
+		 */
+		readonly onDidRequestStop: vscode.Event<void>;
+
+		/**
+		 * Show the preview panel
+		 *
+		 * Only one preview panel can be shown at a time. If a different preview
+		 * is already showing, it will be hidden.
+		 *
+		 * @param preserveFocus When `true`, the webview will not take focus.
+		 */
+		reveal(preserveFocus?: boolean): void;
+
+		/**
+		 * Dispose of the preview panel.
+		 *
+		 * This closes the panel if it showing and disposes of the resources
+		 * owned by the underlying webview.  Preview panels are also disposed
+		 * when the user closes the preview panel. Both cases fire the
+		 * `onDispose` event.
+		 */
+		dispose(): any;
+	}
+
+	/**
+	 * Event fired when a preview panel's view state changes.
+	 */
+	export interface PreviewPanelOnDidChangeViewStateEvent {
+		/**
+		 * Preview panel whose view state changed.
+		 */
+		readonly previewPanel: PreviewPanel;
+	}
+
+	/**
+	 * The type of source that opened a preview.
+	 */
+	export enum PreviewSourceType {
+		/** The preview was opened by a language runtime. */
+		Runtime = 'runtime',
+		/** The preview was opened by a terminal. */
+		Terminal = 'terminal',
+	}
+
+	/**
+	 * Source information for preview content, indicating what opened the preview.
+	 */
+	export interface PreviewSource {
+		/**
+		 * The type of source that opened the preview.
+		 */
+		readonly type: PreviewSourceType;
+
+		/**
+		 * The ID of the source. For 'runtime', this is the session ID;
+		 * for 'terminal', this is the terminal process ID.
+		 */
+		readonly id: string;
+	}
+
+	export interface StatementRangeProvider {
+		/**
+		 * Given a cursor position, return the range of the statement that the
+		 * cursor is within. If the cursor is not within a statement, return the
+		 * range of the next statement, if one exists.
+		 *
+		 * Throw a {@link StatementRangeSyntaxError} to indicate that a statement range
+		 * cannot be provided due to a syntax error in the document.
+		 *
+		 * @param document The document in which the command was invoked.
+		 * @param position The position at which the command was invoked.
+		 * @param token A cancellation token.
+		 * @return The range of the statement at the given position.
+		 */
+		provideStatementRange(document: vscode.TextDocument,
+			position: vscode.Position,
+			token: vscode.CancellationToken): vscode.ProviderResult<StatementRange>;
+	}
+
+	/**
+	 * The range of a statement, plus optionally the code for the range.
+	 */
+	export interface StatementRange {
+		/**
+		 * The range of the statement at the given position.
+		 */
+		readonly range: vscode.Range;
+
+		/**
+		 * The code for this statement range, if different from the document contents at this range.
+		 */
+		readonly code?: string;
+	}
+
+	/**
+	 * An error thrown by a {@link StatementRangeProvider} to indicate that a statement range
+	 * cannot be provided due to a syntax error in the document.
+	 */
+	export class StatementRangeSyntaxError extends Error {
+		/**
+		 * Zero indexed line number where the syntax error occurred.
+		 */
+		readonly line?: number;
+
+		/**
+		 * Creates a new statement range syntax error.
+		 *
+		 * @param line Zero indexed line number where the syntax error occurred.
+		 */
+		constructor(line?: number);
+	}
+
+	export interface InputBoundaryRange {
+		/**
+		 * Zero indexed starting line of the input.
+		 */
+		readonly start: number;
+
+		/**
+		 * Zero indexed ending line of the input, exclusive.
+		 */
+		readonly end: number;
+	}
+
+	export type InputBoundaryKind = 'whitespace' | 'complete' | 'incomplete' | 'invalid';
+
+	export interface InputBoundary {
+		/**
+		 * The line range of this input boundary, relative to the requested range.
+		 */
+		readonly range: InputBoundaryRange;
+
+		/**
+		 * The parse status of this input.
+		 */
+		readonly kind: InputBoundaryKind;
+
+		/**
+		 * Additional data for this input boundary.
+		 */
+		readonly data?: {
+			readonly message?: string;
+		};
+	}
+
+	export interface InputBoundaryProvider {
+		/**
+		 * Given a document range, return the input boundaries within that range.
+		 *
+		 * @param document The document containing the requested range.
+		 * @param range The range to split into input boundaries.
+		 * @param token A cancellation token.
+		 * @return The input boundaries within the requested range.
+		 */
+		provideInputBoundaries(document: vscode.TextDocument,
+			range: vscode.Range,
+			token: vscode.CancellationToken): vscode.ProviderResult<InputBoundary[]>;
+	}
+
+	export interface HelpTopicProvider {
+		/**
+		 * Given a cursor position, return the help topic relevant to the cursor
+		 * position, or an empty string if no help topic is recommended or
+		 * relevant.
+		 *
+		 * @param document The document in which the command was invoked.
+		 * @param position The position at which the command was invoked.
+		 * @param token A cancellation token.
+		 * @return A string containing the help topic relevant to the cursor
+		 *   position
+		 */
+		provideHelpTopic(document: vscode.TextDocument,
+			position: vscode.Position,
+			token: vscode.CancellationToken): vscode.ProviderResult<string>;
+	}
+
+	export interface Console {
+		/**
+		 * Pastes text into the console.
+		 */
+		pasteText(text: string): void;
+	}
+
+	/**
+	 * Start Data Connections
+	 */
+
+	/**
+	 * DataConnectionParameterType enumeration.
+	 */
+	export enum DataConnectionParameterType {
+		Boolean = 'boolean',
+		File = 'file',
+		Number = 'number',
+		Option = 'option',
+		Password = 'password',
+		String = 'string',
+	}
+
+	/**
+	 * DataConnectionParameterBase interface defines common fields shared by all data connection parameter types.
+	 */
+	export interface DataConnectionParameterBase {
+		/**
+		 * The unique identifier for the parameter.
+		 */
+		id: string;
+
+		/**
+		 * A human-readable label for the parameter.
+		 */
+		label: string;
+
+		/**
+		 * An optional, longer help text shown beneath the field to explain the parameter's purpose or
+		 * its behavior when left blank (e.g. "Defaults to your operating system account if empty").
+		 * Distinct from `placeholder`, which shows an example of the expected value.
+		 */
+		description?: string;
+
+		/**
+		 * Whether this parameter is required.
+		 */
+		required?: boolean;
+	}
+
+	/**
+	 * A data connection parameter. The `type` discriminant determines which additional fields are
+	 * available.
+	 */
+	export type DataConnectionParameter = DataConnectionParameterBase & (
+		| {
+			type: DataConnectionParameterType.Boolean;
+			defaultValue?: boolean;
+		}
+		| {
+			type: DataConnectionParameterType.File;
+			defaultValue?: string;
+			placeholder?: string;
+
+			/**
+			 * File-type filters for the file picker opened by the field's Browse button, in the
+			 * same format as {@link vscode.OpenDialogOptions.filters}: each key is a human-readable
+			 * label and each value is a list of extensions without dots, for example:
+			 * ```ts
+			 * { 'SQLite Files': ['sqlite', 'sqlite3', 'db'] }
+			 * ```
+			 * Filters are shown in declaration order and the first one is the picker's default
+			 * selection. An "All Files" option is always appended, so drivers should not declare
+			 * one. When omitted, the picker shows "All Files" only.
+			 */
+			filters?: { [name: string]: string[] };
+		}
+		| {
+			type: DataConnectionParameterType.Number;
+			defaultValue?: number;
+			placeholder?: string;
+		}
+		| {
+			type: DataConnectionParameterType.Option;
+			options: string[];
+			defaultValue?: string;
+			placeholder?: string;
+		}
+		| {
+			// Password fields are always secret and cannot have a default value.
+			type: DataConnectionParameterType.Password;
+			secret: true;
+			placeholder?: string;
+		}
+		| {
+			// Non-secret strings can have a default value.
+			type: DataConnectionParameterType.String;
+			secret?: false;
+			defaultValue?: string;
+			placeholder?: string;
+		}
+		| {
+			// Secret strings cannot have a default value.
+			type: DataConnectionParameterType.String;
+			secret: true;
+			placeholder?: string;
+
+			/**
+			 * Whether the input is masked (rendered like a password field). Defaults to `true` for
+			 * secret strings. Set to `false` to render the value in plaintext while still storing it
+			 * in secret storage -- useful for values the user should be able to read back as they
+			 * type, such as a connection string.
+			 */
+			masked?: boolean;
+		}
+	);
+
+	/**
+	 * DataConnectionParameterValues is a key-value map of parameter id to parameter value.
+	 */
+	export type DataConnectionParameterValues = Record<string, string | number | boolean>;
+
+	/**
+	 * A configuration mechanism for a data connection driver. A driver exposes one or more
+	 * mechanisms, each describing a distinct way to configure a connection (for example, a
+	 * PostgreSQL driver may offer separate mechanisms for user/password and certificate-based
+	 * authentication). Each mechanism carries its own set of parameters.
+	 */
+	export interface DataConnectionMechanism {
+		/**
+		 * A stable identifier for the mechanism, unique within the driver.
+		 */
+		id: string;
+
+		/**
+		 * A short user-facing label for the mechanism (e.g. 'Username & Password').
+		 */
+		label: string;
+
+		/**
+		 * A user-facing description of the mechanism, shown as supporting text.
+		 */
+		description: string;
+
+		/**
+		 * The parameters required to configure a connection using this mechanism.
+		 */
+		parameters: DataConnectionParameter[];
+	}
+
+	/**
+	 * A driver that provides data connections through the 'New Database' dialog.
+	 */
+	/**
+	 * A named variant of generated connection code for a single language. A driver may offer
+	 * several variants per language (for example, Python `sqlite3` vs `SQLAlchemy`) so users can
+	 * pick the library they prefer.
+	 */
+	export interface ConnectionCodeVariant {
+		/**
+		 * A stable identifier for the variant (e.g. 'sqlite3', 'sqlalchemy'). Unique within the
+		 * variants returned for a given language.
+		 */
+		id: string;
+
+		/**
+		 * A user-facing label for the variant (e.g. 'sqlite3', 'SQLAlchemy').
+		 */
+		label: string;
+
+		/**
+		 * The generated connection code for this variant.
+		 */
+		code: string;
+	}
+
+	/**
+	 * The logging surface a data connection driver writes to. `vscode.LogOutputChannel`
+	 * satisfies it structurally, and a driver's internal modules can depend on this
+	 * interface alone so they stay free of a `vscode` import.
+	 */
+	export interface DataConnectionLogger {
+		trace(message: string): void;
+		debug(message: string): void;
+		info(message: string): void;
+		warn(message: string): void;
+		error(message: string): void;
+	}
+
+	export interface DataConnectionDriver {
+		/**
+		 * The driver identifier.
+		 */
+		id: string;
+
+		/**
+		 * The driver name.
+		 */
+		name: string;
+
+		/**
+		 * The driver description.
+		 */
+		description: string;
+
+		/**
+		 * The icon SVG.
+		 */
+		iconSvg: string;
+
+		/**
+		 * The configuration mechanisms this driver supports. Each mechanism describes a distinct
+		 * way to configure a connection and carries its own set of parameters. A driver must expose
+		 * at least one mechanism.
+		 */
+		mechanisms: DataConnectionMechanism[];
+
+		/**
+		 * The language identifiers this driver supports.
+		 */
+		supportedLanguageIds: string[];
+
+		/**
+		 * Connects using the selected mechanism and the provided parameter values.
+		 *
+		 * @param mechanismId The id of the mechanism the user selected. One of this driver's
+		 *   `mechanisms`.
+		 * @param parameters The current values of the parameters defined by the selected mechanism.
+		 */
+		connect(mechanismId: string, parameters: DataConnectionParameterValues): Thenable<DataConnection>;
+
+		/**
+		 * Generates one or more named code variants that connect to this data source in the given
+		 * language, using the selected mechanism and the provided parameter values. The language is
+		 * one of the driver's `supportedLanguageIds`; drivers that report no supported languages need
+		 * not implement this method. Variants are returned in preference order, so the first is
+		 * treated as the default.
+		 *
+		 * @param mechanismId The id of the mechanism the user selected. One of this driver's
+		 *   `mechanisms`.
+		 * @param languageId The language to generate code for (e.g. 'python', 'r'). Always one of
+		 *   the driver's `supportedLanguageIds`.
+		 * @param parameters The current values of the parameters defined by the selected mechanism.
+		 * @returns The available code variants, or an empty array if code cannot be generated from
+		 *   the given parameters (for example, when a required parameter is missing).
+		 */
+		generateConnectionCode?(mechanismId: string, languageId: string, parameters: DataConnectionParameterValues): Thenable<ConnectionCodeVariant[]>;
+
+		/**
+		 * Produces a display-safe, redacted form of a stored secret parameter value, shown in the
+		 * configuration dialog when editing an existing connection (for example, masking the password
+		 * embedded in a connection string). Only called for secret parameters that render in plaintext
+		 * (`masked: false`); the redacted string is used as the field's placeholder. The cleartext
+		 * value never leaves the extension host -- only the returned string is sent to the dialog.
+		 *
+		 * @param mechanismId The id of the mechanism the connection was configured with. One of this
+		 *   driver's `mechanisms`.
+		 * @param parameterId The id of the parameter to redact.
+		 * @param value The stored cleartext parameter value.
+		 * @returns The redacted string to display, or undefined to show no placeholder.
+		 */
+		redactParameterValue?(mechanismId: string, parameterId: string, value: string): vscode.ProviderResult<string>;
+
+		/**
+		 * Validates and normalizes the parameter values the user entered in the configuration dialog
+		 * before the connection is saved -- for example, checking that a database file exists and is
+		 * of the right kind, and resolving a relative path to an absolute one. Runs in the extension
+		 * host, so file checks see the same file system `connect` will. When the result carries any
+		 * errors, the dialog shows them beside their fields and does not save.
+		 *
+		 * Secret parameters the user left blank (to keep a stored value) are absent from `parameters`.
+		 *
+		 * @param mechanismId The id of the mechanism the user selected. One of this driver's
+		 *   `mechanisms`.
+		 * @param parameters The parameter values the user entered.
+		 * @returns The validation result. Return an empty object when the values are valid as entered.
+		 */
+		validateParameters?(mechanismId: string, parameters: DataConnectionParameterValues): Thenable<DataConnectionParameterValidation>;
+
+		/**
+		 * Reports connections this driver already knows about on this machine, without the user
+		 * having configured anything -- ODBC data sources declared in `odbc.ini`, for example.
+		 *
+		 * Positron shows these in the Data Connections pane alongside saved connections, so a data
+		 * source the machine is already set up for is connectable straight away. They are not
+		 * persisted: a discovered connection that stops being reported simply stops appearing, and
+		 * one the user saves becomes an ordinary saved connection from then on (and is no longer
+		 * shown as discovered).
+		 *
+		 * Called when the driver registers, whenever the set of registered drivers changes, and
+		 * whenever the driver fires {@link DataConnectionDriver.onDidChange}.
+		 *
+		 * @returns The connections found on this machine, or an empty array if there are none.
+		 */
+		discoverConnections?(): Thenable<DiscoveredDataConnection[]>;
+
+		/**
+		 * Fires when the driver's `mechanisms` or its discovered connections have changed. Positron
+		 * then re-reads the driver's metadata and calls `discoverConnections` again. Unlike
+		 * re-registering the driver, this leaves the driver's open connections in place.
+		 */
+		onDidChange?: vscode.Event<void>;
+	}
+
+	/**
+	 * The result of {@link DataConnectionDriver.validateParameters}. Both maps are keyed by the ids
+	 * of the selected mechanism's parameters; entries under any other key are ignored.
+	 */
+	export interface DataConnectionParameterValidation {
+		/**
+		 * Replacement values, keyed by parameter id, for parameters the driver normalized (for
+		 * example, a relative path resolved to an absolute one). These are the values saved.
+		 * Parameters not listed keep the value the user entered.
+		 */
+		normalizedValues?: DataConnectionParameterValues;
+
+		/**
+		 * Error messages, keyed by parameter id, shown beside the fields they apply to. When any are
+		 * present, the connection is not saved.
+		 */
+		errors?: Record<string, string>;
+	}
+
+	/**
+	 * A connection a driver found already configured on this machine, reported by
+	 * {@link DataConnectionDriver.discoverConnections}.
+	 */
+	export interface DiscoveredDataConnection {
+		/**
+		 * An identifier for this connection, unique within the driver and stable across sessions
+		 * (so the pane can keep a discovered connection's expansion state). Positron namespaces it
+		 * by driver, so it need not be globally unique.
+		 */
+		id: string;
+
+		/** The name to show in the pane. */
+		name: string;
+
+		/** An optional one-line summary of where the connection points, shown beneath the name. */
+		description?: string;
+
+		/** The id of the mechanism to connect with. One of this driver's `mechanisms`. */
+		mechanismId: string;
+
+		/** The parameter values to connect with, for the parameters that mechanism defines. */
+		parameters: DataConnectionParameterValues;
+	}
+
+	/**
+	 * DataConnectionNodeKind enumeration.
+	 */
+	export enum DataConnectionNodeKind {
+		Database = 'database',
+		// A catalog: the level above a schema in a three-part namespace, e.g. a Unity Catalog
+		// catalog (positron-data-driver-databricks).
+		Catalog = 'catalog',
+		Schema = 'schema',
+		Table = 'table',
+		View = 'view',
+		Field = 'field',
+		// Category containers that group sibling nodes (e.g. "Tables", "Views").
+		GroupDatabases = 'group-databases',
+		GroupCatalogs = 'group-catalogs',
+		GroupSchemas = 'group-schemas',
+		GroupTables = 'group-tables',
+		GroupViews = 'group-views',
+		GroupColumns = 'group-columns',
+		GroupIndexes = 'group-indexes',
+		GroupStages = 'group-stages',
+		GroupVolumes = 'group-volumes',
+		Index = 'index',
+		// A Snowflake stage: a named location for staging files (positron-data-driver-snowflake).
+		Stage = 'stage',
+		// A Unity Catalog volume: a governed location for non-tabular files
+		// (positron-data-driver-databricks).
+		Volume = 'volume',
+		// A directory inside a volume or stage, and a file inside one. Both hold files rather than rows,
+		// so they are browsable but not previewable in the Data Explorer.
+		Directory = 'directory',
+		File = 'file',
+		// A note in the tree rather than an object, e.g. that a long listing was cut short. Give it no
+		// children, preview, details, or path.
+		Notice = 'notice',
+		// The owner (user) that a group of pins belongs to (positron-data-driver-pins).
+		Owner = 'owner',
+		// A pin on a Posit Connect server (positron-data-driver-pins).
+		Pin = 'pin',
+		// A version (bundle) of a pin on a Posit Connect server (positron-data-driver-pins).
+		Version = 'version',
+		// A Snowflake semantic view: a schema-level business model (logical tables, relationships,
+		// facts, dimensions, metrics) over existing tables (positron-data-driver-snowflake). It holds
+		// definitions rather than rows, so it and its members are browsable but not previewable in
+		// the Data Explorer.
+		GroupSemanticViews = 'group-semantic-views',
+		SemanticView = 'semantic-view',
+		// The members of a semantic view, and the groups that hold them. A logical table is the
+		// semantic view's alias for a base table, and holds that table's dimensions (grouping
+		// attributes), time dimensions (date and time attributes), facts (row-level expressions),
+		// named filters (reusable conditions), and metrics (aggregations). A relationship joins two
+		// logical tables, and a derived metric is a view-level metric built from other metrics.
+		GroupLogicalTables = 'group-logical-tables',
+		GroupRelationships = 'group-relationships',
+		GroupFacts = 'group-facts',
+		GroupDimensions = 'group-dimensions',
+		GroupTimeDimensions = 'group-time-dimensions',
+		GroupNamedFilters = 'group-named-filters',
+		GroupMetrics = 'group-metrics',
+		GroupDerivedMetrics = 'group-derived-metrics',
+		LogicalTable = 'logical-table',
+		Relationship = 'relationship',
+		Fact = 'fact',
+		Dimension = 'dimension',
+		TimeDimension = 'time-dimension',
+		NamedFilter = 'named-filter',
+		Metric = 'metric',
+	}
+
+	export interface DataConnectionNode {
+		/**
+		 * Display name.
+		 */
+		name: string;
+
+		/**
+		 * Node type: database, schema, table, view, field, etc.
+		 */
+		kind: DataConnectionNodeKind;
+
+		/**
+		 * Data type information, for field nodes.
+		 */
+		dataType?: string;
+
+		/**
+		 * For field nodes under a table, whether the column is part of the table's primary key.
+		 * Columns under views are not part of a primary key, so this is left unset for them.
+		 */
+		isPrimaryKey?: boolean;
+
+		/**
+		 * The node's full path, in the form the source itself accepts, for copying: e.g. a table's
+		 * quoted three-part name (`"DB"."PUBLIC"."ORDERS"`) or a file's location
+		 * (`@"DB"."PUBLIC"."STAGE"/2024/orders.csv`). Positron offers "Copy Path" for nodes that set
+		 * it. Leave it unset for nodes that have no path of their own, such as groups.
+		 */
+		path?: string;
+
+		/**
+		 * What double-clicking the node opens, for a node that has both a preview and details.
+		 * Defaults to `'preview'`: a table's data is what users reach for. Set `'details'` for a node
+		 * whose details are what it holds, and whose preview opens something else's data -- e.g. a
+		 * semantic view's logical table, which previews its base table. Either way a single click
+		 * shows the details, and the context menu offers both.
+		 */
+		defaultAction?: 'preview' | 'details';
+
+		/**
+		 * The number of nodes `getChildren` would return, for a node whose driver knows it without
+		 * fetching them -- e.g. a "Tables" group built from a listing the driver already holds, or
+		 * counted by one cheap catalog query. Positron shows it on a group node's row (one of the
+		 * `Group*` kinds) before the node is expanded, as "Tables (14)"; once expanded, the children
+		 * themselves are counted instead. Leave notice nodes (`DataConnectionNodeKind.Notice`) out of
+		 * the count; Positron does not count them as children.
+		 * Leave it unset rather than guess, or run a query per node just to fill it: a "Views" group
+		 * with a count of 0, for one, is left out of the tree without being listed.
+		 */
+		childCount?: number;
+
+		/**
+		 * Retrieve child nodes (e.g., tables in a schema, fields in a table).
+		 */
+		getChildren?(): Thenable<DataConnectionNode[]>;
+
+		/**
+		 * Preview the data in this node (e.g., SELECT * FROM table LIMIT 100).
+		 *
+		 * Return the dataset id the preview was opened under -- the same `datasetId` passed to
+		 * `positron.dataExplorer.open` -- so Positron can relate the open Data Explorer back to the
+		 * connection it came from. Returning nothing is supported, but Positron then has no way to
+		 * know the connection has an open Data Explorer, and may close the connection while it is
+		 * still in use.
+		 */
+		preview?(): Thenable<string | void>;
+
+		/**
+		 * Describe this node in detail. Positron shows the result in a details editor when the user
+		 * clicks the node, so implement this for nodes whose definition is worth reading on its own
+		 * (e.g. a semantic view metric's expression, or a stage's location).
+		 *
+		 * The result is a snapshot: Positron fetches it when the editor opens, and again when the
+		 * user clicks the node again.
+		 */
+		getDetails?(): Thenable<DataConnectionNodeDetails>;
+	}
+
+	/**
+	 * The details of a data connection node, shown in the details editor. The node's own name and
+	 * kind head the editor; this supplies what goes beneath them.
+	 */
+	export interface DataConnectionNodeDetails {
+		/**
+		 * A short line saying what and where the node is, shown under its name
+		 * (e.g. "Metric in DEMO_DB.PUBLIC.SALES_MODEL").
+		 */
+		description?: string;
+
+		/**
+		 * The sections of the details, shown in order. Ignored when `tabs` is set.
+		 */
+		sections: DataConnectionNodeDetailsSection[];
+
+		/**
+		 * The details split into tabs (e.g. an Overview and a Definition), for nodes with more to
+		 * show than reads well on one page. When set, the editor shows a tab strip over these in
+		 * place of `sections`.
+		 */
+		tabs?: DataConnectionNodeDetailsTab[];
+	}
+
+	/**
+	 * A tab of a data connection node's details.
+	 */
+	export interface DataConnectionNodeDetailsTab {
+		/**
+		 * The tab's name.
+		 */
+		title: string;
+
+		/**
+		 * The tab's sections, shown in order.
+		 */
+		sections: DataConnectionNodeDetailsSection[];
+	}
+
+	/**
+	 * A section of a data connection node's details.
+	 */
+	export type DataConnectionNodeDetailsSection =
+		| DataConnectionNodeDetailsPropertiesSection
+		| DataConnectionNodeDetailsCodeSection
+		| DataConnectionNodeDetailsTableSection
+		| DataConnectionNodeDetailsGroupSection
+		| DataConnectionNodeDetailsItemsSection;
+
+	/**
+	 * A heading over sections of its own, which may themselves be groups (e.g. "Logical Tables",
+	 * holding a group per table, each holding its "Dimensions"). Nested groups are shown at
+	 * successively smaller heading levels.
+	 */
+	export interface DataConnectionNodeDetailsGroupSection {
+		kind: 'group';
+
+		/**
+		 * The group's heading.
+		 */
+		title: string;
+
+		/**
+		 * A count shown beside the heading (e.g. how many items the group holds).
+		 */
+		count?: number;
+
+		/**
+		 * Whether the user can collapse the group. Collapsible groups start expanded.
+		 */
+		collapsible?: boolean;
+
+		/**
+		 * The tree node the group stands for, if it stands for one, as the kind and name of each node
+		 * on the way down from the node these details describe (e.g. a semantic view's "Dimensions"
+		 * group under one of its logical tables). The group's heading then shows that node in the
+		 * Data Connections pane when clicked.
+		 */
+		treePath?: { kind: DataConnectionNodeKind; name: string }[];
+
+		/**
+		 * The group's sections, shown in order.
+		 */
+		sections: DataConnectionNodeDetailsSection[];
+	}
+
+	/**
+	 * A list of named things (e.g. a semantic view's dimensions), each with an optional data type,
+	 * description, and snippet of code.
+	 */
+	export interface DataConnectionNodeDetailsItemsSection {
+		kind: 'items';
+
+		/**
+		 * The section's heading, if it has one.
+		 */
+		title?: string;
+
+		/**
+		 * The items, shown in order.
+		 */
+		items: DataConnectionNodeDetailsItem[];
+
+		/**
+		 * What to show when there are no items (e.g. "No dimensions").
+		 */
+		emptyText?: string;
+	}
+
+	/**
+	 * An item in a data connection node's details.
+	 */
+	export interface DataConnectionNodeDetailsItem {
+		/**
+		 * The item's name.
+		 */
+		name: string;
+
+		/**
+		 * The kind of node the item is, which picks its icon.
+		 */
+		kind?: DataConnectionNodeKind;
+
+		/**
+		 * The item's data type, shown beside its name.
+		 */
+		dataType?: string;
+
+		/**
+		 * A sentence or two about the item (e.g. its comment).
+		 */
+		description?: string;
+
+		/**
+		 * A snippet of code that defines the item (e.g. its SQL expression).
+		 */
+		code?: string;
+	}
+
+	/**
+	 * A section of name/value pairs (e.g. Data Type: NUMBER(38,0)).
+	 */
+	export interface DataConnectionNodeDetailsPropertiesSection {
+		kind: 'properties';
+
+		/**
+		 * The section's heading, if it has one.
+		 */
+		title?: string;
+
+		/**
+		 * The properties, shown in order.
+		 */
+		properties: { name: string; value: string }[];
+	}
+
+	/**
+	 * A section holding a block of code (e.g. a metric's SQL expression, or an object's DDL).
+	 */
+	export interface DataConnectionNodeDetailsCodeSection {
+		kind: 'code';
+
+		/**
+		 * The section's heading, if it has one.
+		 */
+		title?: string;
+
+		/**
+		 * The language of the code (e.g. 'sql').
+		 */
+		languageId?: string;
+
+		/**
+		 * The code.
+		 */
+		code: string;
+	}
+
+	/**
+	 * A section holding a small table (e.g. the files in a stage).
+	 */
+	export interface DataConnectionNodeDetailsTableSection {
+		kind: 'table';
+
+		/**
+		 * The section's heading, if it has one.
+		 */
+		title?: string;
+
+		/**
+		 * The column headings.
+		 */
+		columns: string[];
+
+		/**
+		 * The rows, each holding one value per column.
+		 */
+		rows: string[][];
+	}
+
+	/**
+	 * DataConnection interface.
+	 */
+	export interface DataConnection {
+		/**
+		 * Whether this connection was opened in read-only mode.
+		 */
+		isReadOnly(): Thenable<boolean>;
+
+		/**
+		 * Browse the top-level schema objects (databases, schemas, catalogs).
+		 */
+		getChildren(): Thenable<DataConnectionNode[]>;
+
+		/**
+		 * Disconnect a data connection.
+		 */
+		disconnect(): Thenable<void>;
+
+		/**
+		 * Test whether the connection is still connected.
+		 */
+		isConnected(): Thenable<boolean>;
+
+		/**
+		 * Reads the lineage of an object: the objects its data flows from (upstream) or into
+		 * (downstream). Optional; implemented only by drivers whose data source tracks lineage.
+		 *
+		 * Resolves to `{ available: false, message }` when the data source declines the request --
+		 * the object does not exist or is not accessible, does not support lineage, or the account
+		 * lacks the feature -- and rejects when the connection itself fails.
+		 *
+		 * @param request Which object, which direction, and how far to follow it.
+		 */
+		getLineage?(request: DataConnectionLineageRequest): Thenable<DataConnectionLineage>;
+	}
+
+	/**
+	 * A request for an object's lineage. See {@link DataConnection.getLineage}.
+	 */
+	export interface DataConnectionLineageRequest {
+		/**
+		 * The object's path from the top of the data source, one exact name per level: e.g.
+		 * `[database, schema, table]` for a table, view or other table-like object, and
+		 * `[database, schema, table, column]` for a column. Each name is as the data source spells
+		 * it, case and all; a driver quotes them as its data source requires.
+		 */
+		path: string[];
+
+		/**
+		 * Whether the object is a table (including views and other table-like objects) or a column.
+		 */
+		domain: 'table' | 'column';
+
+		/**
+		 * Whether to follow the objects the data comes from (`upstream`) or the objects it flows
+		 * into (`downstream`).
+		 */
+		direction: 'upstream' | 'downstream';
+
+		/**
+		 * How many hops to follow, from 1 up to the data source's own limit.
+		 */
+		depth: number;
+
+		/**
+		 * The most edges to return. A driver returns the nearest edges first and sets `truncated`
+		 * when it left any out.
+		 */
+		maxEdges: number;
+	}
+
+	/**
+	 * One end of a lineage edge.
+	 */
+	export interface DataConnectionLineageObject {
+		/** The database holding the object. Absent for an object outside the data source. */
+		database?: string;
+
+		/** The schema holding the object. Absent for an object outside the data source. */
+		schema?: string;
+
+		/** The object's unqualified name. Absent when the object is masked. */
+		name?: string;
+
+		/** The column, when the edge is between columns. */
+		column?: string;
+
+		/** The kind of object, in the data source's own terms, e.g. `table` or `stage`. */
+		domain: string;
+
+		/** Set when the caller is not allowed to see the object, so its name is withheld. */
+		masked?: boolean;
+	}
+
+	/**
+	 * One edge in an object's lineage: data flows from `source` to `target`.
+	 */
+	export interface DataConnectionLineageEdge {
+		source: DataConnectionLineageObject;
+		target: DataConnectionLineageObject;
+
+		/** How many hops from the requested object this edge is. A direct relationship is 1. */
+		distance: number;
+	}
+
+	/**
+	 * An object's lineage, or the data source's reason for not providing it. See
+	 * {@link DataConnection.getLineage}.
+	 */
+	export type DataConnectionLineage =
+		| {
+			available: true;
+
+			/** The edges, nearest first. Empty when the object has no lineage in this direction. */
+			edges: DataConnectionLineageEdge[];
+
+			/** Whether `maxEdges` left edges out. */
+			truncated: boolean;
+		}
+		| {
+			available: false;
+
+			/** The data source's explanation, suitable for showing to the user. */
+			message: string;
+		};
+
+	/**
+	 * A summary of a registered data connection driver, returned by getDrivers().
+	 */
+	export interface DataConnectionDriverSummary {
+		// The driver identifier.
+		id: string;
+
+		// The driver name.
+		name: string;
+
+		// The driver description.
+		description: string;
+
+		// The configuration mechanisms this driver supports.
+		mechanisms: DataConnectionMechanism[];
+
+		// The language identifiers this driver supports.
+		supportedLanguageIds: string[];
+	}
+
+	/**
+	 * End Data Connections
+	 */
+
+	/**
+	 * ConnectionsInput interface defines the structure for connection inputs.
+	 */
+	export interface ConnectionsInput {
+		/**
+		 * The unique identifier for the input.
+		 */
+		id: string;
+		/**`
+		 * A human-readable label for the input.
+		 */
+		label: string;
+		/**
+		 * The type of the input.
+		 */
+		// eslint-disable-next-line local/vscode-dts-literal-or-types, local/vscode-dts-string-type-literals
+		type: 'string' | 'number' | 'option';
+		/**
+		 * Options, if the input type is an option.
+		 */
+		options?: { 'identifier': string; 'title': string }[];
+		/**
+		 * The default value for the input.
+		 */
+		value?: string;
+	}
+
+	/**
+	 * ConnectionsDriverMetadata interface defines the structure for connection driver metadata.
+	 */
+	export interface ConnectionsDriverMetadata {
+		/**
+		 * The language identifier for the driver.
+		 * Drivers are grouped by language, not by runtime.
+		 */
+		languageId: string;
+		/**
+		 * A human-readable name for the driver.
+		 * The name is also used to group drivers for the same database provider. For instance,
+		 * if there are multiple different ways to connect to the same database.
+		 */
+		name: string;
+		/**
+		 * A human-readable description for the driver.
+		 * Used specially when disambiguating drivers with the same name.
+		 */
+		description?: string;
+		/**
+		 * The base64-encoded SVG icon for the driver.
+		 */
+		base64EncodedIconSvg?: string;
+		/**
+		 * The inputs required to create a connection.
+		 * For instance, a connection might require a username
+		 * and password.
+		 */
+		inputs: Array<ConnectionsInput>;
+	}
+
+	export interface ConnectionsDriver {
+		/**
+		 * The unique identifier for the driver.
+		 */
+		driverId: string;
+
+		/**
+		 * The metadata for the driver.
+		 */
+		metadata: ConnectionsDriverMetadata;
+
+		/**
+		 * Generates the connection code based on the inputs.
+		 *
+		 * @param inputs The current values of the connection inputs defined in metadata.
+		 * @returns Either a string containing valid connection code, or an object with:
+		 *   - `code`: The generated connection code. Should still be generated even when
+		 *     validation fails, so users can see and copy the partial code.
+		 *   - `errorMessage`: A user-facing message explaining the validation error,
+		 *     displayed in an error banner overlay on the code editor. The Connect
+		 *     button is disabled when an error message is present.
+		 *
+		 * @example
+		 * // Return valid code as a string
+		 * generateCode: (inputs) => `library(DBI)\ncon <- dbConnect(...)`
+		 *
+		 * @example
+		 * // Return validation error with generated code
+		 * generateCode: (inputs) => ({
+		 *   code: `library(bigrquery)\ncon <- dbConnect(...)`,
+		 *   errorMessage: 'Project ID is required'
+		 * })
+		 */
+		generateCode?: (inputs: Array<ConnectionsInput>) => string | { code: string; errorMessage: string };
+
+		/**
+		 * Connect session.
+		 */
+		connect?: (code: string) => Thenable<void>;
+
+		/**
+		 * Checks if the dependencies for the driver are installed
+		 * and functioning.
+		 */
+		checkDependencies?: () => Thenable<boolean>;
+
+		/**
+		 * Installs the dependencies for the driver.
+		 * For instance, R packages would install the required
+		 * R packages, and or other dependencies.
+		 */
+		installDependencies?: () => Thenable<boolean>;
+	}
+
+	/**
+	 * Settings necessary to render a plot in the format expected by the plot widget.
+	 */
+	export interface PlotRenderSettings {
+		size: {
+			width: number;
+			height: number;
+		};
+		pixel_ratio: number;
+		format: PlotRenderFormat;
+	}
+
+	/**
+	 * Possible formats for rendering a plot.
+	 */
+	export enum PlotRenderFormat {
+		Png = 'png',
+		Jpeg = 'jpeg',
+		Svg = 'svg',
+		Pdf = 'pdf',
+		Tiff = 'tiff'
+	}
+
+	/***
+	 * Represents the result of evaluating a code fragment in the runtime.
+	 */
+	export interface EvalResult {
+		/**
+		 * The value resulting from the code evaluation.
+		 */
+		result: any;
+
+		/**
+		 * The output emitted during code evaluation, if any.
+		 */
+		output: string;
+	}
+
+	namespace languages {
+		/**
+		 * Register a statement range provider.
+		 *
+		 * @param selector A selector that defines the documents this provider is applicable to.
+		 * @param provider A statement range provider.
+		 * @return A {@link Disposable} that unregisters this provider when being disposed.
+		 */
+		export function registerStatementRangeProvider(
+			selector: vscode.DocumentSelector,
+			provider: StatementRangeProvider): vscode.Disposable;
+
+		/**
+		 * Register an input boundary provider.
+		 *
+		 * @param selector A selector that defines the documents this provider is applicable to.
+		 * @param provider An input boundary provider.
+		 * @return A {@link Disposable} that unregisters this provider when being disposed.
+		 */
+		export function registerInputBoundaryProvider(
+			selector: vscode.DocumentSelector,
+			provider: InputBoundaryProvider): vscode.Disposable;
+
+		/**
+		 * Register a help topic provider.
+		 *
+		 * @param selector A selector that defines the documents this provider is applicable to.
+		 * @param provider A help topic provider.
+		 * @return A {@link Disposable} that unregisters this provider when being disposed.
+		 */
+		export function registerHelpTopicProvider(
+			selector: vscode.DocumentSelector,
+			provider: HelpTopicProvider): vscode.Disposable;
+	}
+
+	/**
+	 * The reason the Positron window is shutting down. Surfaced via
+	 * `positron.window.onWillShutdown` so extensions can distinguish a quit
+	 * from a window reload.
+	 */
+	export enum ShutdownReason {
+		/** The window was closed (e.g. last window of the application). */
+		Close = 1,
+
+		/** The application is quitting. */
+		Quit = 2,
+
+		/** The window is reloading. */
+		Reload = 3,
+
+		/** The window is loading a different workspace. */
+		Load = 4,
+	}
+
+	namespace window {
+		/**
+		 * Create and show a new preview panel.
+		 *
+		 * @param viewType Identifies the type of the preview panel.
+		 * @param title Title of the panel.
+		 * @param options Settings for the new panel.
+		 *
+		 * @return New preview panel.
+		 */
+		export function createPreviewPanel(viewType: string, title: string, preserveFocus?: boolean, options?: PreviewOptions): PreviewPanel;
+
+		/**
+		 * Create and show a new preview panel for a URL. This is a convenience
+		 * method that creates a new webview panel and sets its content to the
+		 * given URL.
+		 *
+		 * @param url The URL to preview
+		 * @param source Optional source information indicating what opened the preview
+		 *
+		 * @return New preview panel.
+		 */
+		export function previewUrl(url: vscode.Uri, source?: PreviewSource): PreviewPanel;
+
+		/**
+		 * Create and show a new preview panel for an HTML file. This is a
+		 * convenience method that creates a new webview panel and sets its
+		 * content to that of the given file.
+		 *
+		 * @param path The fully qualified path to the HTML file to preview
+		 *
+		 * @return New preview panel.
+		 */
+		export function previewHtml(path: string): PreviewPanel;
+
+		/**
+		 * Create a log output channel from raw data.
+		 *
+		 * Variant of `createOutputChannel()` that creates a "raw log" output channel.
+		 * Compared to a normal `LogOutputChannel`, this doesn't add timestamps or info
+		 * level. It's meant for extensions that create fully formed log lines but still
+		 * want to benefit from the colourised rendering of log output channels.
+		 *
+		 * @param name Human-readable string which will be used to represent the channel in the UI.
+		 *
+		 * @return New log output channel.
+		 */
+		export function createRawLogOutputChannel(name: string): vscode.LogOutputChannel;
+
+		/**
+		 * Create and show a simple modal dialog prompt.
+		 *
+		 * @param title The title of the dialog
+		 * @param message The message to display in the dialog
+		 * @param okButtonTitle The title of the OK button (optional; defaults to 'OK')
+		 * @param cancelButtonTitle The title of the Cancel button (optional; defaults to 'Cancel')
+		 *
+		 * @returns A Thenable that resolves to true if the user clicked OK, or false
+		 *   if the user clicked Cancel.
+		 */
+		export function showSimpleModalDialogPrompt(title: string,
+			message: string,
+			okButtonTitle?: string,
+			cancelButtonTitle?: string): Thenable<boolean>;
+
+		/**
+		 * Create and show a simple modal dialog input prompt.
+		 *
+		 * @param title The title of the dialog
+		 * @param message The message to display in the dialog
+		 * @param placeholder The placeholder text for the input field
+		 *
+		 * @returns A Thenable that resolves to the user's input, or undefined if the user cancelled.
+		 */
+		export function showSimpleModalDialogInputPrompt(title: string,
+			message: string,
+			placeholder?: string): Thenable<string | undefined>;
+
+		/**
+		 * Create and show a different simple modal dialog prompt.
+		 *
+		 * @param title The title of the dialog
+		 * @param message The message to display in the dialog
+		 * @param okButtonTitle The title of the OK button (optional; defaults to 'OK')
+		 *
+		 * @returns A Thenable that resolves when the user clicks OK.
+		 */
+		export function showSimpleModalDialogMessage(title: string,
+			message: string,
+			okButtonTitle?: string): Thenable<null>;
+
+		/**
+		 * Options for `showThreeButtonModalDialogPrompt`.
+		 */
+		export interface ThreeButtonModalDialogPromptOptions {
+			/** The title shown in the dialog's title bar. */
+			title: string;
+			/** The message shown in the dialog's body. */
+			message: string;
+			/** The default action. Focused when the dialog opens, and invoked by Enter. */
+			primaryButtonTitle: string;
+			/** The alternative action, shown next to the primary button. */
+			secondaryButtonTitle: string;
+			/** The odd-one-out action, shown on the left edge of the footer. */
+			tertiaryButtonTitle: string;
+		}
+
+		/**
+		 * Create and show a modal dialog prompt with three buttons.
+		 *
+		 * The dialog has no Cancel button; the title bar close button and Escape dismiss it.
+		 * Spend one of the three buttons on a labelled dismiss action if the prompt needs one.
+		 *
+		 * @param options The dialog's title, message, and button titles.
+		 *
+		 * @returns A Thenable that resolves to the title of the button the user clicked, or
+		 *   to undefined if the user dismissed the dialog.
+		 */
+		export function showThreeButtonModalDialogPrompt(
+			options: ThreeButtonModalDialogPromptOptions): Thenable<string | undefined>;
+
+		/**
+		 * Get the `Console` for a runtime `languageId`
+		 *
+		 * @param languageId The runtime language id to retrieve a `Console` for, i.e. 'r' or 'python'.
+		 *
+		 * @returns A Thenable that resolves to a `Console` or `undefined` if no `Console` for
+		 *   that `languageId` exists.
+		 */
+		export function getConsoleForLanguage(languageId: string): Thenable<Console | undefined>;
+
+		/**
+		 * The currently active console editor, or `undefined` if no console is active or its
+		 * input has not mounted yet. Provides the full `vscode.TextEditor` API for the console
+		 * input, including `document`, `selection`, `edit()`, and `insertSnippet()`.
+		 *
+		 * Note: the console editor is deliberately not surfaced through the standard `vscode`
+		 * editor APIs. It is never `vscode.window.activeTextEditor`, never appears in
+		 * `vscode.window.visibleTextEditors`, and never raises the
+		 * `vscode.window.onDidChangeTextEditor*` events. This property and
+		 * `onDidChangeActiveConsoleEditor` are the only way to reach it.
+		 */
+		export const activeConsoleEditor: vscode.TextEditor | undefined;
+
+		/**
+		 * An event that fires when the active console editor changes, including when the active
+		 * console's input editor mounts or unmounts.
+		 */
+		export const onDidChangeActiveConsoleEditor: vscode.Event<vscode.TextEditor | undefined>;
+
+		/**
+		 * Fires when the width of the console input changes. The new width is passed as
+		 * a number, which represents the number of characters that can fit in the
+		 * console horizontally.
+		 */
+		export const onDidChangeConsoleWidth: vscode.Event<number>;
+
+		/**
+		 * Returns the current width of the console input, in characters.
+		 */
+		export function getConsoleWidth(): Thenable<number>;
+
+		/**
+		 * Fires when the settings necessary to render a plot in the format expected by
+		 * plot widget have changed.
+		 */
+		export const onDidChangePlotsRenderSettings: vscode.Event<PlotRenderSettings>;
+
+		/**
+		 * Returns the settings necessary to render a plot in the format expected by
+		 * plot widget.
+		 */
+		export function getPlotsRenderSettings(): Thenable<PlotRenderSettings>;
+
+		/**
+		 * Fires when the Positron window is about to shut down. The reason
+		 * indicates how the shutdown was triggered (quit, reload, close, or
+		 * load of a different workspace) so extensions can decide whether
+		 * resources should be torn down or preserved for reconnection.
+		 *
+		 * Listeners must complete synchronously: there is no opportunity to
+		 * defer the shutdown. Stash the reason and consult it from
+		 * `deactivate()` if cleanup needs to happen there.
+		 */
+		export const onWillShutdown: vscode.Event<ShutdownReason>;
+
+		/**
+		 * Fires when a file is uploaded into the workspace through the
+		 * Positron file explorer (drag-and-drop or "Upload..."). The event
+		 * value is the URI of the uploaded file in its new location in the
+		 * workspace. Folder uploads fire one event per file written.
+		 *
+		 * Intended for auditing and observability. The event fires after the
+		 * file has been written.
+		 */
+		export const onDidUploadFile: vscode.Event<vscode.Uri>;
+
+		/**
+		 * Fires when a file is downloaded from the workspace through the
+		 * Positron file explorer ("Download..."). The event value is the URI
+		 * of the source file in the workspace. Folder downloads fire one
+		 * event per file read.
+		 *
+		 * Intended for auditing and observability. The event fires after the
+		 * file has been read.
+		 */
+		export const onDidDownloadFile: vscode.Event<vscode.Uri>;
+
+	}
+
+	namespace context {
+		/**
+		 * Per-workspace ephemeral extension storage. Data survives extension
+		 * host restarts and window reloads, but does not persist beyond the
+		 * lifetime of the application process.
+		 *
+		 * Use this instead of {@link vscode.ExtensionContext.workspaceState workspaceState}
+		 * for state that is only meaningful while the process is running,
+		 * such as runtime session mappings. This avoids leaking stale
+		 * state on disk and ensures automatic cleanup on shutdown.
+		 */
+		export const ephemeralState: EphemeralMemento;
+
+		/**
+		 * A {@link vscode.Memento} with an additional `clear()` method that
+		 * removes all keys at once.
+		 */
+		export interface EphemeralMemento extends vscode.Memento {
+			/**
+			 * Remove all stored keys for this extension's ephemeral storage.
+			 */
+			clear(): Thenable<void>;
+
+			/**
+			 * A promise that resolves when the ephemeral storage has finished
+			 * loading its initial values from the backing store. Synchronous
+			 * reads via {@link vscode.Memento.get get} are only guaranteed to
+			 * reflect previously persisted values once this has resolved, so
+			 * await it before reading at startup (e.g. after a window reload).
+			 */
+			readonly whenReady: Thenable<unknown>;
+		}
+	}
+
+	namespace runtime {
+		/**
+		 * An object that observes an ongoing code execution invoked from the
+		 * `executeCode` API.
+		 */
+		export interface ExecutionObserver {
+			/**
+			 * An optional cancellation token that can be used to cancel the
+			 * execution.
+			 */
+			token?: vscode.CancellationToken;
+
+			/**
+			 * An optional callback to invoke when execution has started. This
+			 * may be different than the time `executeCode` was called, since
+			 * there may have been preceding statements in the queue, or we may
+			 * need to wait for the runtime to start or become ready.
+			 */
+			onStarted?: () => void;
+
+			/**
+			 * An optional callback to invoke when the execution emits text
+			 * output. This can be called zero or more times during execution of
+			 * the code.
+			 *
+			 * @param message The message emitted.
+			 */
+			onOutput?: (message: string) => void;
+
+			/**
+			 * An optional callback to invoke when the execution emits error
+			 * output. This just means "output sent to standard error", and does
+			 * not mean that the execution failed. This can be called zero or more
+			 * times during execution of the code.
+			 *
+			 * @param message The message emitted.
+			 */
+			onError?: (message: string) => void;
+
+			/**
+			 * An optional callback to invoke when the execution emits a plot.
+			 *
+			 * NOTE: Currently only fired for static plots, not dynamic plots.
+			 *
+			 * @param plotData The plot data emitted, as a string.
+			 */
+			onPlot?: (plotData: string) => void;
+
+			/**
+			 * An optional callback to invoke when the execution emits a data
+			 * frame or other rectangular data object.
+			 *
+			 * NOTE: Not currently fired.
+			 *
+			 * @param data The data returned.
+			 */
+			onData?: (data: any) => void;
+
+			/**
+			 * An optional callback to invoke when the execution has completed
+			 * sucessfully.
+			 *
+			 * One of `onCompleted` or `onFailed` will be called, but not both.
+			 *
+			 * @param result The result of the successful execution, as a map of MIME types to values.
+			 */
+			onCompleted?: (result: Record<string, any>) => void;
+
+			/**
+			 * An optional callback to invoke when the execution has failed.
+			 *
+			 * One of `onCompleted` or `onFailed` will be called, but not both.
+			 *
+			 * @param error The error that caused the execution to fail.
+			 */
+			onFailed?: (error: Error) => void;
+
+			/**
+			 * An optional callback to invoke when the execution has finished,
+			 * regardless of success or failure.
+			 *
+			 * It is invoked when the runtime returns to an idle state after
+			 * fully completing the execution.
+			 */
+			onFinished?: () => void;
+		}
+
+		/**
+		 * Executes code in a language runtime's console, as though it were typed
+		 * interactively by the user.
+		 *
+		 * @param languageId The language ID of the code snippet
+		 * @param code The code snippet to execute
+		 * @param focus Whether to focus the runtime's console
+		 * @param allowIncomplete Whether to bypass runtime code completeness checks. If true, the `code`
+		 *   will be executed by the runtime even if it is incomplete or invalid. Defaults to false
+		 * @param mode Possible code execution mode for a language runtime
+		 * @param errorBehavior Possible error behavior for a language runtime, currently ignored by kernels
+		 * @param observer An optional observer for the execution. This object will be notified of
+		 *  execution events, such as output, error, and completion.
+		 * @param sessionId An optional session ID to execute the code in. If
+		 *  not provided, an appropriate session will be chosen, and if no
+		 *  session for the desired language is running at all, a new session
+		 *  will be started.
+		 * @param documentUri An optional URI of the document in which the code to execute is located.
+		 * @param executionMetadata An optional object containing additional
+		 *  metadata to pass to the language runtime. Will be included in the
+		 *  `positron` field of the `metadata` argument passed to the runtime's
+		 *  `execute` method.
+		 * @param attributionMetadata An optional object with which the caller can
+		 *  contribute attribution details about the code's origin. These fields
+		 *  are merged into `attribution.metadata` on the resulting
+		 *  `CodeExecutionEvent`. Positron retains sole authority over
+		 *  `attribution.source`; callers cannot set it.
+		 * @param preserveActiveTab Whether to avoid switching the active tab when
+		 *  revealing the Console and Plots. If another tab is showing where the
+		 *  Console or Plots live, it stays showing. Ignored when `focus` is true.
+		 * @returns A Thenable that resolves with the result of the code execution,
+		 *  as a map of MIME types to values.
+		 */
+		export function executeCode(languageId: string,
+			code: string,
+			focus: boolean,
+			allowIncomplete?: boolean,
+			mode?: RuntimeCodeExecutionMode,
+			errorBehavior?: RuntimeErrorBehavior,
+			observer?: ExecutionObserver,
+			sessionId?: string,
+			documentUri?: vscode.Uri,
+			executionMetadata?: Record<string, any>,
+			attributionMetadata?: Record<string, any>,
+			preserveActiveTab?: boolean): Thenable<Record<string, any>>;
+
+		/**
+		 * Evaluates code silently in a language runtime, without displaying
+		 * output in the console or notifying the user.
+		 *
+		 * @param languageId The language ID of the code snippet
+		 * @param code The code snippet to evaluate
+		 * @param cancellationToken An optional cancellation token that can be
+		 *  used to cancel the evaluation.
+		 * @param sessionId An optional session ID to evaluate the code in. If
+		 *  not provided, an appropriate session will be chosen, and if no
+		 *  session for the desired language is running at all, a new session
+		 *  will be started.
+		 * @param whenBusy Determines what happens if the target runtime is busy
+		 *  when the evaluation is requested. Defaults to
+		 *  `RuntimeBusyBehavior.Queue`, which queues the code to run when the
+		 *  runtime next becomes idle. Use `RuntimeBusyBehavior.Reject` to have
+		 *  the returned Thenable reject with an error instead of queueing.
+		 * @returns A Thenable that resolves with the result of the code
+		 *  evaluation.
+		 */
+		export function evaluateCode(languageId: string,
+			code: string,
+			cancellationToken?: vscode.CancellationToken,
+			sessionId?: string,
+			whenBusy?: RuntimeBusyBehavior): Thenable<EvalResult>;
+
+		/**
+		 * Executes a set of cells in a source document. The results are
+		 * displayed beneath the cells.
+		 *
+		 * @param documentUri The URI of the document
+		 * @param range The ranges of the cells to execute
+		 * @param executionMetadata An optional array of metadata objects to
+		 *  pass to the language runtime, one for each cell being executed.
+		 */
+		export function executeInlineCell(documentUri: vscode.Uri,
+			cellRanges: vscode.Range[],
+			executionMetadata?: Record<string, any>[]
+		): Thenable<void>;
+
+		/**
+		 * Register a language runtime manager with Positron.
+		 *
+		 * @param languageId The language ID for which the manager can provide
+		 * runtimes
+		 * @returns A disposable that unregisters the manager when disposed.
+		 *
+		 */
+		export function registerLanguageRuntimeManager(languageId: string, manager: LanguageRuntimeManager): vscode.Disposable;
+
+		/**
+		 * List all registered runtimes.
+		 */
+		export function getRegisteredRuntimes(): Thenable<LanguageRuntimeMetadata[]>;
+
+		/**
+		 * Get the preferred language runtime for a given language.
+		 *
+		 * @param languageId The language ID of the preferred runtime
+		 * @returns The preferred runtime metadata, or undefined if no eligible runtimes
+		 *  are registered.
+		 */
+		export function getPreferredRuntime(languageId: string): Thenable<LanguageRuntimeMetadata | undefined>;
+
+		/**
+		 * List all active sessions.
+		 */
+		export function getActiveSessions(): Thenable<BaseLanguageRuntimeSession[]>;
+
+		/**
+		 * Get a specific session by its ID.
+		 */
+		export function getSession(sessionId: string): Thenable<BaseLanguageRuntimeSession | undefined>;
+
+		/**
+		 * Get the active foreground session, if any.
+		 */
+		export function getForegroundSession(): Thenable<BaseLanguageRuntimeSession | undefined>;
+
+		/**
+		 * Get the session corresponding to a notebook, if any.
+		 *
+		 * @param notebookUri The URI of the notebook.
+		 */
+		export function getNotebookSession(notebookUri: vscode.Uri): Thenable<BaseLanguageRuntimeSession | undefined>;
+
+		/**
+		 * Select and start a runtime previously registered with Positron. Any
+		 * previously active runtimes for the language will be shut down.
+		 *
+		 * @param runtimeId The ID of the runtime to select and start.
+		 */
+		export function selectLanguageRuntime(runtimeId: string): Thenable<void>;
+
+		/**
+		 * Start a new session for a runtime previously registered with Positron.
+		 *
+		 * @param runtimeId The ID of the runtime to select and start.
+		 * @param sessionName A human-readable name for the new session.
+		 * @param notebookUri If the session is associated with a notebook,
+		 *   the notebook URI.
+		 * @param options Options for the new session.
+		 *
+		 * Returns a Thenable that resolves with the newly created session.
+		 */
+		export function startLanguageRuntime(runtimeId: string,
+			sessionName: string,
+			notebookUri?: vscode.Uri,
+			options?: RuntimeSessionStartOptions): Thenable<LanguageRuntimeSession>;
+
+		/**
+		 * Interrupt a running session.
+		 *
+		 * @param sessionId The ID of the session to interrupt.
+		 */
+		export function interruptSession(sessionId: string): Thenable<void>;
+
+		/**
+		 * Restart a running session.
+		 *
+		 * If the session is busy, the user is prompted whether to interrupt it
+		 * before restarting.
+		 *
+		 * @param sessionId The ID of the session to restart.
+		 * @returns `true` if the session was restarted (or a restart already in
+		 *   progress completed), `false` if the restart was declined by the user.
+		 *   Rejects if the session is not found or not in a restartable state.
+		 */
+		export function restartSession(sessionId: string): Thenable<boolean>;
+
+		/**
+		 * Focus a running session.
+		 */
+		export function focusSession(sessionId: string): void;
+
+		/**
+		 * Delete a running session.
+		 * If the session is busy, the user is asked whether it should be interrupted.
+		 * The promise resolves with `false` if the user declines to interrupt, or `true`
+		 * if the session was deleted. It can also throw e.g. if the session is not found.
+		 *
+		 * A runtime that does not exit during its shutdown grace period is forced to
+		 * quit, which can interrupt exit handlers such as R's `.Last`. If it still
+		 * does not exit, the session is deleted and the promise rejects with the
+		 * shutdown error.
+		 */
+		export function deleteSession(sessionId: string): Thenable<boolean>;
+
+		/**
+		 * Get the runtime variables for a session.
+		 *
+		 * @param sessionId The session ID of the session to get the variables for.
+		 * @param accessKeys An optional array of access keys. Each access key
+		 * is an array listing the path to a variable. If no access keys are
+		 * provided, all variables will be returned.
+		 *
+		 * @returns A Thenable that resolves with an array of runtime
+		 * variables.
+		 */
+		export function getSessionVariables(
+			sessionId: string,
+			accessKeys?: Array<Array<string>>):
+			Thenable<Array<Array<RuntimeVariable>>>;
+
+		/**
+		 * Query a table in a session.
+		 *
+		 * @param sessionId The session ID of the session to query tables.
+		 * @param accessKeys The access keys of the tables to query.
+		 * @param queryTypes The types of data to query for the tables.
+		 *
+		 * @returns A Thenable that resolves with an array of runtime
+		 * table query results.
+		 */
+		export function querySessionTables(
+			sessionId: string,
+			accessKeys: Array<Array<string>>,
+			queryTypes: Array<string>):
+			Thenable<Array<QueryTableSummaryResult>>;
+
+		/**
+		 * A single console execution: a command that ran in a runtime session,
+		 * paired with its output and any error.
+		 */
+		export interface ConsoleHistoryEntry {
+			/** The code that was executed. */
+			input: string;
+			/** The textual output produced by the execution. */
+			output: string;
+			/** The error produced by the execution, if any. */
+			error?: {
+				/** The name of the error. */
+				name: string;
+				/** The error message. */
+				message: string;
+				/** The error stack trace. */
+				traceback: string[];
+			};
+			/** Time the execution occurred, in milliseconds since the Epoch. */
+			when: number;
+		}
+
+		/**
+		 * Get the recent console history for a session: the code fragments that
+		 * have already run, each paired with its output and any error. This is
+		 * read-only; it does not execute anything.
+		 *
+		 * Only completed code executions are returned, oldest first. The startup
+		 * banner and entries recorded without input (e.g. output produced outside
+		 * an execution) are omitted, matching what the console shows as a command
+		 * history.
+		 *
+		 * Console history reading is governed by the `console.historyApiEnabled`
+		 * setting, which users can disable for privacy; when it is disabled this
+		 * call rejects rather than returning content.
+		 *
+		 * @param sessionId The session ID of the session to read console history
+		 *  from.
+		 * @param numberOfEntries The number of most recent entries to return.
+		 *  Defaults to 5. Pass a larger value to look further back in the history.
+		 * @returns A Thenable that resolves with the console entries (an empty
+		 *  array when the session has run nothing yet). Rejects if the session ID
+		 *  is unknown, or if the `console.historyApiEnabled` setting is disabled.
+		 */
+		export function getConsoleHistory(sessionId: string, numberOfEntries?: number): Thenable<ConsoleHistoryEntry[]>;
+
+		/**
+		 * Register a handler for runtime client instances. This handler will be called
+		 * whenever a new client instance is created by a language runtime of the given
+		 * type.
+		 *
+		 * @param handler A handler for runtime client instances
+		 */
+		export function registerClientHandler(handler: RuntimeClientHandler): vscode.Disposable;
+
+		/**
+		 * Register a runtime client instance. Registering the instance
+		 * indicates that the caller has ownership of the instance, and that
+		 * messages the instance receives do not need to be forwarded to the
+		 * Positron core.
+		 */
+		export function registerClientInstance(clientInstanceId: string): vscode.Disposable;
+
+		/**
+		 * Emit a performance mark that can be used for telemetry and
+		 * performance monitoring. The mark is recorded at the current time.
+		 *
+		 * @param name The name of the performance mark.
+		 */
+		export function emitPerfMark(name: string): void;
+
+		/**
+		 * An event that fires when a new runtime is registered.
+		 */
+		export const onDidRegisterRuntime: vscode.Event<LanguageRuntimeMetadata>;
+
+		/**
+		 * An event that fires when the foreground session changes
+		 */
+		export const onDidChangeForegroundSession: vscode.Event<string | undefined>;
+
+		/**
+		 * An event that fires when code is executed.
+		 */
+		export const onDidExecuteCode: vscode.Event<CodeExecutionEvent>;
+
+		/**
+		 * An item to be shown in the runtime picker quick pick.
+		 */
+		export interface RuntimePickerItem {
+			/** Unique identifier for this item */
+			id: string;
+			/** Label shown in the picker */
+			label: string;
+			/** Optional detail text shown below the label */
+			detail?: string;
+			/**
+			 * Set to put a divider before this item. The picker draws the divider
+			 * without the text, since the item's own label names it.
+			 */
+			separatorLabel?: string;
+			/** List this item at the top of the Suggested section. */
+			suggested?: boolean;
+		}
+
+		/**
+		 * A contribution that adds items to the runtime picker.
+		 */
+		export interface RuntimePickerContribution {
+			/** The language ID this contribution applies to (e.g., 'python', 'r') */
+			languageId: string;
+
+			/**
+			 * Called when the runtime picker is about to be shown.
+			 * Return items to add to the picker, or an empty array if none should be shown.
+			 */
+			getItems(): Thenable<RuntimePickerItem[]>;
+
+			/**
+			 * Called when the user selects one of this contribution's items.
+			 * @param itemId The ID of the selected item
+			 * @returns The runtime ID to start, or undefined if no runtime should be started
+			 */
+			onDidSelectItem(itemId: string): Thenable<string | undefined>;
+		}
+
+		/**
+		 * Register a contribution that adds items to the runtime picker.
+		 * Extensions can use this to add custom actions like "Install Python via uv".
+		 *
+		 * @param contribution The contribution to register
+		 * @returns A disposable that unregisters the contribution when disposed
+		 */
+		export function registerRuntimePickerContribution(
+			contribution: RuntimePickerContribution
+		): vscode.Disposable;
+	}
+
+	// FIXME: The current (and clearly not final) state of an experiment to bring in interface(s)
+	// here by referring to an external file. Such an external file will presumably be generated by
+	// the generate-comms.ts script. Two goals of the experiment:
+	// * Reduce the manual proliferation of these generated types.
+	// * Ideally a file is meant to edited by humans or by robots, but not both.
+	// Related to https://github.com/posit-dev/positron/issues/12
+	export type EditorContext = import('./ui-comm.js').EditorContext;
+
+	/**
+	 * This namespace contains all frontend RPC methods available to a runtime.
+	 */
+	namespace methods {
+		/**
+		 * Call a frontend method.
+		 *
+		 * `call()` is designed to be hooked up directly to an RPC mechanism. It takes
+		 * `method` and `params` arguments as defined by the UI frontend OpenRPC contract
+		 * and returns a JSON-RPC response. It never throws, all errors are returned as
+		 * JSON-RPC error responses.
+		 *
+		 * @param method The method name.
+		 * @param params An object of named parameters for `method`.
+		 * @param options Optional options for the call. `sessionId` identifies the calling kernel
+		 *   session, e.g. so console-aware methods can be scoped to that session's own console.
+		 */
+		export function call(method: string, params: Record<string, any>, options?: { sessionId?: string }): Thenable<any>;
+
+		/**
+		 * Retrieve last active editor context.
+		 *
+		 * Returns a `EditorContext` for the last active editor.
+		 */
+		export function lastActiveEditorContext(): Thenable<EditorContext | null>;
+
+		/**
+		 * Create and show a simple modal dialog prompt.
+		 *
+		 * @param title The title of the dialog
+		 * @param message The message to display in the dialog
+		 * @param okButtonTitle The title of the OK button
+		 * @param cancelButtonTitle The title of the Cancel button
+		 *
+		 * @returns A Thenable that resolves to true if the user clicked OK, or false
+		 *   if the user clicked Cancel.
+		 */
+		export function showQuestion(title: string, message: string, okButtonTitle: string, cancelButtonTitle: string): Thenable<boolean>;
+
+		/**
+		 * Create and show a different simple modal dialog prompt.
+		 *
+		 * @param title The title of the dialog
+		 * @param message The message to display in the dialog
+		 *
+		 * @returns A Thenable that resolves when the user dismisses the dialog.
+		 */
+		export function showDialog(title: string, message: string): Thenable<null>;
+
+
+	}
+
+	/**
+	 * An object that describes an environment variable action.
+	 */
+	export interface EnvironmentVariableAction {
+		/** The action to take - replace, append, or prepend */
+		action: vscode.EnvironmentVariableMutatorType;
+
+		/** The name of the variable on which to take the action */
+		name: string;
+
+		/** The value to replace, append, or prepend */
+		value: string;
+	}
+
+	/**
+	 * Selects which environment variable contributions
+	 * {@link environment.getEnvironmentContributions} returns.
+	 */
+	export enum EnvironmentContributionFilter {
+		/**
+		 * Only contributions that are applied at process creation. These are
+		 * inherited by spawned child processes such as language kernels;
+		 * contributions applied only via shell integration are excluded.
+		 */
+		ProcessCreation = 'processCreation',
+	}
+
+	namespace environment {
+		/**
+		 * Get the environment variable contributions for the current session.
+		 *
+		 * @param filter Optional filter selecting which contributions to
+		 *   return. When omitted, all contributions are returned, including
+		 *   those applied only via shell integration.
+		 *
+		 * @returns A map of extension IDs to arrays of environment variable actions.
+		 */
+		export function getEnvironmentContributions(filter?: EnvironmentContributionFilter): Thenable<Record<string, EnvironmentVariableAction[]>>;
+	}
+
+	/**
+	 * Methods for managing data connections.
+	 */
+	namespace dataConnections {
+		/**
+		 * Creates a logger for a data connection driver, backed by an output channel named
+		 * "Data Connections: <driverName>".
+		 *
+		 * The channel is created on the first `info`, `warn`, or `error` call, so a driver
+		 * that has never connected adds no entry to the Output panel. `trace` and `debug`
+		 * write only once the channel exists; before that they are dropped, which keeps a
+		 * trace-only code path from creating a channel that would then render empty at the
+		 * default log level.
+		 *
+		 * Do not log during extension activation. The Data Connections pane activates every
+		 * driver at once, so an activation-time log would put every channel in the Output
+		 * panel for users who never opened a connection.
+		 *
+		 * Each message is logged as a single line: only the first non-empty line is kept, because
+		 * driver errors can echo query text that carries user-entered filter or search values
+		 * after their first line. This is partial mitigation, not a guarantee -- an engine can
+		 * still inline such a value into the first line of the message itself.
+		 *
+		 * @param driverName The driver's display name, e.g. `Snowflake`. Core adds the prefix.
+		 * @returns A logger that also disposes the channel, for `context.subscriptions`.
+		 */
+		export function createDriverLogger(driverName: string): DataConnectionLogger & vscode.Disposable;
+
+		/**
+		 * Registers a data connection driver, allowing extensions to contribute
+		 * to the 'New Database' dialog.
+		 *
+		 * @param driver The driver to register.
+		 * @returns A disposable that unregisters the driver when disposed.
+		 */
+		export function registerDriver(driver: DataConnectionDriver): vscode.Disposable;
+
+		/**
+		 * Returns the registered data connection drivers.
+		 */
+		export function getDrivers(): Thenable<DataConnectionDriverSummary[]>;
+
+		/**
+		 * Connects to a data connection driver using the selected mechanism and the given parameters.
+		 * The connection goes through the main thread service and exercises
+		 * the full RPC pipeline.
+		 *
+		 * @param driverId The driver identifier.
+		 * @param mechanismId The id of the mechanism to connect with. One of the driver's mechanisms.
+		 * @param parameters The connection parameters.
+		 * @returns A data connection.
+		 */
+		export function connect(driverId: string, mechanismId: string, parameters: DataConnectionParameterValues): Thenable<DataConnection>;
+
+		/**
+		 * Returns the connections the user has configured, whether or not they are connected.
+		 *
+		 * These are the user's own connections, as shown in the Data Connections pane -- not the
+		 * ones this extension opened with {@link connect}. Use them to offer completions, checks
+		 * or navigation against whatever the user is actually connected to.
+		 *
+		 * Rejects when the `dataConnections.enabled` setting is off, so that a disabled feature
+		 * cannot be mistaken for a user with no connections.
+		 */
+		export function getConnections(): Thenable<DataConnectionSummary[]>;
+
+		/**
+		 * Opens the user's connection for a profile, if it is not already open.
+		 *
+		 * For an extension that knows which of the user's connections it needs -- a SQL file that
+		 * records the database it is written against, say -- rather than waiting for the user to
+		 * open it by hand before anything works. Idempotent: a profile that is already connected
+		 * resolves without reconnecting.
+		 *
+		 * Still no handle: this can open one of the user's connections but cannot disconnect or
+		 * release one, for the same reason {@link getConnections} hands out summaries. Note that
+		 * connecting is not free -- a driver may prompt for credentials, and a warehouse may bill
+		 * for waking up -- so call it because the user asked for something that needs it, not to
+		 * warm connections up in case.
+		 *
+		 * Distinct from {@link connect}, which opens a new connection through a driver this
+		 * extension registered and hands back the connection it owns.
+		 *
+		 * @param profileId The connection to open, from {@link DataConnectionSummary.profileId}.
+		 * @returns Whether the connection is now open. `false` when no such profile exists, which is
+		 *   ordinary: a caller may have recorded a profile the user has since removed. Rejects when
+		 *   the `dataConnections.enabled` setting is off, and with the driver's error when opening
+		 *   was attempted and failed, which a caller should expect: credentials expire and hosts go
+		 *   away.
+		 */
+		export function openConnection(profileId: string): Thenable<boolean>;
+
+		/**
+		 * Reads the tables and columns a live connection exposes.
+		 *
+		 * A single bounded call rather than a tree to walk: browsing costs a round trip per node,
+		 * and a warehouse has thousands of them. Whenever a bound leaves something out, the result
+		 * says so -- see {@link DataConnectionSchema.truncated}, which a caller needs in order to
+		 * tell a name the schema is missing from a name the user got wrong.
+		 *
+		 * @param profileId The connection to read, from {@link DataConnectionSummary.profileId}.
+		 * @param options Bounds for the walk. Defaults are sized for a summary, not a full schema.
+		 * @returns The schema, or `undefined` if the connection is not currently connected. Rejects
+		 *   when the `dataConnections.enabled` setting is off.
+		 */
+		export function getSchema(profileId: string, options?: DataConnectionSchemaOptions): Thenable<DataConnectionSchema | undefined>;
+
+		/**
+		 * Fires when a connection is opened or closed, or a profile is added, renamed or removed.
+		 *
+		 * Carries no payload; call {@link getConnections} to read the new set. Without this an
+		 * extension has no way to know the user connected to something, and has to re-read on a
+		 * guess -- when a relevant editor is focused, say.
+		 */
+		export const onDidChangeConnections: vscode.Event<void>;
+	}
+
+	/**
+	 * A connection the user has configured, returned by
+	 * {@link dataConnections.getConnections}.
+	 *
+	 * Carries no connection parameters, redacted or otherwise: this says what the user is
+	 * connected to, not how they connected, and a payload holding a host name or an account
+	 * identifier is one every consumer then has to be careful with.
+	 */
+	export interface DataConnectionSummary {
+		/** Stable identifier for the connection, and the key for every other call about it. */
+		readonly profileId: string;
+
+		/** The user-chosen name for the connection. */
+		readonly name: string;
+
+		/** The driver the connection was made with, e.g. `postgresql`. */
+		readonly driverId: string;
+
+		/** The driver's display name, e.g. `PostgreSQL`. */
+		readonly driverName: string;
+
+		/** Whether the connection is live right now. Only a live one has a schema to read. */
+		readonly connected: boolean;
+	}
+
+	/**
+	 * Bounds on a schema read. Each one exists because a database can be arbitrarily large and
+	 * every level costs a round trip to the engine.
+	 */
+	export interface DataConnectionSchemaOptions {
+		/**
+		 * How deep to walk. Root-level objects are depth 1. Container levels that name nothing of
+		 * their own are flattened and do not count against this.
+		 */
+		readonly maxDepth?: number;
+
+		/** How many objects to return under any one parent. */
+		readonly maxNodesPerLevel?: number;
+
+		/** How many objects to return in total, across every level. */
+		readonly maxTotalNodes?: number;
+	}
+
+	/** One object in a connection's schema: a catalog, a schema, a table, or a column. */
+	export interface DataConnectionSchemaNode {
+		readonly name: string;
+
+		/** The kind of object. */
+		readonly kind: DataConnectionNodeKind;
+
+		/** The column's data type, for a node of kind `field`. */
+		readonly dataType?: string;
+
+		/** Whether the column is part of the primary key, for a node of kind `field`. */
+		readonly isPrimaryKey?: boolean;
+
+		/** Present only when this object has at least one child in the result. */
+		readonly children?: DataConnectionSchemaNode[];
+
+		/**
+		 * How many of this object's children a bound left out. Present only when some were, so
+		 * that what is missing is visible rather than silently absent.
+		 */
+		readonly truncatedChildCount?: number;
+	}
+
+	/** What a connection exposes, as read by {@link dataConnections.getSchema}. */
+	export interface DataConnectionSchema {
+		/** The connection this was read from. */
+		readonly profileId: string;
+
+		/** The connection's top-level objects. */
+		readonly nodes: DataConnectionSchemaNode[];
+
+		/**
+		 * Whether any bound left part of the schema out.
+		 *
+		 * Worth checking before treating the result as the whole picture. A truncated schema
+		 * cannot tell a name it never saw from a name that is wrong, so a caller that reports
+		 * unknown names should stay quiet when this is set.
+		 */
+		readonly truncated: boolean;
+	}
+
+	/**
+	 * A single Data Explorer RPC request. The `params` and the `result` of the corresponding
+	 * response use the Data Explorer backend protocol; an extension typically casts them to its own
+	 * copy of the generated protocol types.
+	 */
+	export interface DataExplorerRpcRequest {
+		/** The backend-request method name. */
+		method: string;
+		/** The dataset identifier the request targets. */
+		uri?: string;
+		/** Method-specific parameters. */
+		params: object;
+	}
+
+	/**
+	 * The response to a {@link DataExplorerRpcRequest}: a result payload or an error message.
+	 */
+	export interface DataExplorerRpcResponse {
+		result?: unknown;
+		error_message?: string;
+	}
+
+	/**
+	 * A frontend UI event pushed from a backend (e.g. async column profiles), routed by dataset id.
+	 */
+	export interface DataExplorerUiEvent {
+		/** The dataset identifier the event targets. */
+		uri: string;
+		/** The frontend-event method name. */
+		method: string;
+		/** Event-specific parameters. */
+		params: object;
+	}
+
+	/**
+	 * Services Data Explorer RPC requests for the datasets a provider owns.
+	 */
+	export interface DataExplorerRpcHandler {
+		/**
+		 * Handles a single Data Explorer RPC request.
+		 * @param request The request envelope.
+		 * @returns The response (a result or an error message).
+		 */
+		handleRpc(request: DataExplorerRpcRequest): Thenable<DataExplorerRpcResponse>;
+
+		/**
+		 * Notifies the provider that the Data Explorer for a dataset has closed, so
+		 * it can release any per-dataset resources. A provider may use this to shut
+		 * down idle work once its last dataset closes. Optional.
+		 * @param datasetId The identifier of the dataset that was closed.
+		 */
+		closeDataset?(datasetId: string): void;
+
+		/**
+		 * Rebuilds a dataset's view so that it reflects the current contents of its
+		 * source, e.g. after the underlying table changed outside Positron. The
+		 * rebuilt view starts with no sort keys or row filters; Positron re-applies
+		 * the user's sort and filters afterwards. Reject on failure, leaving the
+		 * existing view intact. Optional: the Data Explorer offers Refresh only for
+		 * providers that implement it.
+		 * @param datasetId The identifier of the dataset to refresh.
+		 */
+		refreshDataset?(datasetId: string): Thenable<void>;
+	}
+
+	/**
+	 * A registration handle for a Data Explorer RPC handler. Dispose to unregister.
+	 */
+	export interface DataExplorerRpcSession extends vscode.Disposable {
+		/**
+		 * Pushes a frontend UI event (e.g. async column profiles) to the Data Explorer.
+		 * @param event The UI event.
+		 */
+		sendUiEvent(event: DataExplorerUiEvent): void;
+	}
+
+	/**
+	 * Import options that are not part of the file's identity. This bag is the seam for future
+	 * options (delimiter, skip rows, NA strings, column types, encoding).
+	 */
+	export interface DataImportOptions {
+		/** Whether the first row of the file holds column names. Defaults to true when absent. */
+		hasHeaderRow?: boolean;
+
+		/** The worksheet to read, for formats that have sheets. */
+		sheetName?: string;
+	}
+
+	/**
+	 * A column sort from the Data Explorer view. The column is named rather than indexed, because
+	 * the generated code operates on the loaded dataframe, where names are the only stable handle.
+	 */
+	export interface DataImportSortKey {
+		/** The name of the column to sort by. */
+		columnName: string;
+
+		/** Sort order: ascending (true) or descending (false). */
+		ascending: boolean;
+	}
+
+	/** The fields every row filter carries, whatever its type. */
+	export interface DataImportRowFilterBase {
+		/** The name of the column the filter applies to. */
+		columnName: string;
+
+		/** The column's canonical Positron display type, e.g. 'integer', 'string', 'boolean'. */
+		columnType: string;
+
+		/** How this filter combines with the one before it. Ignored on the first filter. */
+		condition: 'and' | 'or';
+	}
+
+	/** Keeps rows where the column's value falls inside (or, for not_between, outside) a range. */
+	export interface DataImportBetweenFilter extends DataImportRowFilterBase {
+		filterType: 'between' | 'not_between';
+		/** The lower limit, as a stringified column value. */
+		leftValue: string;
+		/** The upper limit, as a stringified column value. */
+		rightValue: string;
+	}
+
+	/** Keeps rows satisfying a binary comparison against one value. */
+	export interface DataImportCompareFilter extends DataImportRowFilterBase {
+		filterType: 'compare';
+		op: '=' | '!=' | '<' | '<=' | '>' | '>=';
+		/** The comparison value, as a stringified column value. */
+		value: string;
+	}
+
+	/** Keeps rows whose text matches a search term. */
+	export interface DataImportSearchFilter extends DataImportRowFilterBase {
+		filterType: 'search';
+		searchType: 'contains' | 'not_contains' | 'starts_with' | 'ends_with' | 'regex_match';
+		term: string;
+		caseSensitive: boolean;
+	}
+
+	/** Keeps rows whose value is in (or, when not inclusive, not in) a set. */
+	export interface DataImportSetMembershipFilter extends DataImportRowFilterBase {
+		filterType: 'set_membership';
+		/** The set members, as stringified column values. */
+		values: string[];
+		inclusive: boolean;
+	}
+
+	/** A row filter that needs no parameters beyond its type. */
+	export interface DataImportUnaryFilter extends DataImportRowFilterBase {
+		filterType: 'is_null' | 'not_null' | 'is_empty' | 'not_empty' | 'is_true' | 'is_false';
+	}
+
+	/**
+	 * One row filter from the Data Explorer view, discriminated on filterType so a generator can
+	 * switch over it exhaustively and route any type it cannot translate to `unsupported`.
+	 */
+	export type DataImportRowFilter =
+		| DataImportBetweenFilter
+		| DataImportCompareFilter
+		| DataImportSearchFilter
+		| DataImportSetMembershipFilter
+		| DataImportUnaryFilter;
+
+	/**
+	 * The Data Explorer view at the moment the dialog opened: what the user is looking at beyond
+	 * the raw file. Row filters marked invalid by the backend are excluded, because they are not
+	 * applied to the on-screen data either.
+	 */
+	export interface DataImportView {
+		rowFilters: DataImportRowFilter[];
+		sortKeys: DataImportSortKey[];
+	}
+
+	/**
+	 * A request to generate the code that loads one file into one variable.
+	 */
+	export interface DataImportRequest {
+		/** The original file, not the positron-data-explorer URI. */
+		fileUri: vscode.Uri;
+
+		/**
+		 * The target variable name, as entered by the user. This is arbitrary text, not
+		 * validated or sanitized for the importer's language: Positron does not check that it is
+		 * assignable, and importers are not expected to either. A name that is not a valid
+		 * identifier in the importer's language produces code that fails to run, which the code
+		 * preview already shows the user before they run it.
+		 */
+		variableName: string;
+
+		/** Format and parsing options. */
+		options: DataImportOptions;
+
+		/**
+		 * The Data Explorer view to reproduce (row filters and sorts), present
+		 * only when the user asked to include the current filters and sorts. Anything the importer
+		 * cannot translate belongs in the result's `unsupported` list, never dropped silently.
+		 */
+		view?: DataImportView;
+	}
+
+	/**
+	 * Generated import code, plus anything the importer could not express.
+	 */
+	export interface DataImportResult {
+		/** The generated code, ready to run in a console. */
+		code: string;
+
+		/**
+		 * Human-readable descriptions of anything in the request the importer could not translate.
+		 * Positron shows these as a warning next to the generated code, so that nothing is dropped
+		 * silently.
+		 */
+		unsupported?: string[];
+	}
+
+	/**
+	 * Generates the code that loads a data file into a variable, for one language and library. The
+	 * declared file extensions are what keep an importer off files it cannot read.
+	 */
+	export interface DataImporter {
+		/** The language the generated code is written in, e.g. 'python'. */
+		languageId: string;
+
+		/** A human-readable name for the importer, e.g. 'Python (pandas)'. */
+		displayName: string;
+
+		/** File extensions this importer can read, without a leading dot, e.g. ['csv', 'tsv']. */
+		fileExtensions: string[];
+
+		/**
+		 * Words this language will not let you assign to, e.g. 'class' for Python or 'if' for R.
+		 *
+		 * Positron derives the default variable name from the file name, restricted to an ASCII
+		 * letter followed by letters, digits and underscores, which is assignable in any language
+		 * an importer is likely to target. A reserved word is the one case that rule cannot catch,
+		 * so supply the language's list and Positron suffixes any collision: a file named class.csv
+		 * is offered as 'class_'. Omitting the list means such a file is offered as 'class'.
+		 */
+		reservedNames?: string[];
+
+		/**
+		 * Generates the code that loads the requested file.
+		 *
+		 * @param request The file, the target variable name, and the import options.
+		 * @returns The generated code, or undefined to decline.
+		 */
+		generateCode(request: DataImportRequest): vscode.ProviderResult<DataImportResult>;
+	}
+
+	/**
+	 * Methods for providing Data Explorer backends from an extension. A provider registers an RPC
+	 * handler under a stable provider id, then opens datasets it owns in the Data Explorer.
+	 */
+	namespace dataExplorer {
+		/**
+		 * Registers a Data Explorer RPC handler under a provider id.
+		 *
+		 * @param providerId A stable identifier for the providing extension (e.g. 'positron-duckdb').
+		 * @param handler The handler that services RPC requests for this provider's datasets.
+		 * @returns A session for pushing UI events; dispose it to unregister the handler.
+		 */
+		export function registerRpcHandler(providerId: string, handler: DataExplorerRpcHandler): DataExplorerRpcSession;
+
+		/**
+		 * Opens (or focuses) a Data Explorer for a dataset served by a registered provider.
+		 *
+		 * @param options The provider id, the dataset identifier, and a human-readable display name.
+		 */
+		export function open(options: { providerId: string; datasetId: string; displayName: string }): Thenable<void>;
+
+		/**
+		 * Registers a data importer, which generates the code that loads a data file into a variable.
+		 *
+		 * The importer is offered for files whose extension it declares, and its generated code is
+		 * shown to the user before it runs.
+		 *
+		 * @param importer The importer to register.
+		 * @returns A disposable that unregisters the importer.
+		 */
+		export function registerDataImporter(importer: DataImporter): vscode.Disposable;
+
+		/**
+		 * Where the data shown in a Data Explorer came from. Fields are set when they are known.
+		 */
+		export interface DataExplorerSource {
+			/** The ID of the language runtime session that owns the data, for kernel-backed data. */
+			sessionId?: string;
+			/** The language of the session that owns the data (e.g. 'Python', 'R'). */
+			languageName?: string;
+			/** The URI of the file being viewed, for file-backed data. */
+			fileUri?: string;
+			/** The name of the data connection the data was previewed from. */
+			connectionName?: string;
+			/** The name of the data connection's driver (e.g. 'PostgreSQL'). */
+			connectionDriver?: string;
+		}
+
+		/**
+		 * The selected region of a Data Explorer grid.
+		 */
+		export interface DataExplorerSelection {
+			/** Whether whole columns, whole rows, or a range of cells are selected. */
+			kind: 'columns' | 'rows' | 'cells';
+			/** The number of selected columns. */
+			columnCount: number;
+			/** The number of selected rows. */
+			rowCount: number;
+			/** The names of the selected columns, when few enough to list. */
+			columns?: string[];
+			/** The labels of the selected rows, when few enough to list. Undefined for column selections. */
+			rows?: string[];
+			/** The selected values as TSV, when the selection is small enough. */
+			values?: string;
+		}
+
+		/**
+		 * Describes the Data Explorer in the active editor.
+		 */
+		export interface DataExplorerContext {
+			/** The name of the data, e.g. the variable name, expression, file name, or table name. */
+			displayName: string;
+			/** Where the data came from. */
+			source: DataExplorerSource;
+			/** The number of rows and columns after filtering. */
+			shape: { rows: number; columns: number };
+			/** The number of rows and columns before filtering. */
+			unfilteredShape: { rows: number; columns: number };
+			/** Descriptions of the active row filters. */
+			rowFilters: string[];
+			/** The active sort keys, in priority order. */
+			sortKeys: Array<{ column: string; ascending: boolean }>;
+			/** The cell the cursor is on; the row is identified by its label. */
+			cursor?: { column: string; row: string };
+			/** The selected region, if any. */
+			selection?: DataExplorerSelection;
+		}
+
+		/**
+		 * Gets a description of the Data Explorer in the active editor, including where its data
+		 * came from, the cursor position, and the selection.
+		 *
+		 * @returns The context, or undefined if the active editor is not a Data Explorer.
+		 */
+		export function getContext(): Thenable<DataExplorerContext | undefined>;
+	}
+
+	/**
+	 * Refers to methods related to the connections pane
+	 */
+	namespace connections {
+		/**
+		 * Registers a new connection driver with Positron allowing extensions to contribute
+		 * to the 'New Connection' dialog.
+		 *
+		 * @param driver The connection driver to register
+		 * @returns A disposable that unregisters the driver when disposed
+		 */
+		export function registerConnectionDriver(driver: ConnectionsDriver): vscode.Disposable;
+	}
+
+	/**
+	 * Utilities for formatting file paths for use in code.
+	 */
+	namespace paths {
+		/**
+		 * Specifies the base directory for making a relative path.
+		 * Can be an abstract reference (which will be made concrete at runtime)
+		 * or a literal URI.
+		 *
+		 * - 'workspace': The workspace folder
+		 * - 'session': Working directory of a session
+		 * - 'home': User's home directory
+		 * - vscode.Uri: A literal URI provided by the caller
+		 */
+		export type RelativeBase = 'workspace' | 'session' | 'home' | vscode.Uri;
+
+		/**
+		 * Options for formatting file paths for use in code.
+		 */
+		export interface FormatPathForCodeOptions {
+			/**
+			 * Specifies base directories for relative path calculation, tried in order.
+			 * The path will be made relative to the first base that contains the file.
+			 * If omitted or empty, the path won't be relative-ized.
+			 *
+			 * Examples:
+			 * - ['workspace', 'home']: Try workspace-relative, fall back to home-relative
+			 * - ['session', 'home']: Try session-working-directory-relative, fall back to home-relative
+			 * - [vscode.Uri.file('/custom/base'), 'home']: Try custom base, fall back to home-relative
+			 */
+			relativeTo?: RelativeBase | RelativeBase[];
+
+			/**
+			 * Optional session ID when using 'session' in relativeTo.
+			 */
+			sessionId?: string;
+
+			/**
+			 * User's home directory URI. Required for 'home' and to expand ~ in 'session'.
+			 */
+			homeUri?: vscode.Uri;
+		}
+
+		/**
+		 * Format a file path for use in code.
+		 * - Replaces `\` with `/` because Windows.
+		 * - Surrounds path with double quotes and escapes any internal double quotes.
+		 * - Optionally returns a relative path (e.g. to workspace or user's home directory).
+		 *
+		 * @param filePath The file path to format
+		 * @param options Options for path formatting
+		 * @returns A Thenable that resolves to a quoted, forward-slash path ready for use in code,
+		 *  e.g., "C:/path/file.txt", "relative/path.txt", or "~/relative/path.txt"
+		 */
+		export function formatPathForCode(
+			filePath: string,
+			options?: FormatPathForCodeOptions
+		): Thenable<string>;
+
+		/**
+		 * Extract file paths from clipboard data.
+		 * Detects files copied from a file manager and returns paths formatted for use in code,
+		 * or null if no files detected.
+		 */
+		export function extractClipboardFilePaths(
+			dataTransfer: vscode.DataTransfer,
+			options?: FormatPathForCodeOptions
+		): Thenable<string[] | null>;
+	}
+
+	/**
+	 * Access to Positron product documentation cached on disk.
+	 */
+	namespace docs {
+		/**
+		 * A bundle of Positron documentation available on the extension host's
+		 * local filesystem.
+		 */
+		export interface LocalDocs {
+			/** Absolute path of the extracted bundle root, on the extension host's filesystem. */
+			readonly path: string;
+
+			/** Bundle format version. Currently 1. */
+			readonly schema: number;
+
+			/** Docs version this bundle was generated from, e.g. '2026.05.0-179'. */
+			readonly version: string;
+
+			/** 'positron' or 'workbench'. */
+			readonly profile: string;
+
+			/** Base URL for building a citable web link to a page in this bundle. */
+			readonly docsBaseUrl: string;
+
+			/** True when the bundle matches the running build exactly. */
+			readonly isExactMatch: boolean;
+		}
+
+		/**
+		 * Get the locally cached Positron documentation, downloading it if it is
+		 * not present yet.
+		 *
+		 * Safe to call per docs need: a successful result is cached in process,
+		 * and concurrent calls join a single in-flight download rather than
+		 * starting several. Waits at most 10 seconds for an in-flight download;
+		 * on timeout the download continues in the background and is available
+		 * to the next call.
+		 *
+		 * Resolves to `undefined` when there are no local docs, which means the
+		 * caller should fall back to fetching documentation from the web. That
+		 * is the only meaning of `undefined`.
+		 *
+		 * @returns A Thenable resolving to the local docs, or undefined.
+		 */
+		export function getLocalDocs(): Thenable<LocalDocs | undefined>;
+
+		/**
+		 * Get the locally cached Positron documentation if it is already present,
+		 * without ever downloading it.
+		 *
+		 * Unlike {@link getLocalDocs}, this never touches the network: it returns
+		 * whatever a prior prefetch or fetch has already placed on disk. Use it
+		 * when a download would be too costly to trigger on demand.
+		 *
+		 * Resolves to `undefined` when there are no local docs on disk, which
+		 * means the caller should fall back to fetching documentation from the
+		 * web. That is the only meaning of `undefined`.
+		 *
+		 * @returns A Thenable resolving to the local docs, or undefined.
+		 */
+		export function getLocalDocsCache(): Thenable<LocalDocs | undefined>;
+	}
+
+	/**
+	 * Experimental AI features.
+	 */
+	namespace ai {
+		/**
+		 * Request the current plot data.
+		 */
+		export function getCurrentPlotUri(): Thenable<string | undefined>;
+
+		/**
+		 * Filters a chat request's tools down to those Positron considers enabled
+		 * for the current context. Runs synchronously. Used by chat clients such
+		 * as Copilot Chat to apply Positron's tool-availability policy.
+		 *
+		 * @param request The chat request the tools would be used for.
+		 * @param tools The full list of candidate tools.
+		 * @returns The names of the tools that are enabled.
+		 */
+		export function getEnabledTools(request: vscode.ChatRequest, tools: readonly vscode.LanguageModelToolInformation[]): string[];
+
+		/**
+		 * Generate the Positron assistant prompt for a chat request: the
+		 * Positron-specific system instructions and IDE context to embed in a
+		 * chat prompt. Used by chat clients such as Copilot Chat.
+		 *
+		 * @param request The chat request to generate prompt content for.
+		 * @returns The assembled prompt content.
+		 */
+		export function generateAssistantPrompt(request: vscode.ChatRequest): Thenable<string>;
+
+		/**
+		 * Whether the provider with the given CATALOG id (e.g. 'copilot',
+		 * 'anthropic') is enabled in the resolved provider catalog. Unlike
+		 * getEnabledProviders(), ids are catalog ids, not registered auth-provider
+		 * ids, and no provider registration is required: the catalog's
+		 * default-enabled baseline answers for providers with no configuration.
+		 */
+		export function isProviderEnabled(id: string): Thenable<boolean>;
+
+		/**
+		 * The resolved base URL for the provider with the given CATALOG id
+		 * (e.g. 'positai'), after ai-config applies every layer: enforced
+		 * settings, environment variables, providers.json, admin defaults, and
+		 * built-in defaults. Undefined for unknown ids or providers without a
+		 * base URL.
+		 */
+		export function getProviderBaseUrl(id: string): Thenable<string | undefined>;
+
+		/** Fires when a provider's catalog enablement flips. Ids are catalog ids. */
+		export const onDidChangeProviderEnablement: vscode.Event<{ readonly id: string; readonly enabled: boolean }>;
+
+		/**
+		 * A positional parameter accepted by an agent-compatible command.
+		 *
+		 * The entry's position in `AgentCommand.args` is the positional index the
+		 * command handler expects.
+		 */
+		export interface AgentCommandArg {
+			/** Parameter name. */
+			name: string;
+			/** Human-readable description of the parameter. */
+			description?: string;
+			/** JSON Schema describing valid values for this argument. */
+			schema?: object;
+			/** Whether the argument is required. Defaults to `true`. */
+			required?: boolean;
+		}
+
+		/**
+		 * Where an agent-compatible command was registered from.
+		 */
+		export interface AgentCommandSource {
+			/** `'builtin'` for core Positron/VS Code commands; `'extension'` for extension-contributed commands. */
+			type: 'builtin' | 'extension';
+			/** Extension identifier (e.g. `ms-python.python`). Only present when `type` is `'extension'`. */
+			id?: string;
+			/** Extension display name. Only present when `type` is `'extension'`. */
+			displayName?: string;
+		}
+
+		/**
+		 * Metadata for a single Positron command exposed to AI agents.
+		 */
+		export interface AgentCommand {
+			/** Unique command identifier (e.g. `workbench.action.files.save`). */
+			id: string;
+			/**
+			 * Short, localized display name (e.g. `Save`), for an agent to show
+			 * the user when it runs the command, in place of the id. Absent when
+			 * the command has no title; show the id then.
+			 */
+			title?: string;
+			/** Model-facing description of what the command does. */
+			description?: string;
+			/** Ordered list of positional arguments the command accepts. */
+			args?: AgentCommandArg[];
+			/** Description of the command's return value, if meaningful. */
+			returns?: string;
+			/**
+			 * Whether the command leaves the user's work and data as they were, so
+			 * an agent may run it without asking. It may still change what's on
+			 * screen, such as revealing a pane.
+			 */
+			readOnly?: boolean;
+			/** Where the command was registered from. */
+			source: AgentCommandSource;
+		}
+
+		/**
+		 * An image an agent-compatible command returns for the agent to see,
+		 * rather than text. The bytes are base64, since a `Uint8Array` doesn't
+		 * survive a command result's serialization.
+		 */
+		export interface AgentCommandImage {
+			kind: 'image';
+			/** The image's type, such as `image/png`. */
+			mimeType: string;
+			/** The image, base64-encoded. */
+			data: string;
+			/** Text to go with the image, such as how it was made. */
+			note?: string;
+		}
+
+		/**
+		 * Result of {@link validateAndExecuteCommand}.
+		 *
+		 * On success, `ok` is `true` and `result` carries the handler's return
+		 * value. On failure, `ok` is `false` and `reason` explains what went
+		 * wrong so the caller can respond intelligibly:
+		 * - `'not-found'`: no command is registered with this id in the current
+		 *   build.
+		 * - `'disabled'`: the command's precondition context-key expression
+		 *   evaluated to false. `precondition` contains the serialized
+		 *   expression for diagnostics.
+		 * - `'error'`: the handler threw. `message` contains the error message.
+		 * - `'unknown'`: the failure cause could not be determined.
+		 */
+		export type ValidateAndExecuteCommandResult =
+			| { ok: true; result: unknown }
+			| {
+				ok: false;
+				reason: 'not-found' | 'disabled' | 'error' | 'unknown';
+				precondition?: string;
+				message?: string;
+			};
+
+		/**
+		 * Options for {@link getAgentAllowedCommands}.
+		 */
+		export interface GetAgentAllowedCommandsOptions {
+			/**
+			 * Include agent-compatible commands whose precondition does not
+			 * currently hold (e.g. a Data Explorer command while no Data Explorer
+			 * is open). Defaults to `false`, which returns only commands that are
+			 * enabled right now. Set to `true` when the full static set is needed
+			 * regardless of the current UI state, such as when generating
+			 * documentation.
+			 */
+			includeDisabled?: boolean;
+		}
+
+		/**
+		 * Returns the curated list of Positron commands that are available to
+		 * AI agents, including their IDs, descriptions, and parameter and
+		 * return-value metadata.
+		 *
+		 * The list is assembled from commands whose registration marks them as
+		 * agent-compatible; any curated id that is not registered in the
+		 * current build is dropped so the returned list is guaranteed to
+		 * resolve.
+		 *
+		 * @param options Controls which commands are returned.
+		 * @returns A Thenable that resolves to an array of command descriptors.
+		 */
+		export function getAgentAllowedCommands(options?: GetAgentAllowedCommandsOptions): Thenable<AgentCommand[]>;
+
+		/**
+		 * Registers a filesystem root holding agent skills produced at runtime
+		 * (for example, generated skill files written to an extension's storage),
+		 * so it is discovered by {@link getAgentSkillRoots}. The root is a
+		 * directory whose immediate subdirectories each contain a `SKILL.md`.
+		 *
+		 * The registration lives in the extension host. Dispose the returned
+		 * value to remove the root again.
+		 *
+		 * @param root Absolute filesystem path of the skill root to add.
+		 * @returns A Disposable that removes the root when disposed.
+		 */
+		export function registerAgentSkillRoot(root: string): vscode.Disposable;
+
+		/**
+		 * Returns the filesystem roots holding the agent skills available to
+		 * this Positron build, as added via {@link registerAgentSkillRoot}.
+		 *
+		 * Each root is a directory whose immediate subdirectories are skills, one
+		 * `SKILL.md` per subdirectory. Resolved on whichever machine the extension
+		 * host runs on, so the paths are valid for an extension reading them.
+		 *
+		 * @returns A Thenable resolving to absolute paths, empty when no skill
+		 * roots are registered.
+		 */
+		export function getAgentSkillRoots(): Thenable<string[]>;
+
+		/**
+		 * Fires when a skill root is added or removed via
+		 * {@link registerAgentSkillRoot}. Skill roots are frequently registered
+		 * after a reading extension has taken its first {@link getAgentSkillRoots}
+		 * snapshot, so a consumer should observe this event and re-read rather than
+		 * assuming the initial result is complete.
+		 */
+		export const onDidChangeAgentSkillRoots: vscode.Event<void>;
+
+		/**
+		 * Validate and execute a Positron command.
+		 *
+		 * Unlike `vscode.commands.executeCommand`, this call first checks that
+		 * the command exists and that its precondition (the context-key
+		 * expression that would grey the command out in menus and the command
+		 * palette) currently holds, then runs it and reports the outcome as a
+		 * structured result instead of a UI notification.
+		 *
+		 * @param commandId The identifier of the command to execute.
+		 * @param args Positional arguments to pass to the command handler.
+		 * @returns A Thenable that resolves to the structured result.
+		 */
+		export function validateAndExecuteCommand(
+			commandId: string,
+			args?: unknown[]
+		): Thenable<ValidateAndExecuteCommandResult>;
+	}
+
+	/**
+	 * Namespace for interacting with Positron notebooks.
+	 *
+	 * Quarto and R Markdown documents open in an editor while inline output is
+	 * enabled are also presented as notebooks whose cells are their code
+	 * chunks. Adding markdown cells, and moving and reordering cells, are not
+	 * supported for them.
+	 */
+	export namespace notebooks {
+		/**
+		 * Context about the currently active notebook
+		 */
+		export interface NotebookContext {
+			/**
+			 * URI of the notebook
+			 */
+			uri: string;
+
+			/**
+			 * ID of the active kernel
+			 */
+			kernelId?: string;
+
+			/**
+			 * Language of the kernel (e.g., 'python', 'r')
+			 */
+			kernelLanguage?: string;
+
+			/**
+			 * Total number of cells in the notebook
+			 */
+			cellCount: number;
+
+			/**
+			 * Currently selected cells
+			 */
+			selectedCells: NotebookCell[];
+
+			/**
+			 * All cells in the notebook. Included if notebook is small enough
+			 * to fit without taking too much context.
+			 */
+			allCells?: NotebookCell[];
+
+			/**
+			 * The current state of the runtime session (e.g. 'idle', 'busy', 'restarting').
+			 * Undefined if no runtime session is associated with this notebook.
+			 */
+			runtimeState?: string;
+		}
+
+		/**
+		 * Type of notebook cell
+		 */
+		export enum NotebookCellType {
+			/** A code cell */
+			Code = 'code',
+
+			/** A markdown cell */
+			Markdown = 'markdown',
+		}
+
+		/**
+		 * Represents a cell in a notebook
+		 */
+		export interface NotebookCell {
+			/**
+			 * Unique identifier for the cell
+			 */
+			id: string;
+
+			/**
+			 * Index of the cell in the notebook (0-based)
+			 */
+			index: number;
+
+			/**
+			 * Type of cell
+			 */
+			type: NotebookCellType;
+
+			/**
+			 * Content of the cell
+			 */
+			content: string;
+
+			/**
+			 * Whether the cell has output
+			 */
+			hasOutput: boolean;
+
+			/**
+			 * Selection status of the cell ('unselected' | 'selected' | 'active')
+			 */
+			selectionStatus: string;
+
+			/**
+			 * Execution status of the cell ('running' | 'pending' | 'idle')
+			 * Only present for code cells
+			 */
+			executionStatus?: string;
+
+			/**
+			 * Execution order number for the last execution
+			 * Only present for code cells
+			 */
+			executionOrder?: number;
+
+			/**
+			 * Whether the last execution was successful
+			 * Only present for code cells
+			 */
+			lastRunSuccess?: boolean;
+
+			/**
+			 * Duration of the last execution in milliseconds
+			 * Only present for code cells
+			 */
+			lastExecutionDuration?: number;
+
+			/**
+			 * Timestamp when the last execution ended
+			 * Only present for code cells
+			 */
+			lastRunEndTime?: number;
+
+			/**
+			 * For markdown cells only: whether the editor is shown (true) or preview is shown (false).
+			 * This property is undefined for code cells.
+			 */
+			editorShown?: boolean;
+		}
+
+		/**
+		 * Get context about the active notebook.
+		 *
+		 * When no Positron notebook or Quarto document is the active editor
+		 * pane (e.g. focus is in another editor or view), falls back to the
+		 * open notebook or Quarto document attached to the foreground session,
+		 * then to the most recently active Positron notebook that is still open.
+		 *
+		 * Resolves with `undefined` when no notebook is open. Rejects with an
+		 * actionable error when the active editor holds a notebook in an
+		 * editor other than the Positron Notebook Editor (e.g. the
+		 * built-in/Jupyter notebook editor), since the notebook API only
+		 * operates on Positron Notebook Editor instances; the error message
+		 * explains how to switch editors.
+		 *
+		 * @returns The notebook context, or undefined if no notebook is open
+		 */
+		export function getContext(): Thenable<NotebookContext | undefined>;
+
+		/**
+		 * Get all cells from a notebook
+		 * @param notebookUri URI of the notebook
+		 * @returns Array of all cells in the notebook
+		 */
+		export function getCells(notebookUri: string): Thenable<NotebookCell[]>;
+
+		/**
+		 * Get a specific cell from a notebook by its index
+		 * @param notebookUri URI of the notebook
+		 * @param cellIndex Index of the cell to retrieve
+		 * @returns The cell or undefined if not found
+		 */
+		export function getCell(notebookUri: string, cellIndex: number): Thenable<NotebookCell | undefined>;
+
+		/**
+		 * Execute cells in a notebook
+		 * @param notebookUri URI of the notebook
+		 * @param cellIndices Array of cell indices to execute
+		 */
+		export function runCells(notebookUri: string, cellIndices: number[]): Thenable<void>;
+
+		/**
+		 * Add a new cell to a notebook
+		 * @param notebookUri URI of the notebook
+		 * @param type Type of cell to add
+		 * @param index Index where the cell should be inserted
+		 * @param content Initial content for the cell
+		 * @returns The ID of the newly created cell
+		 */
+		export function addCell(notebookUri: string, type: NotebookCellType, index: number, content: string): Thenable<string>;
+
+		/**
+		 * Delete a cell from a notebook
+		 * @param notebookUri URI of the notebook
+		 * @param cellIndex Index of the cell to delete
+		 */
+		export function deleteCell(notebookUri: string, cellIndex: number): Thenable<void>;
+
+		/**
+		 * Delete multiple cells from a notebook
+		 * @param notebookUri URI of the notebook
+		 * @param cellIndices Array of cell indices to delete
+		 */
+		export function deleteCells(notebookUri: string, cellIndices: number[]): Thenable<void>;
+
+		/**
+		 * Update the content of a cell in a notebook
+		 * @param notebookUri URI of the notebook
+		 * @param cellIndex Index of the cell to update
+		 * @param content New content for the cell
+		 */
+		export function updateCellContent(notebookUri: string, cellIndex: number, content: string): Thenable<void>;
+
+		/**
+		 * Represents a cell output with its MIME type and data
+		 */
+		export interface NotebookCellOutput {
+			/**
+			 * MIME type of the output (e.g., 'text/plain', 'image/png', 'image/jpeg')
+			 */
+			mimeType: string;
+
+			/**
+			 * Output data - plain text for text outputs, base64-encoded string for images and other binary data
+			 */
+			data: string;
+		}
+
+		/**
+		 * Get the outputs from a code cell
+		 *
+		 * SVG outputs (image/svg+xml) are rasterized to base64-encoded PNG
+		 * (image/png) so they can be attached as images for language models;
+		 * the raw SVG text is returned only when rasterization fails.
+		 *
+		 * @param notebookUri URI of the notebook
+		 * @param cellIndex Index of the cell
+		 * @returns Array of output objects with MIME type and data
+		 */
+		export function getCellOutputs(notebookUri: string, cellIndex: number): Thenable<NotebookCellOutput[]>;
+
+		/**
+		 * Move a cell from one index to another in a notebook
+		 * @param notebookUri URI of the notebook
+		 * @param fromIndex The current index of the cell to move
+		 * @param toIndex The target index where the cell should be moved to
+		 */
+		export function moveCell(notebookUri: string, fromIndex: number, toIndex: number): Thenable<void>;
+
+		/**
+		 * Reorder all cells in a notebook according to a new order
+		 * @param notebookUri URI of the notebook
+		 * @param newOrder Array representing the new order - newOrder[i] is the index of the cell
+		 *                 that should be at position i in the reordered notebook.
+		 *                 Must be a valid permutation containing each index from 0 to cellCount-1 exactly once.
+		 */
+		export function reorderCells(notebookUri: string, newOrder: number[]): Thenable<void>;
+
+		/**
+		 * Scroll to a cell if it's out of view and auto-follow is enabled.
+		 * Respects the `positron.assistant.notebook.autoFollow` setting.
+		 * @param notebookUri The notebook URI as a string
+		 * @param cellIndex The index of the cell to scroll to
+		 */
+		export function scrollToCellIfNeeded(notebookUri: string, cellIndex: number): Thenable<void>;
+
+		/**
+		 * Clear cell outputs in a notebook.
+		 * @param notebookUri URI of the notebook
+		 * @param cellIndices Optional array of cell indices to clear. If omitted, clears all cells.
+		 */
+		export function clearCellOutputs(notebookUri: string, cellIndices?: number[]): Thenable<void>;
+	}
+
+	/**
+	 * A specification for migrating one configuration key to another.
+	 * Used with {@link workspace.registerConfigurationMigrations}.
+	 */
+	export interface ConfigurationMigrationSpec {
+		/** The configuration key to migrate from. */
+		readonly key: string;
+		/** The configuration key to migrate to. */
+		readonly migrateTo: string;
+	}
+
+	export namespace workspace {
+
+		/**
+		 * Register configuration key migrations. Each migration copies a value from an old
+		 * configuration key to a new key and clears the old key. If the destination key
+		 * already has a user-set value at the same configuration target, the old key is
+		 * cleared without overwriting the new value.
+		 *
+		 * Ownership of the source keys is required and determined in order:
+		 * 1. The key is still registered and its `source` matches the calling extension.
+		 * 2. The key has no registered extension owner (e.g. removed from the manifest after
+		 *    renaming) and the key starts with `{extensionId}.` — namespace ownership.
+		 *
+		 * Ownership checks are bypassed entirely for extensions published by `posit`.
+		 *
+		 * If the old key is enforced by system policy but the new key is not, the migration
+		 * will log an error and notify the user; the admin should update the policy to use
+		 * the new key.
+		 *
+		 * @param migrations Array of migration specifications.
+		 * @returns A {@link vscode.Disposable} (unregistering is not supported; dispose is a no-op).
+		 */
+		export function registerConfigurationMigrations(migrations: ReadonlyArray<ConfigurationMigrationSpec>): vscode.Disposable;
+	}
+}

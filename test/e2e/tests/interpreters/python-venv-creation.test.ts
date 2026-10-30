@@ -1,0 +1,68 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
+End-to-end smoke for Python venv auto-creation: open a workspace with a
+requirements.txt, accept the prompt, and confirm uv actually creates the .venv.
+
+The prompt's gating decision (requirements present, no existing venv/conda, a
+global interpreter selected, etc.) is pure logic covered deterministically by
+positron-python's unit tests -- see
+extensions/positron-python/src/test/pythonEnvironments/creation/createEnvironmentTrigger.unit.test.ts
+(including the "selected python is not global" branch). This E2E only covers
+the one thing those can't: the real create-venv flow through the UI and uv.
+*/
+
+import * as os from 'os';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { test as base, expect, tags } from '../_test.setup';
+
+const test = base.extend<{}, {}>({
+	beforeApp: [
+		async ({ settingsFile }, use) => {
+			await settingsFile.append({
+				'python.createEnvironment.trigger': 'prompt',
+				'interpreters.startupBehavior': 'auto',
+				'python.defaultInterpreterPath': '/usr/bin/python3',
+			});
+			await use();
+		},
+		{ scope: 'worker' }
+	],
+});
+
+test.use({
+	suiteId: __filename
+});
+
+test.describe('Python Venv Auto-Creation', {
+	tag: [tags.INTERPRETER, tags.WEB, tags.PYTHON]
+}, () => {
+	test.skip(process.env.IS_OPENSUSE === 'true', 'Skip on openSuse');
+	test.slow();
+
+	test('Clicking Yes creates venv', async function ({ app, openFolder }) {
+		const tempWorkspace = path.join(os.tmpdir(), 'vscsmoke', 'test-files', 'venv-creation-test');
+		// Cleaned up here rather than after the test: the new venv's session is still
+		// starting when the test ends, and removing the folder then fails the kernel launch.
+		await fs.rm(tempWorkspace, { recursive: true, force: true });
+		await fs.mkdir(tempWorkspace, { recursive: true });
+		await fs.writeFile(path.join(tempWorkspace, 'requirements.txt'), 'requests\n');
+
+		await openFolder('test-files/venv-creation-test');
+		await app.workbench.sessions.expectNoStartUpMessaging();
+
+		// Info toasts auto-hide after 10s when the window has focus; the notification
+		// center keeps the prompt, and waitForAppear checks both.
+		await app.workbench.toasts.waitForAppear(/requirements\.txt/, { timeout: 60000 });
+		await app.workbench.toasts.clickButton('Yes', { notificationFilter: /requirements\.txt/ });
+
+		const venvPath = path.join(tempWorkspace, '.venv');
+		await expect(async () => {
+			await fs.access(venvPath);
+		}).toPass({ timeout: 60000 });
+	});
+});

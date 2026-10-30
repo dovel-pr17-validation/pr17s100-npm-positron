@@ -1,0 +1,39 @@
+{
+	"compilerOptions": {
+		"module": "commonjs",
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": true,
+		"noImplicitAny": false,
+		"removeComments": false,
+		"preserveConstEnums": true,
+		"target": "es2024",
+		"strict": true,
+		"noUnusedParameters": false,
+		"noUnusedLocals": true,
+		"rootDir": ".",
+		"outDir": "out",
+		"sourceMap": true,
+		"skipLibCheck": true,
+		"lib": [
+			"esnext", // for #201187
+			"dom"
+		],
+		"paths": {
+			// Prefer the playwright-core nested under @playwright/test so CDP types
+			// match the driver's CDPSession; the root playwright-core is pinned by
+			// upstream merges. Falls back to the hoisted copy in flat installs.
+			"playwright-core/types/protocol": [
+				"../../node_modules/playwright/node_modules/playwright-core/types/protocol.d.ts",
+				"../../node_modules/playwright-core/types/protocol.d.ts"
+			]
+		}
+	},
+	"exclude": [
+		"node_modules",
+		// Vitest files under test/e2e belong to the vitest project, which owns
+		// them via `test/e2e/**/*.vitest.ts` in vitest.tsconfig.json. Compiling
+		// them here fails in CI, where the e2e lanes install only the Playwright
+		// dependencies and `vitest` is not resolvable.
+		"**/*.vitest.ts"
+	]
+}

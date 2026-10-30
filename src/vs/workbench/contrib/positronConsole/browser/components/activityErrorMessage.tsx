@@ -1,0 +1,102 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2023-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+// CSS.
+import './activityErrorMessage.css';
+
+// React.
+import { useEffect, useRef, useState } from 'react';
+
+// Other dependencies.
+import { localize } from '../../../../../nls.js';
+import { ConsoleOutputLines } from './consoleOutputLines.js';
+import { Button } from '../../../../../base/browser/ui/positronComponents/button/button.js';
+import { ActivityItemErrorMessage } from '../../../../services/positronConsole/browser/classes/activityItemErrorMessage.js';
+import { ConsoleQuickFix } from './activityErrorQuickFix.js';
+import { usePositronConfiguration } from '../../../../../base/browser/positronReactHooks.js';
+import { IPositronConsoleInstance } from '../../../../services/positronConsole/browser/interfaces/positronConsoleService.js';
+
+// ActivityErrorProps interface.
+export interface ActivityErrorMessageProps {
+	activityItemErrorMessage: ActivityItemErrorMessage;
+	/** The code that raised the error, when the console still has it. */
+	code?: string;
+	/** The console the error was raised in. */
+	positronConsoleInstance: IPositronConsoleInstance;
+}
+
+/**
+ * ActivityErrorMessage component.
+ * @param props An ActivityErrorMessageProps that contains the component properties.
+ * @returns The rendered component.
+ */
+export const ActivityErrorMessage = (props: ActivityErrorMessageProps) => {
+	// Reference hooks.
+	const activityErrorMessageRef = useRef<HTMLDivElement>(undefined!);
+
+	// State hooks.
+	const [showTraceback, setShowTraceback] = useState(false);
+
+	// Configuration hooks. The quick fix itself hides while there is no active
+	// error action handler, e.g. while AI is disabled.
+	const showAssistantActions = usePositronConfiguration<boolean>('console.assistantActions.enabled');
+
+	// Traceback useEffect.
+	useEffect(() => {
+		// Ensure that the component is scrolled into view when traceback is showing.
+		if (showTraceback) {
+			activityErrorMessageRef.current?.scrollIntoView({ behavior: 'auto' });
+		}
+	}, [showTraceback]);
+
+	const pressedTracebackHandler = () => {
+		// Toggle show traceback.
+		setShowTraceback(!showTraceback);
+	};
+
+	// Render.
+	return (
+		<div ref={activityErrorMessageRef} className='activity-error-message'>
+			<div className='error-bar'></div>
+			<div className='error-information'>
+				{props.activityItemErrorMessage.messageOutputLines.length > 0 &&
+					<ConsoleOutputLines outputLines={props.activityItemErrorMessage.messageOutputLines} />
+				}
+				<div className='error-footer'>
+					<div className='traceback'>
+						<div className='actions'>
+							{props.activityItemErrorMessage.tracebackOutputLines.length > 0 &&
+								<Button className='toggle-traceback' onPressed={pressedTracebackHandler}>
+									{showTraceback ?
+										<>
+											<div className='expansion-indicator codicon codicon-positron-triangle-down'></div>
+											<div className='link-text'>{localize('positronHideTraceback', "Hide Traceback")}</div>
+
+										</> :
+										<>
+											<div className='expansion-indicator codicon codicon-positron-triangle-right'></div>
+											<div className='link-text'>{localize('positronShowTraceback', "Show Traceback")}</div>
+										</>
+									}
+								</Button>
+							}
+							{showAssistantActions &&
+								<ConsoleQuickFix code={props.code} outputLines={props.activityItemErrorMessage.messageOutputLines} positronConsoleInstance={props.positronConsoleInstance} tracebackLines={props.activityItemErrorMessage.tracebackOutputLines} />
+							}
+						</div>
+						{showTraceback &&
+							<div className='traceback-lines'>
+								<div />
+								<div>
+									<ConsoleOutputLines outputLines={props.activityItemErrorMessage.tracebackOutputLines} />
+								</div>
+							</div>
+						}
+					</div>
+				</div>
+			</div>
+		</div>
+	);
+};

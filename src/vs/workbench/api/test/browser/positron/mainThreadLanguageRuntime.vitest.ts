@@ -1,0 +1,413 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/// <reference types="vitest/globals" />
+
+import { CancellationToken } from '../../../../../base/common/cancellation.js';
+import { Emitter, Event } from '../../../../../base/common/event.js';
+import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { URI } from '../../../../../base/common/uri.js';
+import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+import { ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { NullLogService } from '../../../../../platform/log/common/log.js';
+import { INotificationService } from '../../../../../platform/notification/common/notification.js';
+import { IOpenerService } from '../../../../../platform/opener/common/opener.js';
+import { stubInterface } from '../../../../../test/vitest/stubInterface.js';
+import { ensureNoLeakedDisposables } from '../../../../../test/vitest/vitestUtils.js';
+import { INotebookService } from '../../../../contrib/notebook/common/notebookService.js';
+import { IPositronHelpService } from '../../../../contrib/positronHelp/browser/positronHelpService.js';
+import { IQuartoExecutionManager } from '../../../../contrib/positronQuarto/common/quartoExecutionTypes.js';
+import { IRuntimeNotebookKernelService } from '../../../../contrib/runtimeNotebookKernel/common/interfaces/runtimeNotebookKernelService.js';
+import { IEditorService } from '../../../../services/editor/common/editorService.js';
+import { IWorkbenchEnvironmentService } from '../../../../services/environment/common/environmentService.js';
+import { ILanguageRuntimeMetadata, ILanguageRuntimeService, LanguageRuntimeSessionMode, RuntimeCodeExecutionMode, RuntimeErrorBehavior } from '../../../../services/languageRuntime/common/languageRuntimeService.js';
+import { IPathService } from '../../../../services/path/common/pathService.js';
+import { IPositronConnectionsService } from '../../../../services/positronConnections/common/interfaces/positronConnectionsService.js';
+import { IPositronConsoleService } from '../../../../services/positronConsole/browser/interfaces/positronConsoleService.js';
+import { CodeAttributionSource, ILanguageRuntimeCodeExecutedEvent } from '../../../../services/positronConsole/common/positronConsoleCodeExecution.js';
+import { IPositronDataExplorerService } from '../../../../services/positronDataExplorer/browser/interfaces/positronDataExplorerService.js';
+import { IExecutionHistoryService } from '../../../../services/positronHistory/common/executionHistoryService.js';
+import { IPositronIPyWidgetsService } from '../../../../services/positronIPyWidgets/common/positronIPyWidgetsService.js';
+import { IPositronPlotsService } from '../../../../services/positronPlots/common/positronPlots.js';
+import { IPositronVariablesService } from '../../../../services/positronVariables/common/interfaces/positronVariablesService.js';
+import { IPositronWebviewPreloadService } from '../../../../services/positronWebviewPreloads/browser/positronWebviewPreloadService.js';
+import { ILanguageRuntimeSession, IRuntimeSessionMetadata, IRuntimeSessionService, SessionStartReasonId } from '../../../../services/runtimeSession/common/runtimeSessionService.js';
+import { IRuntimeStartupService } from '../../../../services/runtimeStartup/common/runtimeStartupService.js';
+import { IExtHostContext } from '../../../../services/extensions/common/extHostCustomers.js';
+import { ExtHostLanguageRuntimeShape, RuntimeSessionCapabilities } from '../../../common/positron/extHost.positron.protocol.js';
+import { buildRuntimeOpenEventResource, ExtHostLanguageRuntimeSessionAdapter, MainThreadLanguageRuntime, openRuntimeResourceWithSystem } from '../../../browser/positron/mainThreadLanguageRuntime.js';
+
+/**
+ * `pathService.fileURI()` is stubbed so these tests run on any host OS;
+ * each scenario passes the URI it would have produced on the target OS.
+ */
+
+async function callHelper(opts: {
+	inputPath: string;
+	fileURIResult: URI;
+	defaultUriScheme: string;
+	remoteAuthority: string | undefined;
+}): Promise<URI> {
+	const pathService = stubInterface<IPathService>({
+		fileURI: vi.fn().mockResolvedValue(opts.fileURIResult),
+		defaultUriScheme: opts.defaultUriScheme,
+	});
+	const environmentService = stubInterface<IWorkbenchEnvironmentService>({
+		remoteAuthority: opts.remoteAuthority,
+	});
+	return buildRuntimeOpenEventResource(opts.inputPath, pathService, environmentService);
+}
+
+describe('buildRuntimeOpenEventResource', () => {
+	it('#13431 - Windows UNC path, desktop', async () => {
+		const uri = await callHelper({
+			inputPath: '\\\\NASEN1010\\share\\folder\\file.R',
+			fileURIResult: URI.from({ scheme: 'file', authority: 'NASEN1010', path: '/share/folder/file.R' }),
+			defaultUriScheme: 'file',
+			remoteAuthority: undefined,
+		});
+		expect(uri.toString()).toBe('file://nasen1010/share/folder/file.R');
+	});
+
+	it('#8374 - Windows drive letter, desktop', async () => {
+		const uri = await callHelper({
+			inputPath: 'C:\\Users\\jenny\\foo.R',
+			fileURIResult: URI.from({ scheme: 'file', authority: '', path: '/C:/Users/jenny/foo.R' }),
+			defaultUriScheme: 'file',
+			remoteAuthority: undefined,
+		});
+		expect(uri.toString()).toBe('file:///c%3A/Users/jenny/foo.R');
+	});
+
+	it('POSIX path, desktop', async () => {
+		const uri = await callHelper({
+			inputPath: '/Users/jenny/foo.R',
+			fileURIResult: URI.from({ scheme: 'file', authority: '', path: '/Users/jenny/foo.R' }),
+			defaultUriScheme: 'file',
+			remoteAuthority: undefined,
+		});
+		expect(uri.toString()).toBe('file:///Users/jenny/foo.R');
+	});
+
+	it('#10378 - POSIX path, web build: vscode-remote scheme + remote authority populated', async () => {
+		const uri = await callHelper({
+			inputPath: '/home/jenny/foo.R',
+			fileURIResult: URI.from({ scheme: 'file', authority: '', path: '/home/jenny/foo.R' }),
+			defaultUriScheme: 'vscode-remote',
+			remoteAuthority: 'localhost:8080',
+		});
+		expect(uri.toString()).toBe('vscode-remote://localhost:8080/home/jenny/foo.R');
+	});
+});
+
+describe('openRuntimeResourceWithSystem', () => {
+	function createServices(opts: { fileURIResult: URI; defaultUriScheme: string; remoteAuthority: string | undefined; proxyUrl?: string }) {
+		const open = vi.fn().mockResolvedValue(true);
+		const executeCommand = vi.fn().mockResolvedValue(opts.proxyUrl);
+		return {
+			open,
+			executeCommand,
+			commandService: stubInterface<ICommandService>({ executeCommand }),
+			openerService: stubInterface<IOpenerService>({ open }),
+			pathService: stubInterface<IPathService>({
+				fileURI: vi.fn().mockResolvedValue(opts.fileURIResult),
+				defaultUriScheme: opts.defaultUriScheme,
+			}),
+			environmentService: stubInterface<IWorkbenchEnvironmentService>({ remoteAuthority: opts.remoteAuthority }),
+		};
+	}
+
+	it('desktop: opens the file URI externally so the OS default application handles it', async () => {
+		const s = createServices({
+			fileURIResult: URI.from({ scheme: 'file', authority: '', path: '/Users/jenny/report.html' }),
+			defaultUriScheme: 'file',
+			remoteAuthority: undefined,
+		});
+
+		await openRuntimeResourceWithSystem('/Users/jenny/report.html', s.commandService, s.openerService, s.pathService, s.environmentService, false);
+
+		expect(s.executeCommand).not.toHaveBeenCalled();
+		expect(s.open).toHaveBeenCalledWith(URI.parse('file:///Users/jenny/report.html'), { openExternal: true });
+	});
+
+	it('#10893 - web: serves the file through the HTML proxy and opens that URL externally', async () => {
+		const s = createServices({
+			fileURIResult: URI.from({ scheme: 'file', authority: '', path: '/home/jenny/report.html' }),
+			defaultUriScheme: 'vscode-remote',
+			remoteAuthority: 'localhost:8080',
+			proxyUrl: 'http://localhost:43210/ab12cd34/report.html',
+		});
+
+		await openRuntimeResourceWithSystem('/home/jenny/report.html', s.commandService, s.openerService, s.pathService, s.environmentService, true);
+
+		expect(s.executeCommand).toHaveBeenCalledWith('positronProxy.startHtmlProxyServer', '/home/jenny/report.html');
+		expect(s.open).toHaveBeenCalledWith(URI.parse('http://localhost:43210/ab12cd34/report.html'), { openExternal: true });
+	});
+
+	it('web: rejects when the proxy server could not be started', async () => {
+		const s = createServices({
+			fileURIResult: URI.from({ scheme: 'file', authority: '', path: '/home/jenny/missing.html' }),
+			defaultUriScheme: 'vscode-remote',
+			remoteAuthority: 'localhost:8080',
+			proxyUrl: undefined,
+		});
+
+		await expect(openRuntimeResourceWithSystem('/home/jenny/missing.html', s.commandService, s.openerService, s.pathService, s.environmentService, true))
+			.rejects.toThrow('Failed to start HTML proxy server');
+		expect(s.open).not.toHaveBeenCalled();
+	});
+});
+
+describe('ExtHostLanguageRuntimeSessionAdapter - missing-package capabilities', () => {
+	const disposables = ensureNoLeakedDisposables();
+
+	function createAdapter(capabilities: RuntimeSessionCapabilities) {
+		const $getMissingPackageProbe = vi.fn().mockResolvedValue('import requests');
+		const proxy = stubInterface<ExtHostLanguageRuntimeShape>({
+			$getMissingPackageProbe,
+			// Read by the adapter's dispose() via ensureNoLeakedDisposables.
+			$disposeLanguageRuntime: vi.fn(),
+		});
+		const adapter = disposables.add(new ExtHostLanguageRuntimeSessionAdapter(
+			{
+				handle: 0,
+				dynState: { inputPrompt: '>', continuationPrompt: '+', sessionName: 'test' },
+				capabilities,
+			},
+			stubInterface<ILanguageRuntimeMetadata>({}),
+			stubInterface<IRuntimeSessionMetadata>({ notebookUri: undefined }),
+			stubInterface<IRuntimeSessionService>({
+				onDidChangeForegroundSession: Event.None,
+				onDidReceiveRuntimeEvent: Event.None,
+			}),
+			stubInterface<INotificationService>({}),
+			new NullLogService(),
+			stubInterface<ICommandService>({}),
+			stubInterface<INotebookService>({}),
+			stubInterface<IEditorService>({}),
+			stubInterface<IPathService>({}),
+			stubInterface<IWorkbenchEnvironmentService>({}),
+			proxy,
+			stubInterface<IOpenerService>({}),
+		));
+		return { adapter, $getMissingPackageProbe };
+	}
+
+	it('leaves the optional methods undefined when the extension session lacks them', () => {
+		const { adapter } = createAdapter({ listMissingPackages: false, getMissingPackageProbe: false });
+
+		expect(adapter.listMissingPackages).toBeUndefined();
+		expect(adapter.getMissingPackageProbe).toBeUndefined();
+	});
+
+	it('defines the optional methods when the extension session implements them', () => {
+		const { adapter } = createAdapter({ listMissingPackages: true, getMissingPackageProbe: true });
+
+		expect(adapter.listMissingPackages).toBeDefined();
+		expect(adapter.getMissingPackageProbe).toBeDefined();
+	});
+
+	it('projects the console error to name/message/traceback before crossing the RPC boundary', async () => {
+		const { adapter, $getMissingPackageProbe } = createAdapter({ listMissingPackages: true, getMissingPackageProbe: true });
+
+		// A frontend IConsoleError carries extra fields (sessionId, languageId)
+		// that must not reach extensions; keep it as a variable so the extra
+		// fields pass the structural check.
+		const error = {
+			name: 'ModuleNotFoundError',
+			message: `No module named 'requests'`,
+			traceback: [],
+			sessionId: 's1',
+			languageId: 'python',
+		};
+
+		await adapter.getMissingPackageProbe!(error, CancellationToken.None);
+
+		expect($getMissingPackageProbe).toHaveBeenCalledWith(
+			0,
+			{ name: 'ModuleNotFoundError', message: `No module named 'requests'`, traceback: [] },
+			CancellationToken.None,
+		);
+	});
+});
+
+/**
+ * Creates a MainThreadLanguageRuntime with stub services.
+ */
+function createMainThreadLanguageRuntime(
+	disposables: Pick<DisposableStore, 'add'>,
+	runtimeSessionService: IRuntimeSessionService = stubInterface<IRuntimeSessionService>({ registerSessionManager: () => Disposable.None }),
+	consoleExecuteCode?: IPositronConsoleService['executeCode'],
+) {
+	const consoleEmitter = disposables.add(new Emitter<ILanguageRuntimeCodeExecutedEvent>());
+	const notebookEmitter = disposables.add(new Emitter<ILanguageRuntimeCodeExecutedEvent>());
+	const quartoEmitter = disposables.add(new Emitter<ILanguageRuntimeCodeExecutedEvent>());
+
+	const $notifyCodeExecuted = vi.fn();
+	const proxy = stubInterface<ExtHostLanguageRuntimeShape>({ $notifyCodeExecuted });
+	const extHostContext = stubInterface<IExtHostContext>({
+		getProxy: (() => proxy) as unknown as IExtHostContext['getProxy'],
+	});
+
+	const mainThread = new MainThreadLanguageRuntime(
+		extHostContext,
+		stubInterface<ILanguageRuntimeService>({ onDidRegisterRuntime: Event.None }),
+		runtimeSessionService,
+		stubInterface<IRuntimeStartupService>({ registerRuntimeManager: () => Disposable.None }),
+		stubInterface<IRuntimeNotebookKernelService>({ initialize: vi.fn(), onDidExecuteCode: notebookEmitter.event }),
+		stubInterface<IPositronConsoleService>({
+			initialize: vi.fn(),
+			onDidExecuteCode: consoleEmitter.event,
+			...(consoleExecuteCode && { executeCode: consoleExecuteCode }),
+		}),
+		stubInterface<IPositronDataExplorerService>({ initialize: vi.fn() }),
+		stubInterface<IPositronVariablesService>({ initialize: vi.fn() }),
+		stubInterface<IPositronHelpService>({ initialize: vi.fn() }),
+		stubInterface<IPositronPlotsService>({ initialize: vi.fn() }),
+		stubInterface<IPositronIPyWidgetsService>({ initialize: vi.fn() }),
+		stubInterface<IPositronWebviewPreloadService>({ initialize: vi.fn() }),
+		stubInterface<IPositronConnectionsService>({ initialize: vi.fn() }),
+		stubInterface<INotificationService>({}),
+		stubInterface<IQuartoExecutionManager>({ onDidExecuteCode: quartoEmitter.event }),
+		stubInterface<IPathService>({}),
+		new NullLogService(),
+		stubInterface<ICommandService>({}),
+		stubInterface<INotebookService>({}),
+		stubInterface<IEditorService>({}),
+		stubInterface<IOpenerService>({}),
+		stubInterface<IWorkbenchEnvironmentService>({}),
+		stubInterface<IExecutionHistoryService>({}),
+		stubInterface<IConfigurationService>({}),
+	);
+	disposables.add(mainThread);
+	return { mainThread, consoleEmitter, notebookEmitter, quartoEmitter, $notifyCodeExecuted };
+}
+
+describe('MainThreadLanguageRuntime - code execution event forwarding', () => {
+	const disposables = ensureNoLeakedDisposables();
+
+	function codeExecutedEvent(overrides: Partial<ILanguageRuntimeCodeExecutedEvent>): ILanguageRuntimeCodeExecutedEvent {
+		return {
+			executionId: 'exec-1',
+			sessionId: 'session-1',
+			languageId: 'python',
+			code: 'print("hi")',
+			attribution: { source: CodeAttributionSource.Notebook },
+			runtimeName: 'Python 3.12',
+			mode: RuntimeCodeExecutionMode.Interactive,
+			errorBehavior: RuntimeErrorBehavior.Stop,
+			...overrides,
+		};
+	}
+
+	function createMainThread() {
+		return createMainThreadLanguageRuntime(disposables);
+	}
+
+	it('forwards code execution events from the console, notebook, and Quarto sources to the extension host', () => {
+		const { consoleEmitter, notebookEmitter, quartoEmitter, $notifyCodeExecuted } = createMainThread();
+
+		const consoleEvent = codeExecutedEvent({ executionId: 'console' });
+		const notebookEvent = codeExecutedEvent({ executionId: 'notebook' });
+		const quartoEvent = codeExecutedEvent({ executionId: 'quarto' });
+
+		consoleEmitter.fire(consoleEvent);
+		notebookEmitter.fire(notebookEvent);
+		quartoEmitter.fire(quartoEvent);
+
+		expect($notifyCodeExecuted.mock.calls.map(([event]) => event)).toEqual([
+			consoleEvent,
+			notebookEvent,
+			quartoEvent,
+		]);
+	});
+});
+
+describe('MainThreadLanguageRuntime - extension-requested sessions', () => {
+	const disposables = ensureNoLeakedDisposables();
+
+	it('names the calling extension in the start reason', async () => {
+		const selectRuntime = vi.fn<IRuntimeSessionService['selectRuntime']>(async () => { });
+		const startNewRuntimeSession = vi.fn<IRuntimeSessionService['startNewRuntimeSession']>(async () => 'session-1');
+		const { mainThread } = createMainThreadLanguageRuntime(disposables, stubInterface<IRuntimeSessionService>({
+			registerSessionManager: () => Disposable.None,
+			selectRuntime,
+			startNewRuntimeSession,
+		}));
+
+		await mainThread.$selectLanguageRuntime('r-1', 'positron.positron-r');
+		await mainThread.$startLanguageRuntime('python-1', 'Python 3.12', LanguageRuntimeSessionMode.Console, undefined, 'positron.positron-python', undefined);
+
+		expect([selectRuntime.mock.calls[0][1], startNewRuntimeSession.mock.calls[0][4]]).toEqual([
+			{ id: SessionStartReasonId.ExtensionApiSelect, requestingExtensionId: 'positron.positron-r' },
+			{ id: SessionStartReasonId.ExtensionApiStart, requestingExtensionId: 'positron.positron-python' },
+		]);
+	});
+
+	it('passes the calling extension to a restart', async () => {
+		const restartSession = vi.fn<IRuntimeSessionService['restartSession']>(async () => true);
+		const { mainThread } = createMainThreadLanguageRuntime(disposables, stubInterface<IRuntimeSessionService>({
+			registerSessionManager: () => Disposable.None,
+			restartSession,
+		}));
+
+		await mainThread.$restartSession('session-1', 'positron.positron-run-app');
+
+		expect(restartSession.mock.calls[0]).toEqual([
+			'session-1', 'Extension-requested runtime restart via Positron API', true, 'positron.positron-run-app']);
+	});
+
+	it('attributes code to the calling extension and the kernel that sent it, ignoring caller-supplied values', async () => {
+		const executeCode = vi.fn<IPositronConsoleService['executeCode']>(async () => 'session-1');
+		const kernelSession = stubInterface<ILanguageRuntimeSession>({ sessionId: 'r-notebook-1' });
+		const { mainThread } = createMainThreadLanguageRuntime(disposables, stubInterface<IRuntimeSessionService>({
+			registerSessionManager: () => Disposable.None,
+			getSession: sessionId => sessionId === kernelSession.sessionId ? kernelSession : undefined,
+		}), executeCode);
+		const forged = { extensionId: 'example.forged', callerSessionId: 'forged-session' };
+
+		await mainThread.$executeCode('r', 'posit.shiny', undefined, 'x', false,
+			undefined, undefined, undefined, undefined, undefined, undefined, forged);
+		await mainThread.$executeCode('r', 'positron.positron-supervisor', undefined, 'x', false,
+			undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'r-notebook-1');
+		// An extension can pass any session ID to `positron.methods.call`; one that names no
+		// session doesn't count, so the extension is still credited.
+		await mainThread.$executeCode('r', 'posit.shiny', undefined, 'x', false,
+			undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'made-up-session');
+
+		expect(executeCode.mock.calls.map(call => call[3])).toEqual([
+			{ source: CodeAttributionSource.Extension, metadata: { extensionId: 'posit.shiny', callerSessionId: undefined } },
+			{ source: CodeAttributionSource.Extension, metadata: { extensionId: 'positron.positron-supervisor', callerSessionId: 'r-notebook-1' } },
+			{ source: CodeAttributionSource.Extension, metadata: { extensionId: 'posit.shiny', callerSessionId: undefined } },
+		]);
+	});
+
+	it('attributes the console that evaluateCode starts to the calling extension', async () => {
+		const executeCode = vi.fn<IPositronConsoleService['executeCode']>(async () => 'session-1');
+		const { mainThread } = createMainThreadLanguageRuntime(disposables, stubInterface<IRuntimeSessionService>({
+			registerSessionManager: () => Disposable.None,
+			getActiveSessions: () => [],
+		}), executeCode);
+
+		// No session ever appears, so the evaluation itself fails; this test only covers the start.
+		await expect(mainThread.$evaluateCode('python', 'posit.shiny', undefined, '1', 'eval-1')).rejects.toThrow();
+
+		expect(executeCode.mock.calls[0][3]).toEqual({ source: CodeAttributionSource.Extension, metadata: { extensionId: 'posit.shiny' } });
+	});
+
+	it('records an agent session started by an extension', async () => {
+		const startNewRuntimeSession = vi.fn<IRuntimeSessionService['startNewRuntimeSession']>(async () => 'session-1');
+		const { mainThread } = createMainThreadLanguageRuntime(disposables, stubInterface<IRuntimeSessionService>({
+			registerSessionManager: () => Disposable.None,
+			startNewRuntimeSession,
+		}));
+
+		await mainThread.$startLanguageRuntime('python-1', 'Python 3.12', LanguageRuntimeSessionMode.Console, undefined, 'posit.assistant', { owner: 'agent', activate: false });
+
+		expect(startNewRuntimeSession.mock.calls[0][4]).toEqual(
+			{ id: SessionStartReasonId.ExtensionStartedAgentSession, requestingExtensionId: 'posit.assistant' },
+		);
+	});
+});

@@ -1,0 +1,147 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { DisposableStore, IDisposable } from '../../../../base/common/lifecycle.js';
+import { extHostNamedCustomer, IExtHostContext } from '../../../services/extensions/common/extHostCustomers.js';
+import { IPositronDataExplorerService } from '../../../services/positronDataExplorer/browser/interfaces/positronDataExplorerService.js';
+import { IDataExplorerRpcDto, IDataExplorerResponseDto, IDataExplorerRpcTransport, IDataExplorerUiEventDto } from '../../../services/positronDataExplorer/common/dataExplorerRpcTransport.js';
+import { IDataImporter, IDataImporterMetadata, IDataImportRequest, IDataImportResult, IPositronDataImporterRegistry } from '../../../services/positronDataExplorer/common/positronDataImporterRegistry.js';
+import type { dataExplorer } from 'positron';
+import { IEditorService } from '../../../services/editor/common/editorService.js';
+import { IRuntimeSessionService } from '../../../services/runtimeSession/common/runtimeSessionService.js';
+import { PositronDataExplorerUri } from '../../../services/positronDataExplorer/common/positronDataExplorerUri.js';
+import { IPositronDataConnectionsService } from '../../../services/positronDataConnections/common/interfaces/positronDataConnectionsService.js';
+import { ExtHostDataExplorerShape, ExtHostPositronContext, MainPositronContext, MainThreadDataExplorerShape } from '../../common/positron/extHost.positron.protocol.js';
+
+/**
+ * Main thread counterpart to ExtHostDataExplorer, one per extension host. Acts as this host's
+ * {@link IDataExplorerRpcTransport} for core Data Explorer backends -- forwarding each RPC over the
+ * typed ext-host channel to the providing extension -- routes the extension's frontend UI events and
+ * open requests into the IPositronDataExplorerService, and tells the service which providers this
+ * host owns as their handlers register. The service triggers activation and routes RPCs to the owner.
+ */
+@extHostNamedCustomer(MainPositronContext.MainThreadDataExplorer)
+export class MainThreadDataExplorer implements MainThreadDataExplorerShape, IDataExplorerRpcTransport {
+
+	private readonly _proxy: ExtHostDataExplorerShape;
+	private readonly _disposables = new DisposableStore();
+
+	/** Registry registrations for importers contributed by the ext host, keyed by handle. */
+	private readonly _importerRegistrations = new Map<number, IDisposable>();
+
+	/** The providers registered on this host whose handlers implement `refreshDataset`. */
+	private readonly _refreshableProviders = new Set<string>();
+
+	constructor(
+		extHostContext: IExtHostContext,
+		@IPositronDataExplorerService private readonly _dataExplorerService: IPositronDataExplorerService,
+		@IPositronDataImporterRegistry private readonly _dataImporterRegistry: IPositronDataImporterRegistry,
+		@IEditorService private readonly _editorService: IEditorService,
+		@IRuntimeSessionService private readonly _runtimeSessionService: IRuntimeSessionService,
+		@IPositronDataConnectionsService private readonly _dataConnectionsService: IPositronDataConnectionsService
+	) {
+		this._proxy = extHostContext.getProxy(ExtHostPositronContext.ExtHostDataExplorer);
+		// Register this host so its provider claims are cleared if the host disconnects.
+		this._disposables.add(this._dataExplorerService.registerRpcHost(this));
+	}
+
+	// --- IDataExplorerRpcTransport ---
+
+	handleRpc(providerId: string, rpc: IDataExplorerRpcDto): Promise<IDataExplorerResponseDto> {
+		// The service resolves this transport only once the provider has registered here, so the
+		// extension is already active; `$handleRpc` also waits for the handler as a safety net.
+		return this._proxy.$handleRpc(providerId, rpc);
+	}
+
+	disposeBackend(providerId: string, datasetId: string): void {
+		this._proxy.$disposeBackend(providerId, datasetId);
+	}
+
+	supportsRefresh(providerId: string): boolean {
+		return this._refreshableProviders.has(providerId);
+	}
+
+	refreshDataset(providerId: string, datasetId: string): Promise<void> {
+		return this._proxy.$refreshDataset(providerId, datasetId);
+	}
+
+	// --- MainThreadDataExplorerShape (called by the ext host) ---
+
+	$registerRpcHandler(providerId: string, supportsRefresh: boolean): void {
+		// A re-registration replaces the handler, so it replaces the capability too.
+		if (supportsRefresh) {
+			this._refreshableProviders.add(providerId);
+		} else {
+			this._refreshableProviders.delete(providerId);
+		}
+
+		// Tells the service this host is the one that can service the provider's RPCs. In web there
+		// are two hosts and only one of them has the extension, so this is what routes correctly.
+		this._dataExplorerService.registerRpcProvider(providerId, this);
+	}
+
+	$unregisterRpcHandler(providerId: string): void {
+		this._refreshableProviders.delete(providerId);
+		this._dataExplorerService.unregisterRpcProvider(providerId, this);
+	}
+
+	$sendUiEvent(event: IDataExplorerUiEventDto): void {
+		this._dataExplorerService.routeUiEvent(event);
+	}
+
+	$open(providerId: string, datasetId: string, displayName: string): Promise<void> {
+		return this._dataExplorerService.openWithExtensionBackend({ providerId, datasetId, displayName });
+	}
+
+	$registerDataImporter(handle: number, metadata: IDataImporterMetadata): void {
+		const importer: IDataImporter = {
+			languageId: metadata.languageId,
+			displayName: metadata.displayName,
+			fileExtensions: metadata.fileExtensions,
+			reservedNames: metadata.reservedNames,
+			generateCode: (request: IDataImportRequest): Promise<IDataImportResult | undefined> =>
+				this._proxy.$generateImportCode(handle, {
+					fileUri: request.fileUri.toJSON(),
+					variableName: request.variableName,
+					options: request.options,
+					view: request.view
+				})
+		};
+		this._importerRegistrations.set(handle, this._dataImporterRegistry.registerImporter(importer));
+	}
+
+	$unregisterDataImporter(handle: number): void {
+		this._importerRegistrations.get(handle)?.dispose();
+		this._importerRegistrations.delete(handle);
+	}
+
+	async $getActiveDataExplorerContext(): Promise<dataExplorer.DataExplorerContext | undefined> {
+		const resource = this._editorService.activeEditor?.resource;
+		const identifier = resource && PositronDataExplorerUri.parse(resource);
+		const instance = identifier && this._dataExplorerService.getInstance(identifier);
+		if (!instance) {
+			return undefined;
+		}
+
+		const session = this._runtimeSessionService.activeSessions.find(session =>
+			session.clientInstances.some(client => client.getClientId() === identifier));
+		const profile = this._dataConnectionsService.getProfileForDataset(identifier);
+		const source: dataExplorer.DataExplorerSource = {
+			sessionId: session?.sessionId,
+			languageName: session?.runtimeMetadata.languageName,
+			fileUri: PositronDataExplorerUri.backingUri(resource)?.toString(),
+			connectionName: profile?.connectionName,
+			connectionDriver: profile?.driverMetadata.name,
+		};
+
+		return { ...await instance.getViewContext(), source };
+	}
+
+	dispose(): void {
+		this._importerRegistrations.forEach(registration => registration.dispose());
+		this._importerRegistrations.clear();
+		this._disposables.dispose();
+	}
+}

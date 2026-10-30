@@ -1,0 +1,20 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2024-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.positron-dynamic-modal-dialog-box .choose-new-folder-window-modal-dialog {
+	gap: 8px;
+	display: flex;
+	flex-direction: column;
+	white-space: normal;
+}
+
+/* Beats the content area's own 11px code style. */
+.positron-dynamic-modal-dialog-box .content-area .choose-new-folder-window-modal-dialog code {
+	font-size: 13px;
+	font-weight: 500;
+	overflow-wrap: anywhere;
+	font-family: var(--monaco-monospace-font);
+	color: var(--vscode-positronModalDialog-preformattedTextForeground);
+}

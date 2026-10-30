@@ -1,0 +1,568 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+// A reconnecting wrapper around the snowflake-sdk Connection. It mirrors the reconnecting client the
+// Redshift driver uses, but adapts to two ways Snowflake differs from a raw Postgres socket:
+//
+//   1. Callbacks, not promises. snowflake-sdk is callback-based -- connect(cb), execute({complete}),
+//      destroy(cb) -- so each call is promisified here, giving the rest of the driver the same
+//      `query()`/`connect()`/`end()` surface the Postgres/Redshift clients expose.
+//
+//   2. Session drop-out. A Snowflake session left idle is torn down server-side (the client session
+//      idle timeout), and the socket can also be dropped by a NAT/firewall along the way. The next
+//      query then fails with a session/connection error. `clientSessionKeepAlive` keeps the session
+//      warm across ordinary gaps; when the session really is gone, query() classifies the failure and
+//      rebuilds the connection once before retrying, so browsing a connection that sat idle recovers
+//      transparently. A genuine SQL error (bad identifier, compilation error) is never retried.
+
+/**
+ * Normalized Snowflake connection options, independent of any single auth mechanism. Built by the
+ * driver from the mechanism's parameter values and passed straight to snowflake-sdk's
+ * createConnection. Only the fields relevant to a mechanism are set; the rest are left undefined.
+ */
+export interface SnowflakeConnectionOptions {
+	/** The Snowflake account identifier (e.g. `myorg-myacct`), never the full hostname. */
+	account: string;
+	/**
+	 * The hostname to connect to, when it is not the one the SDK derives from `account`. Inside
+	 * Snowpark Container Services this is `$SNOWFLAKE_HOST`, the account's internal endpoint, which a
+	 * container can reach without egress to the public one.
+	 */
+	host?: string;
+	/** The login name. Required for key-pair and PAT; optional for OAuth client credentials. */
+	username?: string;
+	/**
+	 * The password field. Also carries a Programmatic Access Token, which Snowflake accepts wherever a
+	 * password is expected, so PAT auth sets this and leaves `authenticator` at its default.
+	 */
+	password?: string;
+	/** The snowflake-sdk authenticator constant (e.g. `SNOWFLAKE_JWT`, `OAUTH_CLIENT_CREDENTIALS`). */
+	authenticator?: string;
+	/** A pre-issued OAuth access token (authenticator `OAUTH`). */
+	token?: string;
+	/**
+	 * Supplies the OAuth access token afresh each time a connection is built, for tokens an external
+	 * party rotates (Posit Workbench managed credentials). Takes precedence over `token`, and is read on
+	 * every connect and reconnect so a rotated token is never reused stale.
+	 */
+	tokenProvider?: () => Promise<string>;
+	/** Path to the PEM private key file (key-pair / SNOWFLAKE_JWT auth). */
+	privateKeyPath?: string;
+	/** Passphrase protecting the private key file, if any (key-pair auth). */
+	privateKeyPass?: string;
+	/** OAuth client id (OAuth client-credentials auth). */
+	oauthClientId?: string;
+	/** OAuth client secret (OAuth client-credentials auth). */
+	oauthClientSecret?: string;
+	/** OAuth token endpoint the client-credentials grant posts to. */
+	oauthTokenRequestUrl?: string;
+	/** OAuth scope requested for the token, if any. */
+	oauthScope?: string;
+	/** The warehouse to use for queries. Optional; the account default is used when unset. */
+	warehouse?: string;
+	/** The initial current database. Optional. */
+	database?: string;
+	/** The initial current schema. Optional. */
+	schema?: string;
+	/** The role to activate for the session. Optional. */
+	role?: string;
+}
+
+/** An error as surfaced by snowflake-sdk or the underlying socket: may carry a code and a message. */
+interface SnowflakeError {
+	code?: string | number;
+	message?: string;
+	// The SQL state Snowflake reported for a statement that failed on the server.
+	sqlState?: string;
+}
+
+/**
+ * The slice of a snowflake-sdk Statement this client uses to read a streamed result: its row count,
+ * and a stream of a range of its rows.
+ */
+interface ISdkStatement {
+	getNumRows(): number;
+	/** The result's column metadata; `getType()` is the SDK's lowercase type name (e.g. 'fixed', 'real'). */
+	getColumns(): Array<{ getName(): string; getType(): string }> | undefined;
+	streamRows(options: { start: number; end: number }): {
+		on(event: 'data', listener: (row: Record<string, unknown>) => void): unknown;
+		on(event: 'end', listener: () => void): unknown;
+		on(event: 'error', listener: (err: SnowflakeError) => void): unknown;
+	};
+}
+
+/** The options passed to snowflake-sdk's Connection.execute. */
+interface SdkExecuteOptions {
+	sqlText: string;
+	binds?: unknown[];
+	// When set, `complete` gets no rows; they are read from the statement with streamRows instead,
+	// so a large result need not be fetched whole.
+	streamResult?: boolean;
+	// SDK data types to return as the raw text Snowflake sent rather than converting. 'Number' covers
+	// both FIXED (NUMBER) and REAL (FLOAT) columns.
+	fetchAsString?: Array<'Number'>;
+	complete: (err: SnowflakeError | undefined, stmt: ISdkStatement, rows: Array<Record<string, unknown>> | undefined) => void;
+}
+
+/**
+ * The slice of the snowflake-sdk Connection surface this client uses. Declared locally (rather than
+ * pulled from @types/snowflake-sdk, which lags the SDK and lacks the newer auth options) so the
+ * factory can be faked in tests without a live account.
+ */
+export interface ISnowflakeSdkConnection {
+	/** Connects using a synchronous authenticator (password, key-pair, PAT). */
+	connect(callback: (err: SnowflakeError | undefined, conn: ISnowflakeSdkConnection) => void): void;
+	/**
+	 * Connects using an authenticator that needs an async step (OAuth token exchange, browser SSO).
+	 * This is the SDK's promise-based API: it returns a promise that settles with the outcome, and
+	 * depending on the failure mode it may reject that promise *without* invoking the callback. Callers
+	 * must therefore consume the returned promise, not rely on the callback alone.
+	 */
+	connectAsync(callback?: (err: SnowflakeError | undefined, conn: ISnowflakeSdkConnection) => void): Promise<ISnowflakeSdkConnection>;
+	/** Runs a statement, delivering rows (or an error) to the `complete` callback. */
+	execute(options: SdkExecuteOptions): void;
+	/** Closes the connection. */
+	destroy(callback: (err: SnowflakeError | undefined, conn: ISnowflakeSdkConnection) => void): void;
+}
+
+/** The shape a query resolves to: rows as plain objects keyed by (case-preserved) column name. */
+export interface SnowflakeQueryResult {
+	rows: Array<Record<string, unknown>>;
+}
+
+/** Options for a single query. */
+export interface SnowflakeQueryOptions {
+	/**
+	 * Return NUMBER values as their exact digit strings (e.g. '9007199254740993.01') instead of JS
+	 * numbers, which cannot hold a wide NUMBER(p,s) and round a NUMBER(38,0) past 2^53. FLOAT values
+	 * are still returned as JS numbers, and NULLs as null.
+	 */
+	exactNumbers?: boolean;
+}
+
+/** The shape a capped query resolves to: its first rows, and how many rows the result had in all. */
+export interface SnowflakeCappedQueryResult extends SnowflakeQueryResult {
+	total: number;
+}
+
+/**
+ * Builds a fresh snowflake-sdk Connection for the given options. Factored out (and overridable via
+ * the SnowflakeClient constructor) so tests can supply a fake connection without a live account.
+ * Async because the real factory loads the SDK on demand.
+ */
+export type SnowflakeConnectionFactory = (options: SnowflakeConnectionOptions) => Promise<ISnowflakeSdkConnection>;
+
+/**
+ * Authenticators whose connect performs an asynchronous step (an OAuth token exchange or a browser
+ * round-trip) and so must go through snowflake-sdk's connectAsync rather than connect.
+ */
+const ASYNC_AUTHENTICATORS = new Set(['OAUTH_CLIENT_CREDENTIALS', 'OAUTH_AUTHORIZATION_CODE', 'EXTERNALBROWSER']);
+
+/**
+ * The real factory: a keepalive-enabled snowflake-sdk Connection.
+ *
+ * snowflake-sdk is imported here rather than at the top of the module so that loading it is paid
+ * for by the first connection attempt, not by activating the extension. The Data Connections pane
+ * activates every driver at once, and a user who never opens a Snowflake connection should never
+ * pay to load its SDK.
+ *
+ * Exported for unit tests, which assert the lazy import yields a constructible connection.
+ */
+export const defaultConnectionFactory: SnowflakeConnectionFactory = async options => {
+	// snowflake-sdk is bundled behind a shim module (src/snowflakeSdk.ts) that
+	// is its own esbuild entry point, so the packaged extension loads the
+	// bundled copy with a relative dynamic import rather than resolving the
+	// package from node_modules, which does not ship. snowflake-sdk is
+	// CommonJS with no `exports` map, so the namespace a dynamic import()
+	// yields carries the module object on `default` and nothing else.
+	// @types/snowflake-sdk declares the package ESM-shaped, so reaching for
+	// `createConnection` on the namespace type-checks but is undefined at runtime.
+	const snowflake = (await import('./snowflakeSdk.js')).default;
+	// createConnection returns @types/snowflake-sdk's Connection, whose execute signature is narrower
+	// than the simplified ISnowflakeSdkConnection this file declares (see that interface's comment).
+	// Cast at the SDK boundary since the two execute shapes aren't structurally assignable.
+	return snowflake.createConnection({
+		account: options.account,
+		host: options.host,
+		username: options.username,
+		password: options.password,
+		authenticator: options.authenticator,
+		token: options.token,
+		privateKeyPath: options.privateKeyPath,
+		privateKeyPass: options.privateKeyPass,
+		oauthClientId: options.oauthClientId,
+		oauthClientSecret: options.oauthClientSecret,
+		oauthTokenRequestUrl: options.oauthTokenRequestUrl,
+		oauthScope: options.oauthScope,
+		warehouse: options.warehouse,
+		database: options.database,
+		schema: options.schema,
+		role: options.role,
+		// Keep the session warm across idle gaps so browsing after a pause doesn't hit a torn-down
+		// session on the first query.
+		clientSessionKeepAlive: true,
+		// Identify Positron as the client application in Snowflake's session metadata.
+		application: 'Positron',
+	}) as unknown as ISnowflakeSdkConnection;
+};
+
+// Connect-retry budget. A transient network hiccup or a warehouse still spinning up can drop the
+// first connect attempts; the attempt count and capped exponential backoff cover a brief window
+// before giving up. A terminal error (bad credentials, unknown account) is not retried.
+const CONNECT_MAX_ATTEMPTS = 5;
+const CONNECT_RETRY_BASE_DELAY_MS = 1_000;
+const CONNECT_RETRY_MAX_DELAY_MS = 10_000;
+
+/**
+ * Undoes the side effects of `fetchAsString: ['Number']`, so that a NUMBER's exact text is the only
+ * thing the option changes, apart from one deliberate fix to FLOAT infinity. Rows are converted in
+ * place.
+ *
+ * - A NULL in any numeric column arrives as the string 'NULL' (the SDK's `representNullAsStringNull`
+ *   defaults to on), so it is turned back into null. In a numeric column the string can mean nothing
+ *   else.
+ * - A FLOAT is converted back to a JS number. The option is all-or-nothing across numeric types, but a
+ *   FLOAT is a double either way, and its raw text need not be in the plain notation a cell or an
+ *   export should show. The conversion is the SDK's own `Number()`, except that it reads Snowflake's
+ *   'inf' and '-inf' as infinity rather than NaN (see `parseFloatText`).
+ */
+function normalizeNumericColumns(stmt: ISdkStatement, rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+	const columns = (stmt.getColumns() ?? [])
+		.filter(column => column.getType() === 'fixed' || column.getType() === 'real')
+		.map(column => ({ name: column.getName(), isFloat: column.getType() === 'real' }));
+	if (columns.length === 0) {
+		return rows;
+	}
+	for (const row of rows) {
+		for (const { name, isFloat } of columns) {
+			const value = row[name];
+			if (value === 'NULL') {
+				row[name] = null;
+			} else if (isFloat && typeof value === 'string') {
+				row[name] = parseFloatText(value);
+			}
+		}
+	}
+	return rows;
+}
+
+/**
+ * Parses a FLOAT's raw text as Snowflake sends it. This is `Number()`, which is what the SDK applies,
+ * except for infinity: Snowflake spells it 'inf' and '-inf', which `Number()` reads as NaN, so an
+ * infinite value would otherwise display as NaN.
+ */
+function parseFloatText(text: string): number {
+	const infinity = /^(?<sign>[+-]?)inf(?:inity)?$/i.exec(text);
+	if (infinity) {
+		return infinity.groups?.sign === '-' ? -Infinity : Infinity;
+	}
+	return Number(text);
+}
+
+/** Resolves after the given number of milliseconds. */
+function defaultSleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Whether an error means the session/connection itself is gone (as opposed to a SQL-level error like
+ * a compilation or object-not-found problem, which reconnecting would not fix). Covers Node socket
+ * errors and the message-only network/session errors snowflake-sdk raises when its session has been
+ * torn down. Only these trigger a reconnect, so a genuine query error is never retried.
+ */
+export function isFatalConnectionError(err: unknown): boolean {
+	if (!err || typeof err !== 'object') {
+		return false;
+	}
+	const { code, message } = err as SnowflakeError;
+	if (typeof code === 'string') {
+		// Node socket-level errors.
+		if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ETIMEDOUT' ||
+			code === 'ECONNREFUSED' || code === 'ENETUNREACH' || code === 'EHOSTUNREACH' ||
+			code === 'EHOSTDOWN') {
+			return true;
+		}
+	}
+	// snowflake-sdk raises these (with no SQL state) once its session/socket has gone away.
+	const lower = (message ?? '').toLowerCase();
+	return lower.includes('terminated') ||
+		lower.includes('network error') ||
+		lower.includes('socket hang up') ||
+		lower.includes('session does not exist') ||
+		lower.includes('session doesn\'t exist') ||
+		lower.includes('session token') ||
+		lower.includes('not connected');
+}
+
+/**
+ * Whether an error is Snowflake's verdict on the statement itself -- insufficient privileges, an
+ * object that doesn't exist, a stage whose credentials fail -- rather than a problem with the
+ * connection it ran on (a dead or closed session, a network failure, an expired login). Snowflake
+ * reports a statement's failure with a SQL state; a connection problem comes with none, or with a
+ * class 08 (connection exception) state.
+ */
+export function isStatementError(err: unknown): boolean {
+	if (!err || typeof err !== 'object' || isFatalConnectionError(err)) {
+		return false;
+	}
+	const { sqlState } = err as SnowflakeError;
+	return typeof sqlState === 'string' && sqlState.length > 0 && !sqlState.startsWith('08');
+}
+
+/**
+ * A snowflake-sdk connection that survives an idle session dropping out from under it. Presents the
+ * small promisified surface the rest of the driver uses -- connect(), query(), end() -- and swaps the
+ * underlying connection transparently when a query hits a dead session. Callers hold a stable
+ * reference to this wrapper, so schema-tree nodes built against it keep working across a reconnect.
+ */
+export class SnowflakeClient {
+	// The current sdk connection, or null before connect() / after end().
+	private _conn: ISnowflakeSdkConnection | null = null;
+
+	// In-flight reconnect, shared so concurrent queries that all hit the dead session rebuild the
+	// connection once rather than racing to create several. While it is set, `_conn` is transiently
+	// null even though the client is not closed, so callers must await it before reading `_conn`.
+	private _reconnecting: Promise<void> | null = null;
+
+	// True once end() has been called. Distinguishes a disposed client (a null `_conn` that stays null)
+	// from a client mid-reconnect (a null `_conn` that a pending `_reconnecting` will refill), so a
+	// query in the reconnect window waits instead of failing as "closed".
+	private _closed = false;
+
+	/**
+	 * @param _config The connection options.
+	 * @param _createConnection Factory for the underlying sdk connection. Defaults to a
+	 * keepalive-enabled real connection; overridden in tests to supply a fake.
+	 * @param _sleep Backoff delay between connect attempts. Overridden in tests to avoid real waits.
+	 */
+	constructor(
+		private readonly _config: SnowflakeConnectionOptions,
+		private readonly _createConnection: SnowflakeConnectionFactory = defaultConnectionFactory,
+		private readonly _sleep: (ms: number) => Promise<void> = defaultSleep
+	) { }
+
+	/**
+	 * Builds a connection and connects it, retrying a transient connection failure with backoff. A
+	 * terminal error (bad credentials, unknown account) or exhausting the attempts propagates.
+	 */
+	private async _open(): Promise<void> {
+		for (let attempt = 1; ; attempt++) {
+			const conn = await this._createConnection(await this._resolveOptions());
+			try {
+				await this._connectOnce(conn);
+				this._conn = conn;
+				return;
+			} catch (err) {
+				if (!isFatalConnectionError(err) || attempt >= CONNECT_MAX_ATTEMPTS) {
+					throw err;
+				}
+				await this._sleep(Math.min(CONNECT_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), CONNECT_RETRY_MAX_DELAY_MS));
+			}
+		}
+	}
+
+	/**
+	 * The options to build the next connection with: the configured options, with the OAuth token
+	 * fetched from the token provider when one is set, so every (re)connect uses a current token.
+	 */
+	private async _resolveOptions(): Promise<SnowflakeConnectionOptions> {
+		const { tokenProvider, ...options } = this._config;
+		return tokenProvider ? { ...options, token: await tokenProvider() } : options;
+	}
+
+	/**
+	 * Promisifies a single connect on the given connection, choosing connectAsync for authenticators
+	 * that perform an async token exchange or browser round-trip and connect otherwise.
+	 */
+	private _connectOnce(conn: ISnowflakeSdkConnection): Promise<void> {
+		// Compare case-insensitively: authenticators sourced from connections.toml can be lower-case
+		// (e.g. `externalbrowser`), while the form-based mechanisms pass the upper-case SDK constants.
+		const useAsync = this._config.authenticator !== undefined && ASYNC_AUTHENTICATORS.has(this._config.authenticator.toUpperCase());
+		return new Promise<void>((resolve, reject) => {
+			const callback = (err: SnowflakeError | undefined) => err ? reject(err) : resolve();
+			if (useAsync) {
+				// connectAsync (OAuth exchange, browser SSO) can report failure by rejecting its promise
+				// without ever calling the callback, which would leave this hanging until the SDK's
+				// internal timeout. Settle on whichever of the promise or the callback fires first; a
+				// Promise ignores settles after the first, so wiring both is safe.
+				conn.connectAsync(callback).then(() => resolve(), reject);
+			} else {
+				conn.connect(callback);
+			}
+		});
+	}
+
+	/** Establishes the connection. Must be called before query(). */
+	async connect(): Promise<void> {
+		await this._open();
+	}
+
+	/**
+	 * Runs a query, reconnecting once and retrying if the session was found dead. A non-connection
+	 * error (bad SQL, missing object) is thrown without a retry. `binds` supplies positional `?`
+	 * parameters.
+	 */
+	async query(sqlText: string, binds?: unknown[], options?: SnowflakeQueryOptions): Promise<SnowflakeQueryResult> {
+		return this._withReconnect(() => this._queryOnce(sqlText, binds, options));
+	}
+
+	/**
+	 * Runs a query whose result may be too large to fetch whole (LIST on a stage of millions of
+	 * files), reading only its first `limit` rows and reporting how many it had in all. The rows are
+	 * streamed from the result rather than fetched and then cut, so the cap bounds the work as well
+	 * as what is shown. Reconnects and retries like query().
+	 */
+	async queryCapped(sqlText: string, limit: number): Promise<SnowflakeCappedQueryResult> {
+		return this._withReconnect(() => this._queryCappedOnce(sqlText, limit));
+	}
+
+	/**
+	 * Runs one attempt of a query, reconnecting once and retrying if the session was found dead. A
+	 * non-connection error (bad SQL, missing object) is thrown without a retry.
+	 */
+	private async _withReconnect<T>(attempt: () => Promise<T>): Promise<T> {
+		// A reconnect nulls `_conn` while it rebuilds the session; wait for any in-flight reconnect
+		// rather than mistaking that transient gap for a closed client.
+		const inflight = this._reconnecting;
+		if (inflight) {
+			await inflight;
+		}
+		if (this._closed) {
+			throw new Error('Snowflake client is closed');
+		}
+		try {
+			return await attempt();
+		} catch (err) {
+			if (!isFatalConnectionError(err)) {
+				throw err;
+			}
+			await this._reconnect();
+			return await attempt();
+		}
+	}
+
+	/** Issues a single statement with a streamed result, reading at most `limit` of its rows. */
+	private _queryCappedOnce(sqlText: string, limit: number): Promise<SnowflakeCappedQueryResult> {
+		const conn = this._conn;
+		if (!conn) {
+			return Promise.reject(new Error('Snowflake client is closed'));
+		}
+		return new Promise<SnowflakeCappedQueryResult>((resolve, reject) => {
+			conn.execute({
+				sqlText,
+				streamResult: true,
+				complete: (err, stmt) => {
+					if (err) {
+						reject(err);
+						return;
+					}
+					// The SDK calls this outside the promise's executor, so anything reading the
+					// result throws is caught here; uncaught, it would escape to the extension host
+					// and leave the promise unsettled.
+					try {
+						const total = stmt.getNumRows();
+						const count = Math.min(total, limit);
+						if (count <= 0) {
+							resolve({ rows: [], total });
+							return;
+						}
+						const rows: Array<Record<string, unknown>> = [];
+						// The range is inclusive at both ends.
+						const stream = stmt.streamRows({ start: 0, end: count - 1 });
+						stream.on('data', row => rows.push(row));
+						stream.on('error', reject);
+						stream.on('end', () => resolve({ rows, total }));
+					} catch (error) {
+						reject(error);
+					}
+				},
+			});
+		});
+	}
+
+	/** Issues a single statement against the current connection, promisifying execute(). */
+	private _queryOnce(sqlText: string, binds?: unknown[], options?: SnowflakeQueryOptions): Promise<SnowflakeQueryResult> {
+		const conn = this._conn;
+		if (!conn) {
+			return Promise.reject(new Error('Snowflake client is closed'));
+		}
+		const exactNumbers = options?.exactNumbers === true;
+		return new Promise<SnowflakeQueryResult>((resolve, reject) => {
+			conn.execute({
+				sqlText,
+				binds,
+				// The SDK converts NUMBER with Number(), which is where the precision goes; fetching
+				// as a string hands back the text Snowflake sent, which the SDK already holds.
+				fetchAsString: exactNumbers ? ['Number'] : undefined,
+				complete: (err, stmt, rows) => {
+					if (err) {
+						reject(err);
+						return;
+					}
+					// The SDK calls this outside the promise's executor, so a throw reading the result
+					// must be caught here or the promise would never settle.
+					try {
+						resolve({ rows: exactNumbers ? normalizeNumericColumns(stmt, rows ?? []) : rows ?? [] });
+					} catch (error) {
+						reject(error);
+					}
+				},
+			});
+		});
+	}
+
+	/**
+	 * Rebuilds the connection after a dead-session failure. Coalesced so concurrent callers share one
+	 * reconnect; the old connection is destroyed best-effort (its session has already gone, so
+	 * failures to destroy it are expected and ignored).
+	 */
+	private _reconnect(): Promise<void> {
+		if (this._closed) {
+			return Promise.reject(new Error('Snowflake client is closed'));
+		}
+		if (!this._reconnecting) {
+			this._reconnecting = (async () => {
+				const old = this._conn;
+				this._conn = null;
+				if (old) {
+					await this._destroy(old).catch(() => { /* already dead; nothing to clean up */ });
+				}
+				await this._open();
+				// If end() ran while we were rebuilding, don't leave the freshly opened connection
+				// installed: tear it down so a disposed client holds no live session.
+				if (this._closed && this._conn) {
+					const orphan = this._conn;
+					this._conn = null;
+					await this._destroy(orphan).catch(() => { /* nothing more to do */ });
+				}
+			})().finally(() => { this._reconnecting = null; });
+		}
+		return this._reconnecting;
+	}
+
+	/** Closes the connection. Idempotent. */
+	async end(): Promise<void> {
+		this._closed = true;
+		// If a reconnect is mid-flight, let it settle first: it owns `_conn` and will hand back whatever
+		// it installs (its own closed-check then tears that down), so awaiting it avoids racing a live
+		// connection into place after we return.
+		const inflight = this._reconnecting;
+		if (inflight) {
+			await inflight.catch(() => { /* a failed reconnect leaves nothing to close */ });
+		}
+		const conn = this._conn;
+		this._conn = null;
+		if (conn) {
+			await this._destroy(conn).catch(() => { /* already closed or broken; nothing more to do */ });
+		}
+	}
+
+	/** Promisifies destroy() on the given connection. */
+	private _destroy(conn: ISnowflakeSdkConnection): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			conn.destroy(err => err ? reject(err) : resolve());
+		});
+	}
+}

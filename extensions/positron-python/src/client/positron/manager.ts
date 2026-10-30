@@ -1,0 +1,1015 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2023-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import * as portfinder from 'portfinder';
+// eslint-disable-next-line import/no-unresolved
+import * as positron from 'positron';
+import * as vscode from 'vscode';
+import * as path from 'path';
+import * as os from 'os';
+
+import { Event, EventEmitter, Disposable } from 'vscode';
+import { inject, injectable } from 'inversify';
+import * as fs from '../common/platform/fs-paths';
+import { IServiceContainer } from '../ioc/types';
+import { pythonRuntimeDiscoverer } from './discoverer';
+import { IInterpreterService, PythonEnvironmentsChangedEvent } from '../interpreter/contracts';
+import { traceError, traceInfo, traceWarn } from '../logging';
+import { IConfigurationService, IDisposable, IDisposableRegistry } from '../common/types';
+import { getActivePythonSessions, PythonRuntimeSession } from './session';
+import { createPythonRuntimeMetadata, PythonRuntimeExtraData } from './runtime';
+import { getPythonDiscoveryRootSignature } from './discoveryRootSignature';
+import {
+    EXTENSION_ROOT_DIR,
+    INTERPRETERS_EXCLUDE_SETTING_KEY,
+    INTERPRETERS_INCLUDE_SETTING_KEY,
+    INTERPRETERS_OVERRIDE_SETTING_KEY,
+} from '../common/constants';
+import { JupyterKernelSpec } from '../positron-supervisor.d';
+import { IEnvironmentVariablesProvider } from '../common/variables/types';
+import { getConfiguration } from '../common/vscodeApis/workspaceApis';
+import {
+    shouldIncludeInterpreter,
+    getInterpreterDefinitionPaths,
+    getPinnedInterpreterPath,
+    isDefinitionsOnlyDiscovery,
+} from './interpreterSettings';
+import { resolveInterpreterOnce, resolveInterpreterWithRetry } from './util';
+import { canBeModuleEnv, recommendWorkspaceRuntime } from './interpreterRecommendation';
+import { IInterpreterAutoSelectionService } from '../interpreter/autoSelection/types';
+import { isCondaEnvironment } from '../pythonEnvironments/common/environmentManagers/conda';
+import {
+    pendingModuleRuntimeRegistrations,
+    getEnvironmentModulesApi,
+} from '../pythonEnvironments/base/locators/lowLevel/moduleEnvironmentLocator';
+import { CondaPythonPickerContribution } from './condaPickerContribution';
+import {
+    CreateVirtualEnvironmentPromptOutcome,
+    promptToCreateVirtualEnvironment,
+} from './createVirtualEnvironmentPrompt';
+
+export const IPythonRuntimeManager = Symbol('IPythonRuntimeManager');
+
+export interface IPythonRuntimeManager extends positron.LanguageRuntimeManager {
+    /**
+     * An event that fires when a new Python language runtime session is created or restored.
+     */
+    onDidCreateSession: Event<PythonRuntimeSession>;
+
+    /**
+     * Register a Python language runtime for the given interpreter path.
+     *
+     * @param pythonPath The interpreter path.
+     * @param recreateRuntime Shut down any sessions on an existing runtime for
+     *        this path and re-register it.
+     * @param forceRefresh Re-resolve the interpreter even if a runtime is
+     *        already registered for this path, and supersede it if the resolved
+     *        metadata differs (e.g. a version that a cached discovery pass got
+     *        wrong). Without this, an already-registered path returns early
+     *        without re-resolving.
+     */
+    registerLanguageRuntimeFromPath(
+        pythonPath: string,
+        recreateRuntime?: boolean,
+        forceRefresh?: boolean,
+    ): Promise<positron.LanguageRuntimeMetadata | undefined>;
+    /**
+     * Registers the runtime for an interpreter path, refreshing discovery and
+     * retrying once if the path is not yet known. Returns undefined if it still
+     * cannot be registered.
+     */
+    resolveRuntimeMetadataFromPath(
+        pythonPath: string,
+        recreateRuntime?: boolean,
+    ): Promise<positron.LanguageRuntimeMetadata | undefined>;
+    selectLanguageRuntimeFromPath(pythonPath: string, recreateRuntime?: boolean): Promise<string | undefined>;
+    triggerInterpreterRefresh(): Promise<void>;
+}
+
+/** Refuses an interpreter that `python.interpreters.exclude` or `override` filters out. */
+function throwIfFilteredOut(pythonPath: string): void {
+    if (!shouldIncludeInterpreter(pythonPath)) {
+        throw new Error(
+            vscode.l10n.t(
+                'Python interpreter {0} is filtered out by the python.interpreters.exclude or python.interpreters.override setting.',
+                pythonPath,
+            ),
+        );
+    }
+}
+
+/**
+ * Provides Python language runtime metadata and sessions to Positron;
+ * implements positron.LanguageRuntimeManager.
+ */
+@injectable()
+export class PythonRuntimeManager implements IPythonRuntimeManager, Disposable {
+    /**
+     * A map of Python interpreter paths to their language runtime metadata.
+     */
+    readonly registeredPythonRuntimes: Map<string, positron.LanguageRuntimeMetadata> = new Map();
+
+    /**
+     * Positron registers the recommendation and uses it when it needs a Python
+     * runtime, but must not save it as the workspace's default: the ranking is
+     * recomputed every time the folder opens.
+     */
+    readonly recommendationIsProjectDefault = false;
+
+    private disposables: IDisposable[] = [];
+
+    private readonly _onDidDiscoverRuntime = new EventEmitter<positron.LanguageRuntimeMetadata>();
+
+    private readonly _onDidRemoveRuntime = new EventEmitter<string>();
+
+    private readonly _onDidCreateSession = new EventEmitter<PythonRuntimeSession>();
+
+    /**
+     * An event that fires when a new Python language runtime is discovered.
+     */
+    public readonly onDidDiscoverRuntime = this._onDidDiscoverRuntime.event;
+
+    /**
+     * An event that fires when a previously registered Python runtime should be
+     * retracted from Positron, carrying the runtimeId to remove. Used to drop a
+     * runtime whose interpreter was deleted, or a symlink alias that
+     * de-duplication has collapsed into another path.
+     */
+    public readonly onDidRemoveRuntime = this._onDidRemoveRuntime.event;
+
+    public readonly onDidCreateSession = this._onDidCreateSession.event;
+
+    /**
+     * Serializes handling of `onDidChangeInterpreters` events. The handler is
+     * async (it resolves interpreter details before registering), so without a
+     * queue a `Created` and a follow-up `Changed`/`Deleted` for the same path
+     * could interleave and leave the registry out of sync with the picker.
+     */
+    private _interpreterChangeQueue: Promise<void> = Promise.resolve();
+
+    /** Shutdowns this manager has requested for sessions that haven't ended, keyed by session ID. */
+    private readonly _pendingShutdowns = new Map<string, Promise<void>>();
+
+    constructor(
+        @inject(IServiceContainer) private readonly serviceContainer: IServiceContainer,
+        @inject(IInterpreterService) private readonly interpreterService: IInterpreterService,
+    ) {
+        const disposables = this.serviceContainer.get<Disposable[]>(IDisposableRegistry);
+        disposables.push(this);
+
+        this.disposables.push(
+            positron.runtime.registerLanguageRuntimeManager('python', this),
+
+            positron.runtime.registerRuntimePickerContribution(
+                new CondaPythonPickerContribution(this.serviceContainer),
+            ),
+
+            // When an interpreter is added, removed, or replaced, keep our
+            // registry (and the Positron picker) in sync. Serialized so a
+            // Created and a follow-up Changed/Deleted for the same path can't
+            // interleave. Each event's failure is caught and logged so one
+            // transient error can't reject the queue and stop every later event
+            // from being handled until reload.
+            interpreterService.onDidChangeInterpreters((event) => {
+                this._interpreterChangeQueue = this._interpreterChangeQueue
+                    .then(() => this.handleInterpreterChange(event))
+                    .catch((error) => {
+                        const changedPath = event.new?.path ?? event.old?.path;
+                        traceError(`Failed to handle interpreter change for ${changedPath}: ${error}`);
+                    });
+            }),
+
+            interpreterService.onDidChangeInterpreter(async (event) => {
+                // Split event: only session-intent fires should start a session. Storage-only fires
+                // (migration, install-complete, active-env-deleted, positron-session-start, ...)
+                // must not spawn a console here - that would reintroduce the #12116 regression.
+                if (!event.startSession) {
+                    traceInfo(
+                        `Skipping session start for onDidChangeInterpreter fire (source=${event.source}, resource=${
+                            event.resource?.fsPath ?? 'undefined'
+                        })`,
+                    );
+                    return;
+                }
+                traceInfo(
+                    `Handling onDidChangeInterpreter fire (source=${event.source}, resource=${
+                        event.resource?.fsPath ?? 'undefined'
+                    })`,
+                );
+                const interpreter = await interpreterService.getActiveInterpreter(event.resource);
+                if (!interpreter) {
+                    traceError(
+                        `Interpreter not found; could not select language runtime. Workspace: ${event.resource?.fsPath}`,
+                    );
+                    return;
+                }
+                await this.selectLanguageRuntimeFromPath(interpreter.path);
+            }),
+        );
+    }
+
+    dispose(): void {
+        this.disposables.forEach((d) => d.dispose());
+    }
+
+    /**
+     * Handles an interpreter add/remove/replace event, keeping the registry and
+     * the Positron picker in sync. Invoked serially via `_interpreterChangeQueue`.
+     *
+     * - Added (`new` only): register a runtime for the new path. Uses
+     *   forceRefresh so that if a cached discovery pass already registered this
+     *   path with a stale version, we re-resolve and supersede it.
+     * - Removed (`old` only): retract the removed path's runtime and shut down
+     *   any sessions still backed by it. If an interpreter is back at the path by
+     *   the time the event is handled, keep sessions on its runtime and shut down
+     *   only those on an older one.
+     * - Replaced (`old` and `new` with different paths): de-duplication collapsed
+     *   one interpreter alias into another (e.g. a symlink resolved to a shorter
+     *   path). Retract the old alias's runtime -- which may already be in the
+     *   picker from its own earlier Created event -- and register the survivor
+     *   with forceRefresh so a stale cached version for the survivor path is
+     *   re-resolved and superseded rather than returned as is.
+     * - Changed in place (`old` and `new` with the same path): if the major or
+     *   minor version changed (e.g. a venv deleted and recreated with another
+     *   Python, which the file watcher can report as an update rather than a
+     *   removal and an addition), re-register the path and shut down sessions
+     *   still backed by the old runtime. A patch-only change is ignored, since
+     *   discovery and a live resolve can disagree on the patch version of the
+     *   same interpreter.
+     */
+    private async handleInterpreterChange(event: PythonEnvironmentsChangedEvent): Promise<void> {
+        if (!event.old && event.new) {
+            await this.registerLanguageRuntimeFromPath(
+                event.new.path,
+                /* recreateRuntime */ false,
+                /* forceRefresh */ true,
+            );
+        } else if (event.old && !event.new) {
+            const deletedPath = event.old.path;
+            // The interpreter can be back by the time this runs: a delete reported late, after
+            // Create Environment's Delete and Recreate or `rm -rf .venv && uv venv` had already
+            // recreated it and maybe started a session on it. Handle that like a change in
+            // place, keeping sessions on the runtime now at the path, so the new session survives.
+            const current = (await fs.pathExists(deletedPath))
+                ? await this.registerLanguageRuntimeFromPath(
+                      deletedPath,
+                      /* recreateRuntime */ false,
+                      /* forceRefresh */ true,
+                  )
+                : undefined;
+            if (current) {
+                traceInfo(`Interpreter ${deletedPath} was deleted and is back; keeping its current runtime's sessions`);
+                await this.shutdownSessionsForPath(deletedPath, 'replaced interpreter', current.runtimeId);
+                return;
+            }
+            this.unregisterRuntimeForPath(deletedPath);
+            await this.shutdownSessionsForPath(deletedPath, 'deleted interpreter');
+        } else if (event.old && event.new && event.old.path !== event.new.path) {
+            this.unregisterRuntimeForPath(event.old.path);
+            await this.registerLanguageRuntimeFromPath(
+                event.new.path,
+                /* recreateRuntime */ false,
+                /* forceRefresh */ true,
+            );
+        } else if (event.old && event.new) {
+            const changedPath = event.new.path;
+            const oldVersion = event.old.version;
+            const newVersion = event.new.version;
+            if (oldVersion?.major === newVersion?.major && oldVersion?.minor === newVersion?.minor) {
+                traceInfo(
+                    `Interpreter ${changedPath} changed in place (${oldVersion?.raw} -> ${newVersion?.raw}); ` +
+                        'same minor version, keeping its runtime and sessions',
+                );
+                return;
+            }
+            traceInfo(`Interpreter ${changedPath} changed in place (${oldVersion?.raw} -> ${newVersion?.raw})`);
+            const current = await this.registerLanguageRuntimeFromPath(
+                changedPath,
+                /* recreateRuntime */ false,
+                /* forceRefresh */ true,
+            );
+            if (current) {
+                await this.shutdownSessionsForPath(changedPath, 'replaced interpreter', current.runtimeId);
+            }
+        }
+    }
+
+    /**
+     * Shut down the Python sessions backed by an interpreter path.
+     *
+     * @param pythonPath The interpreter path whose sessions to shut down.
+     * @param reason Describes the interpreter in the log, e.g. 'deleted interpreter'.
+     * @param keepRuntimeId A runtime ID whose sessions are left running.
+     */
+    private async shutdownSessionsForPath(pythonPath: string, reason: string, keepRuntimeId?: string): Promise<void> {
+        try {
+            // Only Python sessions; other languages' sessions may not even have
+            // extraRuntimeData (e.g. restored from a serialized state).
+            const sessions = await getActivePythonSessions();
+            // Skip sessions that have exited. Two paths can shut down the same session (e.g.
+            // the watcher seeing `.venv` deleted, then Create Environment recreating its
+            // runtime), and sending a shutdown to a kernel that has exited fails. A session
+            // still exiting keeps its state until it exits; shutdownSessionOnce covers that.
+            const toShutdown = sessions.filter(
+                (s) =>
+                    (s.runtimeMetadata.extraRuntimeData as PythonRuntimeExtraData).pythonPath === pythonPath &&
+                    (keepRuntimeId === undefined || s.runtimeMetadata.runtimeId !== keepRuntimeId) &&
+                    s.getRuntimeState() !== positron.RuntimeState.Exited,
+            );
+            if (toShutdown.length > 0) {
+                traceInfo(`Shutting down ${toShutdown.length} session(s) for ${reason} ${pythonPath}`);
+                await Promise.all(toShutdown.map((s) => this.shutdownSessionOnce(s)));
+            }
+        } catch (error) {
+            traceError(`Failed to clean up sessions for ${reason} ${pythonPath}: ${error}`);
+        }
+    }
+
+    /**
+     * Shut down a session, unless this manager already asked it to shut down and it
+     * hasn't ended yet. The shutdown request can return before the kernel exits, and
+     * the session's state doesn't change until then, so a second request in that gap
+     * would be sent to a kernel on its way out.
+     */
+    private shutdownSessionOnce(session: PythonRuntimeSession): Promise<void> {
+        const { sessionId } = session.metadata;
+        const pending = this._pendingShutdowns.get(sessionId);
+        if (pending) {
+            return pending;
+        }
+        let ended: Disposable | undefined;
+        const forget = () => {
+            ended?.dispose();
+            this._pendingShutdowns.delete(sessionId);
+        };
+        ended = session.onDidEndSession(forget);
+        const request = session.shutdown(positron.RuntimeExitReason.Shutdown).catch((error) => {
+            forget();
+            throw error;
+        });
+        this._pendingShutdowns.set(sessionId, request);
+        return request;
+    }
+
+    /**
+     * Retract the runtime registered for a given interpreter path, if any, so it
+     * is removed from the Positron picker. No-op if the path isn't registered.
+     */
+    private unregisterRuntimeForPath(pythonPath: string): void {
+        const existing = this.registeredPythonRuntimes.get(pythonPath);
+        if (existing) {
+            this.registeredPythonRuntimes.delete(pythonPath);
+            this._onDidRemoveRuntime.fire(existing.runtimeId);
+        }
+    }
+
+    /**
+     * Discovers all Python language runtimes/environments available to the
+     * extension.
+     *
+     * @returns An async generator that yields Python language runtime metadata.
+     */
+    discoverAllRuntimes(): AsyncGenerator<positron.LanguageRuntimeMetadata> {
+        return this.discoverPythonRuntimes();
+    }
+
+    /**
+     * Snapshot the directories this extension scans for Python interpreters.
+     * Used by Positron to detect newly-installed Python interpreters between
+     * startups without having to rerun a full discovery pass. See
+     * `getPythonDiscoveryRootSignature` for the source list and what's excluded.
+     */
+    async getDiscoveryRootSignature(): Promise<positron.RuntimeRootSignature> {
+        return getPythonDiscoveryRootSignature();
+    }
+
+    /**
+     * Recommend the top eligible interpreter in the ranking for the workspace.
+     * See interpreterRanking.ts for the order.
+     *
+     * @param afterDiscovery Set by core when it asks again after discovery. Without it,
+     * only interpreters named by path are considered, so the call never waits for PET.
+     */
+    async recommendedWorkspaceRuntime(afterDiscovery?: boolean): Promise<positron.LanguageRuntimeMetadata | undefined> {
+        // TODO: may need other handling for multiroot workspaces
+        const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+        try {
+            const runtime = await recommendWorkspaceRuntime(
+                this.serviceContainer,
+                this.interpreterService,
+                workspaceUri,
+                !!afterDiscovery,
+            );
+            if (runtime && workspaceUri) {
+                // Auto-select the recommendation, so the active interpreter used when nothing was chosen matches it.
+                this.autoSelectRecommendation(workspaceUri, runtime.runtimePath).ignoreErrors();
+            }
+            return runtime;
+        } catch (err) {
+            traceError(`Failed to recommend a Python runtime for the workspace: ${err}`);
+            return undefined;
+        }
+    }
+
+    /**
+     * The Python that `python.defaultInterpreterPath` names for the first
+     * workspace folder. Positron writes it over the workspace's affiliated
+     * Python. Looks up only that path, and never starts a refresh of every
+     * interpreter.
+     */
+    async pinnedWorkspaceRuntime(): Promise<positron.LanguageRuntimeMetadata | undefined> {
+        const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+        const pinnedPath = getPinnedInterpreterPath(workspaceUri);
+        if (!pinnedPath) {
+            return undefined;
+        }
+        // Without this check, looking up a missing path runs a full interpreter search before it gives up.
+        if (!(await fs.pathExists(pinnedPath))) {
+            traceInfo(`[pinnedWorkspaceRuntime] Pinned interpreter ${pinnedPath} does not exist`);
+            return undefined;
+        }
+        if (!shouldIncludeInterpreter(pinnedPath)) {
+            return undefined;
+        }
+        if (isDefinitionsOnlyDiscovery() && !getInterpreterDefinitionPaths().includes(pinnedPath)) {
+            traceInfo(
+                `[pinnedWorkspaceRuntime] Pinned interpreter ${pinnedPath} is not in interpreters.definitions, and discovery is limited to it`,
+            );
+            return undefined;
+        }
+        // Not resolveInterpreterWithRetry(): on a miss it refreshes every interpreter, which can take a minute or more.
+        const interpreter = await resolveInterpreterOnce(this.interpreterService, pinnedPath, workspaceUri);
+        if (!interpreter) {
+            traceInfo(`[pinnedWorkspaceRuntime] No Python found at pinned path ${pinnedPath}`);
+            return undefined;
+        }
+        traceInfo(`[pinnedWorkspaceRuntime] Pinned interpreter: ${interpreter.path}`);
+        // Positron matches interpreters.definitions on the exact path, so keep the path as written there,
+        // as the recommendation does. Implicit, like a recommendation that doesn't start right away, so
+        // opening a Python file starts the pin.
+        return createPythonRuntimeMetadata(
+            isDefinitionsOnlyDiscovery() ? { ...interpreter, path: pinnedPath } : interpreter,
+            this.serviceContainer,
+            positron.LanguageRuntimeStartupBehavior.Implicit,
+            { skipModuleWait: !canBeModuleEnv(interpreter.envType) },
+        );
+    }
+
+    /**
+     * Auto-selects the recommended interpreter for the workspace. This only stores the interpreter;
+     * it does not start a session.
+     */
+    private async autoSelectRecommendation(workspaceUri: vscode.Uri, pythonPath: string): Promise<void> {
+        const interpreter = await this.interpreterService.getInterpreterDetails(pythonPath);
+        if (interpreter) {
+            const autoSelection = this.serviceContainer.get<IInterpreterAutoSelectionService>(
+                IInterpreterAutoSelectionService,
+            );
+            await autoSelection.setPositronRecommendedInterpreter(workspaceUri, interpreter);
+        }
+    }
+
+    /**
+     * Registers a new language runtime with Positron.
+     *
+     * @param runtimeMetadata The metadata for the runtime to register.
+     */
+    public registerLanguageRuntime(runtime: positron.LanguageRuntimeMetadata): void {
+        const extraData = runtime.extraRuntimeData as PythonRuntimeExtraData;
+
+        if (shouldIncludeInterpreter(extraData.pythonPath)) {
+            // If this path is already registered under a different runtime id
+            // (e.g. a stale version -- the same venv reported as 3.14.4 by the
+            // cached discovery pass and 3.14.6 once resolved), retract the old
+            // one first so the picker shows a single entry per interpreter path.
+            const existing = this.registeredPythonRuntimes.get(extraData.pythonPath);
+            if (existing && existing.runtimeId !== runtime.runtimeId) {
+                this._onDidRemoveRuntime.fire(existing.runtimeId);
+            }
+
+            // Save the runtime for later use
+            this.registeredPythonRuntimes.set(extraData.pythonPath, runtime);
+            this._onDidDiscoverRuntime.fire(runtime);
+
+            // If this is a module environment runtime, register it with the environment-modules API
+            const pendingRegistration = pendingModuleRuntimeRegistrations.get(extraData.pythonPath);
+            if (pendingRegistration) {
+                this.registerModuleRuntimeWithApi(
+                    pendingRegistration.environmentName,
+                    runtime.runtimeId,
+                    extraData.pythonPath,
+                );
+                // Remove from pending registrations
+                pendingModuleRuntimeRegistrations.delete(extraData.pythonPath);
+            }
+        } else {
+            traceInfo(`Not registering runtime ${extraData.pythonPath} as it is excluded via user settings.`);
+        }
+    }
+
+    /**
+     * Register a module runtime with the environment-modules API for tracking.
+     */
+    private async registerModuleRuntimeWithApi(
+        environmentName: string,
+        runtimeId: string,
+        interpreterPath: string,
+    ): Promise<void> {
+        try {
+            const api = await getEnvironmentModulesApi();
+            if (api) {
+                api.registerDiscoveredRuntime(environmentName, 'python', interpreterPath);
+                traceInfo(
+                    `Registered module runtime ${runtimeId} for environment "${environmentName}" with environment-modules API`,
+                );
+            }
+        } catch (error) {
+            traceError(`Failed to register module runtime with environment-modules API: ${error}`);
+        }
+    }
+
+    /**
+     * Creates a new Python language runtime session.
+     *
+     * @param runtimeMetadata The metadata for the runtime to create.
+     * @param sessionMetadata The metadata for the session to create.
+     *
+     * @returns A promise that resolves to the new language runtime session.
+     */
+    async createSession(
+        runtimeMetadata: positron.LanguageRuntimeMetadata,
+        sessionMetadata: positron.RuntimeSessionMetadata,
+    ): Promise<positron.LanguageRuntimeSession> {
+        traceInfo('createPythonSession: getting service instances');
+
+        const configService = this.serviceContainer.get<IConfigurationService>(IConfigurationService);
+        const environmentVariablesProvider =
+            this.serviceContainer.get<IEnvironmentVariablesProvider>(IEnvironmentVariablesProvider);
+
+        // Extract the extra data from the runtime metadata; it contains the
+        // environment ID that was saved when the metadata was created.
+        const extraData: PythonRuntimeExtraData = runtimeMetadata.extraRuntimeData as PythonRuntimeExtraData;
+        if (!extraData || !extraData.pythonPath) {
+            throw new Error(`Runtime metadata missing Python path: ${JSON.stringify(extraData)}`);
+        }
+
+        // Exclude and override always win, including for an affiliated runtime or
+        // one picked before the settings changed. Running sessions are restored
+        // through restoreSession, which is not affected.
+        throwIfFilteredOut(extraData.pythonPath);
+
+        // When the user explicitly picks an externally-managed Python, offer to create a
+        // virtual environment instead. Aborting here is invisible to the user: the console
+        // instance is not created until this method resolves.
+        const promptOutcome = await promptToCreateVirtualEnvironment(
+            this.serviceContainer,
+            this.interpreterService,
+            this,
+            extraData.pythonPath,
+            sessionMetadata,
+        );
+        if (promptOutcome === CreateVirtualEnvironmentPromptOutcome.Abort) {
+            traceInfo(`createPythonSession: aborting the session start for ${extraData.pythonPath}`);
+            throw new vscode.CancellationError();
+        }
+
+        // Check Python kernel debug and log level settings
+        // NOTE: We may need to pass a resource to getSettings to support multi-root workspaces
+        traceInfo('createPythonSession: getting extension runtime settings');
+
+        const settings = configService.getSettings();
+        const debug = settings.languageServerDebug;
+        const logLevel = settings.languageServerLogLevel;
+        const { quietMode } = settings;
+
+        // If required, also locate an available port for the debugger
+        traceInfo('createPythonSession: locating available debug port');
+        let debugPort;
+        if (debug) {
+            if (debugPort === undefined) {
+                debugPort = 5678; // Default port for debugpy
+            }
+            debugPort = await portfinder.getPortPromise({ port: debugPort });
+        }
+
+        const command = extraData.pythonPath;
+        const lsScriptPath = path.join(EXTENSION_ROOT_DIR, 'python_files', 'posit', 'positron_language_server.py');
+        const args = [
+            command,
+            lsScriptPath,
+            '-f',
+            '{connection_file}',
+            '--logfile',
+            '{log_file}',
+            `--loglevel=${logLevel}`,
+            `--session-mode=${sessionMetadata.sessionMode}`,
+        ];
+        if (debugPort) {
+            args.push(`--debugport=${debugPort}`);
+        }
+        if (quietMode) {
+            args.push('--quiet');
+        }
+
+        // Create a kernel spec for this Python installation. The kernel spec is
+        // only provided for new sessions; existing (restored) sessions already
+        // have one.
+        const env = await environmentVariablesProvider.getEnvironmentVariables();
+
+        // On Windows, conda environments need additional library paths (Library/bin, etc.)
+        // for DLL loading. Without these, Python could crash with STATUS_FATAL_USER_CALLBACK_EXCEPTION
+        // when importing packages with native dependencies like numpy, matplotlib, etc.
+        // See: https://github.com/posit-dev/positron/issues/9740
+        if (os.platform() === 'win32' && (await isCondaEnvironment(extraData.pythonPath))) {
+            const root = path.dirname(extraData.pythonPath);
+            const condaPaths = [
+                path.join(root, 'Library', 'bin'),
+                path.join(root, 'Library', 'mingw-w64', 'bin'),
+                path.join(root, 'Library', 'usr', 'bin'),
+                path.join(root, 'bin'),
+                path.join(root, 'Scripts'),
+            ].join(path.delimiter);
+            env.PATH = env.PATH ? condaPaths + path.delimiter + env.PATH : condaPaths;
+        }
+        if (sessionMetadata.sessionMode === positron.LanguageRuntimeSessionMode.Console) {
+            // Workaround to use Plotly's browser renderer. Ensures the plot is
+            // displayed to fill the webview.
+            env.PLOTLY_RENDERER = 'browser';
+        }
+        // For debugging notebook cells: https://github.com/microsoft/debugpy/issues/869
+        env.PYDEVD_IPYTHON_COMPATIBLE_DEBUGGING = '1';
+        const kernelSpec: JupyterKernelSpec = {
+            argv: args,
+            display_name: `${runtimeMetadata.runtimeName}`,
+            language: 'Python',
+            // On Windows, we need to use the 'signal' interrupt mode since 'message' is
+            // not supported.
+            interrupt_mode: os.platform() === 'win32' ? 'signal' : 'message',
+            // In the future this may need to be updated to reflect the exact version of
+            // the protocol supported by ipykernel. For now, use 5.3 as a lowest
+            // common denominator.
+            kernel_protocol_version: '5.3',
+            env,
+        };
+
+        // If this Python is from a module environment, set the startup command
+        // to load the required modules before starting the kernel
+        if (extraData.moduleMetadata?.startupCommand) {
+            kernelSpec.startup_command = extraData.moduleMetadata.startupCommand;
+            traceInfo(`createPythonSession: using module startup command: ${kernelSpec.startup_command}`);
+        }
+
+        traceInfo(`createPythonSession: kernelSpec argv: ${args}`);
+
+        // Create an adapter for the kernel to fulfill the LanguageRuntime interface.
+        traceInfo(`createPythonSession: creating PythonRuntime`);
+        return this.createPythonSession(runtimeMetadata, sessionMetadata, kernelSpec);
+    }
+
+    /**
+     * Restores (reconnects to) an existing Python session.
+     *
+     * @param runtimeMetadata The metadata for the runtime to restore
+     * @param sessionMetadata The metadata for the session to restore
+     * @param sessionName The name of the session to restore
+     *
+     * @returns The restored session.
+     */
+    async restoreSession(
+        runtimeMetadata: positron.LanguageRuntimeMetadata,
+        sessionMetadata: positron.RuntimeSessionMetadata,
+        sessionName: string,
+    ): Promise<positron.LanguageRuntimeSession> {
+        return this.createPythonSession(runtimeMetadata, sessionMetadata, undefined, sessionName);
+    }
+
+    private createPythonSession(
+        runtimeMetadata: positron.LanguageRuntimeMetadata,
+        sessionMetadata: positron.RuntimeSessionMetadata,
+        kernelSpec?: JupyterKernelSpec,
+        sessionName?: string,
+    ): positron.LanguageRuntimeSession {
+        const session = new PythonRuntimeSession(
+            runtimeMetadata,
+            sessionMetadata,
+            this.serviceContainer,
+            kernelSpec,
+            sessionName,
+        );
+        this._onDidCreateSession.fire(session);
+        return session;
+    }
+
+    /**
+     * Validates the metadata for a Python language runtime.
+     *
+     * @param metadata The metadata to validate.
+     * @returns The validated metadata.
+     */
+    async validateMetadata(metadata: positron.LanguageRuntimeMetadata): Promise<positron.LanguageRuntimeMetadata> {
+        // Extract the extra data from the runtime metadata
+        const extraData: PythonRuntimeExtraData = metadata.extraRuntimeData as PythonRuntimeExtraData;
+        if (!extraData || !extraData.pythonPath) {
+            throw new Error(`Runtime metadata missing Python path: ${JSON.stringify(extraData)}`);
+        }
+
+        // Exclude and override always win. Refusing here keeps Positron from
+        // registering a filtered-out interpreter it was asked to start, such as the
+        // workspace's saved default, so it never becomes the preferred runtime.
+        throwIfFilteredOut(extraData.pythonPath);
+
+        // Ensure that the Python interpreter exists
+        const exists = await fs.pathExists(extraData.pythonPath);
+        if (!exists) {
+            // Consider: Could we return metadata for an interpreter compatible
+            // with the one requested rather than throwing?
+            throw new Error(`Python interpreter path is missing: ${extraData.pythonPath}`);
+        }
+
+        // Replace the metadata if we can find the runtime in the registered runtimes
+        let registeredMetadata = this.registeredPythonRuntimes.get(extraData.pythonPath);
+        let resolvePath = extraData.pythonPath;
+
+        if (!registeredMetadata) {
+            // It's possible that the interpreter is located at pythonPath/bin/python.
+            // Conda environments may have the .conda directory set as the pythonPath, however the
+            // registered runtimes are stored with the pythonPath set to the python executable.
+            const binPythonPath = path.join(extraData.pythonPath, 'bin', 'python');
+            const binPythonExists = await fs.pathExists(binPythonPath);
+            if (binPythonExists) {
+                registeredMetadata = this.registeredPythonRuntimes.get(binPythonPath);
+                resolvePath = binPythonPath;
+            }
+        }
+
+        if (registeredMetadata) {
+            // Discovery already resolved this interpreter; its metadata is fresh.
+            return registeredMetadata;
+        }
+
+        // The retry falls back to a full interpreter refresh, which
+        // definitions-only discovery exists to avoid.
+        const interpreter = isDefinitionsOnlyDiscovery()
+            ? await this.interpreterService.getInterpreterDetails(resolvePath)
+            : await resolveInterpreterWithRetry(this.interpreterService, resolvePath);
+        if (!interpreter) {
+            throw new Error(`Failed to resolve interpreter ${resolvePath}; the environment may no longer be usable`);
+        }
+        // Keep a definition's path as written, as discovery does, so its
+        // variants still match it.
+        const definitionPath = getInterpreterDefinitionPaths().includes(resolvePath);
+        return createPythonRuntimeMetadata(
+            definitionPath ? { ...interpreter, path: resolvePath } : interpreter,
+            this.serviceContainer,
+        );
+    }
+
+    /**
+     * Registers the interpreter at a path and adds it to the include setting so
+     * future discovery finds it.
+     *
+     * @param pythonPath The path to the Python interpreter.
+     * @returns The runtime metadata for the interpreter.
+     */
+    async registerRuntimeFromPath(pythonPath: string): Promise<positron.LanguageRuntimeMetadata> {
+        if (!shouldIncludeInterpreter(pythonPath)) {
+            throw new Error(
+                `${pythonPath} is excluded by the python.${INTERPRETERS_EXCLUDE_SETTING_KEY} or python.${INTERPRETERS_OVERRIDE_SETTING_KEY} setting.`,
+            );
+        }
+        const metadata = await this.resolveRuntimeMetadataFromPath(pythonPath);
+        if (!metadata) {
+            throw new Error(`${pythonPath} is not a Python interpreter Positron can use.`);
+        }
+        const config = getConfiguration('python');
+        const included = config.inspect<string[]>(INTERPRETERS_INCLUDE_SETTING_KEY)?.globalValue ?? [];
+        if (!included.includes(pythonPath)) {
+            await config.update(
+                INTERPRETERS_INCLUDE_SETTING_KEY,
+                [...included, pythonPath],
+                vscode.ConfigurationTarget.Global,
+            );
+        }
+        return metadata;
+    }
+
+    /**
+     * Validate an existing session for a Jupyter-compatible kernel.
+     *
+     * @param sessionId The session ID to validate
+     * @returns True if the session is valid, false otherwise
+     */
+    async validateSession(sessionId: string): Promise<boolean> {
+        const ext = vscode.extensions.getExtension('positron.positron-supervisor');
+        if (!ext) {
+            throw new Error('Positron Supervisor extension not found');
+        }
+        if (!ext.isActive) {
+            await ext.activate();
+        }
+        return ext.exports.validateSession(sessionId);
+    }
+
+    /**
+     * Wrapper for Python runtime discovery method that caches the metadata
+     * before it's returned to Positron.
+     */
+    private async *discoverPythonRuntimes(): AsyncGenerator<positron.LanguageRuntimeMetadata> {
+        // Get the async generator for Python runtimes. When discovery is
+        // limited to definitions, skip all other discovery.
+        const definitionsOnly = isDefinitionsOnlyDiscovery();
+        const discoverer = definitionsOnly ? [] : pythonRuntimeDiscoverer(this.serviceContainer);
+
+        // As each runtime metadata element is returned, cache and return it
+        for await (const runtime of discoverer) {
+            const extraData = runtime.extraRuntimeData as PythonRuntimeExtraData;
+
+            // If the live `onDidChangeInterpreters` handler already registered
+            // this path during discovery, it resolved the interpreter and may
+            // hold a more accurate version than this (cached) discovery pass --
+            // e.g. a venv whose base was upgraded in place, reported here as the
+            // stale `pyvenv.cfg` version but resolved live to the real one.
+            // Yield the existing registration so the same path can't produce two
+            // picker entries with different versions.
+            const existing = this.registeredPythonRuntimes.get(extraData.pythonPath);
+            if (existing && existing.runtimeId !== runtime.runtimeId) {
+                yield existing;
+                continue;
+            }
+
+            // Save a copy of the metadata for later use
+            this.registeredPythonRuntimes.set(extraData.pythonPath, runtime);
+
+            // Return the runtime to Positron
+            yield runtime;
+        }
+
+        // Interpreters named in interpreters.definitions that discovery missed.
+        // Positron hides these and shows only the variants created from the
+        // definitions, so they are not saved with the discovered runtimes.
+        for (const pythonPath of getInterpreterDefinitionPaths()) {
+            if (!shouldIncludeInterpreter(pythonPath)) {
+                traceInfo(
+                    `Ignoring Python interpreter ${pythonPath} from interpreters.definitions: filtered out by settings`,
+                );
+                continue;
+            }
+            if (this.registeredPythonRuntimes.has(pythonPath)) {
+                continue;
+            }
+            try {
+                // Resolve the explicit path directly; a retry would fall back to
+                // a full interpreter refresh for every path that doesn't resolve.
+                const interpreter = await this.interpreterService.getInterpreterDetails(pythonPath);
+                if (!interpreter) {
+                    traceWarn(
+                        `Ignoring Python interpreter ${pythonPath} from interpreters.definitions: could not resolve it`,
+                    );
+                    continue;
+                }
+                // Definitions match on the exact runtime path, so keep the path
+                // as written even if it resolves to another one (e.g. a python3
+                // symlink to python).
+                const runtime = await createPythonRuntimeMetadata(
+                    { ...interpreter, path: pythonPath },
+                    this.serviceContainer,
+                );
+                yield { ...runtime, definitionOnly: true };
+            } catch (err) {
+                traceWarn(`Ignoring Python interpreter ${pythonPath} from interpreters.definitions: ${err}`);
+            }
+        }
+    }
+
+    /**
+     * Register a Python language runtime given its interpreter path.
+     *
+     * @param pythonPath The path to the Python interpreter.
+     * @returns Promise that resolves when the runtime is registered.
+     */
+    async registerLanguageRuntimeFromPath(
+        pythonPath: string,
+        recreateRuntime?: boolean,
+        forceRefresh?: boolean,
+    ): Promise<positron.LanguageRuntimeMetadata | undefined> {
+        const alreadyRegisteredRuntime = this.registeredPythonRuntimes.get(pythonPath);
+        if (alreadyRegisteredRuntime && !recreateRuntime && !forceRefresh) {
+            // Fast path: a runtime is already registered for this path and the
+            // caller hasn't asked us to recreate it or re-check its metadata, so
+            // avoid re-resolving the interpreter.
+            return alreadyRegisteredRuntime;
+        }
+        if (alreadyRegisteredRuntime && recreateRuntime) {
+            // Shut down all sessions for this runtime before recreating it
+            await this.shutdownSessionsForPath(pythonPath, 'recreated runtime');
+
+            // clear stale entry so registerLanguageRuntime below fires _onDidDiscoverRuntime
+            // for the new runtime vs. leaving Positron with an orphaned stale entry.
+            this.registeredPythonRuntimes.delete(pythonPath);
+        }
+
+        // Get the interpreter corresponding to the new runtime. This resolves the
+        // interpreter (running it when needed), so the version reflects what the
+        // interpreter actually reports rather than a stale `pyvenv.cfg` version a
+        // cached discovery pass may have registered for this path.
+        const interpreter = await this.interpreterService.getInterpreterDetails(pythonPath);
+        // Create the runtime and register it with Positron.
+        if (interpreter) {
+            const newRuntime = await createPythonRuntimeMetadata(interpreter, this.serviceContainer);
+            // On a forceRefresh, if the resolved runtime matches what's already
+            // registered for this path, there's nothing to do. If it differs (e.g.
+            // the real version supersedes a stale one from discovery),
+            // registerLanguageRuntime retracts the stale entry so the picker shows
+            // the correct version.
+            if (
+                alreadyRegisteredRuntime &&
+                !recreateRuntime &&
+                alreadyRegisteredRuntime.runtimeId === newRuntime.runtimeId
+            ) {
+                return alreadyRegisteredRuntime;
+            }
+            // Register the runtime with Positron.
+            this.registerLanguageRuntime(newRuntime);
+            return newRuntime;
+        }
+
+        traceError(`Could not register runtime due to an invalid interpreter path: ${pythonPath}`);
+        return undefined;
+    }
+
+    /**
+     * Registers the runtime for an interpreter path, refreshing discovery and
+     * retrying once if the path is not yet known.
+     *
+     * @param pythonPath The path to the Python interpreter.
+     * @param recreateRuntime Whether to recreate an already registered runtime.
+     * @returns The runtime metadata, or undefined if it could not be registered.
+     */
+    async resolveRuntimeMetadataFromPath(
+        pythonPath: string,
+        recreateRuntime?: boolean,
+    ): Promise<positron.LanguageRuntimeMetadata | undefined> {
+        let metadata = await this.registerLanguageRuntimeFromPath(pythonPath, recreateRuntime);
+        if (!metadata) {
+            traceInfo(`Runtime not found for ${pythonPath}, triggering interpreter refresh...`);
+            await this.triggerInterpreterRefresh();
+            metadata = await this.registerLanguageRuntimeFromPath(pythonPath, recreateRuntime);
+        }
+        return metadata;
+    }
+
+    /**
+     * Whether a console session for the runtime is running, rather than exited, not yet
+     * started, or shutting down. A session this manager asked to shut down keeps its state
+     * until its kernel exits, so it counts as shutting down while that request is pending.
+     */
+    private async hasLiveConsoleSession(runtimeId: string): Promise<boolean> {
+        const sessions = await getActivePythonSessions();
+        return sessions.some((session) => {
+            const state = session.getRuntimeState();
+            return (
+                session.runtimeMetadata.runtimeId === runtimeId &&
+                session.metadata.sessionMode === positron.LanguageRuntimeSessionMode.Console &&
+                state !== positron.RuntimeState.Uninitialized &&
+                state !== positron.RuntimeState.Exited &&
+                !this._pendingShutdowns.has(session.metadata.sessionId)
+            );
+        });
+    }
+
+    /**
+     * Select a Python language runtime in the console by its interpreter path.
+     * When recreating the runtime, starts a new console session unless one is
+     * already running for it.
+     *
+     * @param pythonPath The path to the Python interpreter.
+     * @returns Promise that resolves when the runtime is selected.
+     */
+    async selectLanguageRuntimeFromPath(pythonPath: string, recreateRuntime?: boolean): Promise<string | undefined> {
+        const metadata = await this.resolveRuntimeMetadataFromPath(pythonPath, recreateRuntime);
+        if (metadata) {
+            if (recreateRuntime && !(await this.hasLiveConsoleSession(metadata.runtimeId))) {
+                // The sessions for this path were just shut down (e.g. Create Environment >
+                // Delete and Recreate). Selecting the runtime would bring its exited console
+                // back to the front instead of starting one, since a venv recreated with the
+                // same Python keeps the same runtime ID.
+                await positron.runtime.startLanguageRuntime(metadata.runtimeId, metadata.runtimeName);
+            } else {
+                await positron.runtime.selectLanguageRuntime(metadata.runtimeId);
+            }
+            return metadata.runtimeId;
+        } else {
+            traceError(`Tried to switch to a language runtime that has not been registered: ${pythonPath}`);
+            return undefined;
+        }
+    }
+
+    /**
+     * Triggers a refresh of the interpreter list.
+     */
+    async triggerInterpreterRefresh(): Promise<void> {
+        await this.interpreterService.triggerRefresh();
+    }
+}

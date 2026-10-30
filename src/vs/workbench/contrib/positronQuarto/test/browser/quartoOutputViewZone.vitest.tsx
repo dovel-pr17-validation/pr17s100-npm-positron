@@ -1,0 +1,390 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/// <reference types="vitest/globals" />
+/// <reference types="@testing-library/jest-dom/vitest" />
+
+import { act } from '@testing-library/react';
+import { Event } from '../../../../../base/common/event.js';
+import { URI } from '../../../../../base/common/uri.js';
+import { BareFontInfo } from '../../../../../editor/common/config/fontInfo.js';
+import { ICodeEditor } from '../../../../../editor/browser/editorBrowser.js';
+import { EditorOption } from '../../../../../editor/common/config/editorOptions.js';
+import { PositronReactServices } from '../../../../../base/browser/positronReactServices.js';
+import { createTestContainer } from '../../../../../test/vitest/positronTestContainer.js';
+import { stubInterface } from '../../../../../test/vitest/stubInterface.js';
+import { IConfigurationChangeEvent } from '../../../../../platform/configuration/common/configuration.js';
+import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
+import { CellExecutionState, ICellOutput } from '../../common/quartoExecutionTypes.js';
+import { chooseHtmlRenderMode, isInertHtml, isWebviewOverlayShown, QuartoOutputViewZone } from '../../browser/quartoOutputViewZone.js';
+import { registerTestErrorActionHandler } from '../../../positronAssistant/test/browser/errorActionTestUtils.js';
+
+// The inline-output webview is a fixed-position overlay anchored to a
+// placeholder inside the editor view zone. It must be shown only while its view
+// zone is on-screen; otherwise CSS anchor positioning falls back to a static
+// position and the overlay "sticks" in the editor corner (see
+// posit-dev/positron#13978).
+//
+// The predicate keys off Monaco's own `monaco-visible-view-zone` attribute
+// rather than a geometry probe. Monaco sets/removes it in its render pass before
+// calling `onDomNodeTop`, so it is fresh during scroll; a `getClientRects()`
+// probe is one frame stale and, worse, stays truthy for a zone that has scrolled
+// out of the viewport while Monaco still renders it -- exactly the flextable
+// sticking case.
+describe('isWebviewOverlayShown', () => {
+	function zone(visible: boolean): HTMLElement {
+		const el = document.createElement('div');
+		if (visible) {
+			el.setAttribute('monaco-visible-view-zone', 'true');
+		}
+		return el;
+	}
+
+	function anchor(connected: boolean): HTMLElement {
+		const el = document.createElement('div');
+		if (connected) {
+			document.body.appendChild(el);
+		}
+		return el;
+	}
+
+	it('shows the overlay when the zone is on-screen and the anchor is attached', () => {
+		expect(isWebviewOverlayShown(zone(true), anchor(true))).toBe(true);
+	});
+
+	it('hides the overlay when the zone has scrolled off-screen', () => {
+		// Monaco removes the attribute for an off-screen zone even while the
+		// placeholder is still in the DOM: this is the flextable sticking case.
+		expect(isWebviewOverlayShown(zone(false), anchor(true))).toBe(false);
+	});
+
+	it('hides the overlay when the anchor is detached from the DOM', () => {
+		expect(isWebviewOverlayShown(zone(true), anchor(false))).toBe(false);
+	});
+});
+
+describe('isInertHtml', () => {
+	it('treats plain markup as inert', () => {
+		expect(isInertHtml('<table><tr><td>1</td></tr></table>')).toBe(true);
+	});
+
+	it('treats a full inert document as inert', () => {
+		expect(isInertHtml('<!doctype html><html><body><p>hi</p></body></html>')).toBe(true);
+	});
+
+	it('flags scripts, iframes, and inline handlers as active', () => {
+		expect(isInertHtml('<div><script>run()</script></div>')).toBe(false);
+		expect(isInertHtml('<iframe src="x"></iframe>')).toBe(false);
+		expect(isInertHtml('<a href="javascript:go()">x</a>')).toBe(false);
+		expect(isInertHtml('<button onclick="go()">x</button>')).toBe(false);
+	});
+});
+
+// R HTML widgets (e.g. highcharter, leaflet) emit self-contained `text/html`
+// with <script> tags. When such an output is restored from cache after a
+// reload/reopen, no kernel session has reattached yet -- but the raw-HTML
+// webview is built from the static HTML alone and needs no session, so it must
+// still render as a webview rather than the escaped-text warning
+// (posit-dev/positron#14559).
+describe('chooseHtmlRenderMode', () => {
+	const activeHtml = '<div><script>run()</script></div>';
+	const inertHtml = '<table><tr><td>1</td></tr></table>';
+
+	it('renders inert HTML inline regardless of webview service', () => {
+		expect(chooseHtmlRenderMode(inertHtml, true)).toBe('inline');
+		expect(chooseHtmlRenderMode(inertHtml, false)).toBe('inline');
+	});
+
+	it('routes active HTML through a webview whenever the service is available', () => {
+		// This is the reload case: no session, but the service is present.
+		expect(chooseHtmlRenderMode(activeHtml, true)).toBe('webview');
+	});
+
+	it('falls back to the warning only when no webview service exists', () => {
+		expect(chooseHtmlRenderMode(activeHtml, false)).toBe('warning');
+	});
+});
+
+// A cell's output can arrive hundreds of ms after the user collapsed it, while
+// the zone is still in its recomputing window. Expanding on fresh output is the
+// default so new results are visible, but doing it after an explicit collapse
+// discards the user's action and inverts the next toggle: the following toggle
+// reads the collapsed flag as false and collapses again instead of expanding.
+// That is the quarto-inline-output-collapse flake (posit-dev/positron#15205).
+//
+// These drive the real view zone rather than the collapse predicate on its own:
+// the bug was never in the predicate but in the ordering of setRecomputing /
+// setCollapsed / addOutput around it, so the sequence is what has to be pinned.
+describe('QuartoOutputViewZone collapse across a re-execution', () => {
+	function createViewZone(): QuartoOutputViewZone {
+		const containerDomNode = document.createElement('div');
+		const editor = stubInterface<ICodeEditor>({
+			getContainerDomNode: () => containerDomNode,
+			onDidChangeConfiguration: Event.None,
+			onDidLayoutChange: Event.None,
+			onDidScrollChange: Event.None,
+			onDidContentSizeChange: Event.None,
+			onDidChangeHiddenAreas: Event.None,
+			onMouseMove: Event.None,
+			onMouseLeave: Event.None,
+			// The zone reads only fontInfo, and only hands it to `applyFontInfo`,
+			// which takes a BareFontInfo. Throwing on any other option keeps the
+			// stub honest if the zone starts reading more of the editor config.
+			getOption: ((id: EditorOption) => {
+				if (id !== EditorOption.fontInfo) {
+					throw new Error(`unexpected getOption(${id})`);
+				}
+				return BareFontInfo._create('monospace', 'normal', 12, '', '', 18, 0, 1, false);
+			}) as ICodeEditor['getOption'],
+		});
+		return new QuartoOutputViewZone(editor, 'cell-1', 1);
+	}
+
+	function textOutput(id: string, text: string): ICellOutput {
+		return { outputId: id, items: [{ mime: 'text/plain', data: text }] };
+	}
+
+	it('keeps the output collapsed when the user collapses mid-execution', () => {
+		const zone = createViewZone();
+		zone.addOutput(textOutput('out-1', 'first run'));
+
+		// Re-run: the zone enters recomputing while the old output is still shown.
+		zone.setRecomputing(true);
+		// The user collapses during that window.
+		zone.toggleCollapsed();
+		expect(zone.isCollapsed).toBe(true);
+
+		// The new output lands hundreds of ms later. It must not undo the collapse.
+		zone.addOutput(textOutput('out-2', 'second run'));
+		expect(zone.isCollapsed).toBe(true);
+
+		// And the next toggle expands, rather than collapsing a second time.
+		zone.toggleCollapsed();
+		expect(zone.isCollapsed).toBe(false);
+
+		zone.dispose();
+	});
+
+	it('expands on fresh output when the collapse predates the re-execution', () => {
+		const zone = createViewZone();
+		zone.addOutput(textOutput('out-1', 'first run'));
+
+		// Collapsed while idle, before anything re-runs.
+		zone.toggleCollapsed();
+		expect(zone.isCollapsed).toBe(true);
+
+		// This is the case the auto-expand exists for: new results become visible.
+		zone.setRecomputing(true);
+		zone.addOutput(textOutput('out-2', 'second run'));
+		expect(zone.isCollapsed).toBe(false);
+
+		zone.dispose();
+	});
+});
+
+// The VS Code `notebook.showCellStatusBar` setting also controls the
+// execution status bar (icon, duration, relative time) above inline output.
+describe('QuartoOutputViewZone status bar visibility setting', () => {
+	function createViewZone(configurationService: TestConfigurationService): QuartoOutputViewZone {
+		const containerDomNode = document.createElement('div');
+		const editor = stubInterface<ICodeEditor>({
+			getContainerDomNode: () => containerDomNode,
+			onDidChangeConfiguration: Event.None,
+			onDidLayoutChange: Event.None,
+			onDidScrollChange: Event.None,
+			onDidContentSizeChange: Event.None,
+			onDidChangeHiddenAreas: Event.None,
+			onMouseMove: Event.None,
+			onMouseLeave: Event.None,
+			getOption: ((id: EditorOption) => {
+				if (id !== EditorOption.fontInfo) {
+					throw new Error(`unexpected getOption(${id})`);
+				}
+				return BareFontInfo._create('monospace', 'normal', 12, '', '', 18, 0, 1, false);
+			}) as ICodeEditor['getOption'],
+		});
+		const zone = new QuartoOutputViewZone(editor, 'cell-1', 1, undefined, undefined, 40, configurationService);
+		// toBeVisible needs the element to be attached to the document.
+		document.body.appendChild(zone.domNode);
+		return zone;
+	}
+
+	function getStatusBar(zone: QuartoOutputViewZone): HTMLElement {
+		// eslint-disable-next-line no-restricted-syntax -- the status bar is a plain div built by the zone, with no role or label
+		return zone.domNode.querySelector<HTMLElement>('.quarto-output-status-bar')!;
+	}
+
+	function setShowCellStatusBar(configurationService: TestConfigurationService, value: string): void {
+		configurationService.setUserConfiguration('notebook.showCellStatusBar', value);
+		configurationService.onDidChangeConfigurationEmitter.fire(
+			stubInterface<IConfigurationChangeEvent>({
+				affectsConfiguration: (key: string) => key === 'notebook.showCellStatusBar',
+			})
+		);
+	}
+
+	it('shows the status bar for a completed cell by default', () => {
+		const zone = createViewZone(new TestConfigurationService({ 'notebook.showCellStatusBar': 'visible' }));
+		zone.setExecutionInfo(CellExecutionState.Completed, 1000, 2234);
+
+		expect(getStatusBar(zone)).toBeVisible();
+
+		zone.dispose();
+		zone.domNode.remove();
+	});
+
+	it('hides the status bar when notebook.showCellStatusBar is hidden', () => {
+		const zone = createViewZone(new TestConfigurationService({ 'notebook.showCellStatusBar': 'hidden' }));
+		zone.setExecutionInfo(CellExecutionState.Completed, 1000, 2234);
+
+		expect(getStatusBar(zone)).not.toBeVisible();
+
+		zone.dispose();
+		zone.domNode.remove();
+	});
+
+	it('hides the status bar while a cell runs when notebook.showCellStatusBar is hidden', () => {
+		const zone = createViewZone(new TestConfigurationService({ 'notebook.showCellStatusBar': 'hidden' }));
+		zone.setExecutionInfo(CellExecutionState.Running, Date.now());
+
+		expect(getStatusBar(zone)).not.toBeVisible();
+
+		zone.dispose();
+		zone.domNode.remove();
+	});
+
+	it('updates the status bar when the setting changes', () => {
+		const configurationService = new TestConfigurationService({ 'notebook.showCellStatusBar': 'visible' });
+		const zone = createViewZone(configurationService);
+		zone.setExecutionInfo(CellExecutionState.Completed, 1000, 2234);
+		expect(getStatusBar(zone)).toBeVisible();
+
+		setShowCellStatusBar(configurationService, 'hidden');
+		expect(getStatusBar(zone)).not.toBeVisible();
+
+		setShowCellStatusBar(configurationService, 'visible');
+		expect(getStatusBar(zone)).toBeVisible();
+
+		zone.dispose();
+		zone.domNode.remove();
+	});
+});
+
+// The Fix/Explain quick-fix buttons mount asynchronously (a React root), so
+// they are not in the DOM when addOutput() measures the zone synchronously.
+// The original code relied solely on a ResizeObserver to grow the zone once
+// the buttons appeared, but on a re-run that produces an identically sized
+// error the observer sees no net change from its last-reported size and never
+// fires, leaving the zone too short so the buttons paint over the editor lines
+// below The zone must instead re-measure deterministically once the buttons
+// render.
+describe('QuartoOutputViewZone error quick-fix height', () => {
+	const ctx = createTestContainer()
+		.withReactServices()
+		.build();
+
+	// jsdom performs no layout, so offsetHeight is always 0. Inject a measurer
+	// that reports the styled container as taller once the Fix/Explain buttons
+	// have been committed to the DOM, standing in for the real height the
+	// buttons occupy. Crucially it does NOT rely on a ResizeObserver, so the
+	// only thing that can grow the zone is the zone's own re-measure.
+	const TEXT_HEIGHT = 40;
+	const BUTTONS_HEIGHT = 30;
+	function measureOffsetHeight(el: HTMLElement): number {
+		if (el.classList.contains('quarto-inline-output-wrapper')) {
+			return 1; // domNode: any non-zero value means "laid out"
+		}
+		if (el.classList.contains('quarto-inline-output')) {
+			// eslint-disable-next-line no-restricted-syntax -- simulating layout: detect the mounted quick-fix subtree
+			const hasButtons = !!el.querySelector('.assistant-error-quick-fix');
+			return TEXT_HEIGHT + (hasButtons ? BUTTONS_HEIGHT : 0);
+		}
+		return 0;
+	}
+
+	function createViewZone(): QuartoOutputViewZone {
+		const containerDomNode = document.createElement('div');
+		const editor = stubInterface<ICodeEditor>({
+			getContainerDomNode: () => containerDomNode,
+			onDidChangeConfiguration: Event.None,
+			onDidLayoutChange: Event.None,
+			onDidScrollChange: Event.None,
+			onDidContentSizeChange: Event.None,
+			onDidChangeHiddenAreas: Event.None,
+			onMouseMove: Event.None,
+			onMouseLeave: Event.None,
+			getOption: ((id: EditorOption) => {
+				if (id !== EditorOption.fontInfo) {
+					throw new Error(`unexpected getOption(${id})`);
+				}
+				return BareFontInfo._create('monospace', 'normal', 12, '', '', 18, 0, 1, false);
+			}) as ICodeEditor['getOption'],
+		});
+		return new QuartoOutputViewZone(
+			editor, 'cell-1', 1,
+			undefined, undefined, 40, undefined, URI.file('/report.qmd'), undefined, undefined, undefined,
+			measureOffsetHeight,
+		);
+	}
+
+	function errorOutput(id: string): ICellOutput {
+		return {
+			outputId: id,
+			items: [{
+				mime: 'application/vnd.code.notebook.error',
+				data: JSON.stringify({ name: 'Error', message: 'oh no', stack: 'Error: oh no' }),
+			}],
+		};
+	}
+
+	it('grows to fit the async quick-fix buttons on the first run and again on a re-run', async () => {
+		// Register a handler so the Fix/Explain buttons actually render.
+		registerTestErrorActionHandler(ctx);
+		// The view zone renders the buttons through a PositronReactRenderer,
+		// which reads the services singleton; bridge the test container in.
+		PositronReactServices.services = ctx.reactServices;
+
+		const zone = createViewZone();
+		zone.enableQuickFix();
+
+		await act(async () => {
+			zone.addOutput(errorOutput('err-1'));
+		});
+		expect(zone.heightInPx).toBe(TEXT_HEIGHT + BUTTONS_HEIGHT + 5);
+
+		// Re-run: the same error is produced. A ResizeObserver would see no net
+		// change and stay silent, so the zone's own re-measure is what keeps the
+		// buttons inside the reserved whitespace.
+		zone.setRecomputing(true);
+		await act(async () => {
+			zone.addOutput(errorOutput('err-2'));
+		});
+		expect(zone.heightInPx).toBe(TEXT_HEIGHT + BUTTONS_HEIGHT + 5);
+
+		zone.dispose();
+	});
+
+	it('includes the styled container vertical margins in the zone height, rounded up', async () => {
+		const zone = createViewZone();
+		// Computed styles are empty for detached elements.
+		document.body.appendChild(zone.domNode);
+		// jsdom loads no stylesheets, so set the (normally em-based) margins
+		// inline to stand in for their computed values.
+		// eslint-disable-next-line no-restricted-syntax -- reach the styled container to simulate its stylesheet margins
+		const styled = zone.domNode.querySelector<HTMLElement>('.quarto-inline-output')!;
+		// Fractional, as calc(4em / 14) is at a 13px font.
+		styled.style.marginTop = '3.714px';
+		styled.style.marginBottom = '3.714px';
+
+		await act(async () => {
+			zone.addOutput({ outputId: 'out-1', items: [{ mime: 'text/plain', data: 'hello' }] });
+		});
+		// Rounded up to a whole pixel: 40 + 7.428 + 5 = 52.428.
+		expect(zone.heightInPx).toBe(53);
+
+		zone.dispose();
+		zone.domNode.remove();
+	});
+});

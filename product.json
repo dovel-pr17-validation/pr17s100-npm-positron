@@ -1,0 +1,847 @@
+{
+	"companyName": "Posit Software, PBC",
+	"nameShort": "Positron",
+	"nameLong": "Positron",
+	"version": "",
+	"positronVersion": "2026.11.0",
+	"positronBuildNumber": 0,
+	"positronLlmsDocsUrl": "https://cdn.posit.co/positron/releases/docs",
+	"applicationName": "positron",
+	"dataFolderName": ".positron",
+	"sharedDataFolderName": ".positron-shared",
+	"win32MutexName": "positron",
+	"licenseName": "Software Evaluation License",
+	"licenseUrl": "https://positron.posit.co/licensing",
+	"serverLicenseUrl": "https://posit.co/about/eula/",
+	"serverGreeting": [],
+	"serverLicense": [],
+	"serverLicensePrompt": "",
+	"serverApplicationName": "positron-server",
+	"serverDataFolderName": ".positron-server",
+	"serverDownloadUrlTemplate": "https://cdn.posit.co/positron/${quality}/reh/${arch-long}/positron-reh-${os}-${arch}-${version}.tar.gz",
+	"tunnelApplicationName": "positron-tunnel",
+	"win32DirName": "Positron",
+	"win32NameVersion": "Positron",
+	"win32RegValueName": "Positron",
+	"win32AppId": "{{1CE64477-8EE2-479C-942A-D7B101721AFB}",
+	"win32x64AppId": "{{08FC0438-DEF4-4349-85AE-FA80317766E9}",
+	"win32arm64AppId": "{{17BBF21B-410B-40F4-ACC4-2E9515616AC6}",
+	"win32UserAppId": "{{CA791628-3EE5-404F-8BBE-8844E6C04455}",
+	"win32x64UserAppId": "{{5894F169-3C13-4E32-A124-67BDE57636E1}",
+	"win32arm64UserAppId": "{{585852C3-3385-447E-8711-67F60DE17946}",
+	"win32AppUserModelId": "Posit.Positron",
+	"win32ShellNameShort": "&Positron",
+	"win32TunnelServiceMutex": "positron-tunnelservice",
+	"win32TunnelMutex": "positrontunnel",
+	"darwinBundleIdentifier": "co.posit.positron",
+	"darwinProfileUUID": "0501C5DF-0DC9-4217-9C18-A5595A125743",
+	"darwinProfilePayloadUUID": "BEA2CCD2-3F74-4174-9C0E-606A6F13B050",
+	"linuxIconName": "co.posit.positron",
+	"licenseFileName": "LICENSE.txt",
+	"reportIssueUrl": "https://github.com/posit-dev/positron/issues/new",
+	"nodejsRepository": "https://nodejs.org",
+	"nodejsArtifactFeed": "",
+	"electronArtifactFeed": "",
+	"urlProtocol": "positron",
+	"agentsTelemetryAppName": "agents",
+	"webviewContentExternalBaseUrlTemplate": "https://{{uuid}}.vscode-cdn.net/insider/ef65ac1ba57f57f2a3961bfe94aa20481caca4c6/out/vs/workbench/contrib/webview/browser/pre/",
+	"updateUrl": "https://cdn.posit.co/positron",
+	"releaseNotesUrl": "https://positron.posit.co/release-notes.html",
+	"downloadUrl": "https://positron.posit.co/download",
+	"builtInExtensions": [
+		{
+			"name": "ms-vscode.js-debug-companion",
+			"version": "1.1.3",
+			"sha256": "7380a890787452f14b2db7835dfa94de538caf358ebc263f9d46dd68ac52de93",
+			"repo": "https://github.com/microsoft/vscode-js-debug-companion",
+			"metadata": {
+				"id": "99cb0b7f-7354-4278-b8da-6cc79972169d",
+				"publisherId": {
+					"publisherId": "5f5636e7-69ed-4afe-b5d6-8d231fb3d3ee",
+					"publisherName": "ms-vscode",
+					"displayName": "Microsoft",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "Microsoft"
+			}
+		},
+		{
+			"name": "ms-vscode.js-debug",
+			"version": "1.117.0",
+			"sha256": "854eeb8a785b1f41ba2bd02d7ccd4fdbe10021b61473293973c7e96d036c7fb8",
+			"repo": "https://github.com/microsoft/vscode-js-debug",
+			"metadata": {
+				"id": "25629058-ddac-4e17-abba-74678e126c5d",
+				"publisherId": {
+					"publisherId": "5f5636e7-69ed-4afe-b5d6-8d231fb3d3ee",
+					"publisherName": "ms-vscode",
+					"displayName": "Microsoft",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "Microsoft"
+			}
+		},
+		{
+			"name": "ms-vscode.vscode-js-profile-table",
+			"version": "1.0.11",
+			"sha256": "50d002706213bc90d695f05f56d42fffd825035945eaf1cb1ba175effb7ff408",
+			"repo": "https://github.com/microsoft/vscode-js-profile-visualizer",
+			"metadata": {
+				"id": "7e52b41b-71ad-457b-ab7e-0620f1fc4feb",
+				"publisherId": {
+					"publisherId": "5f5636e7-69ed-4afe-b5d6-8d231fb3d3ee",
+					"publisherName": "ms-vscode",
+					"displayName": "Microsoft",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "Microsoft"
+			}
+		},
+		{
+			"name": "rstudio.rstudio-workbench",
+			"version": "2026.11.5",
+			"positUrl": "https://cdn.posit.co/pwb-components/extension",
+			"type": "reh-web-pwb",
+			"sha256": "0292ae56723befcf184bf049190e0efedc67cc69b3c668d4bc615374fee82de7",
+			"metadata": {
+				"publisherDisplayName": "Posit PBC"
+			}
+		},
+		{
+			"name": "posit.slc",
+			"version": "0.6.0",
+			"positUrl": "https://cdn.posit.co/pwb-components/slc-extension",
+			"type": "reh-web-pwb",
+			"sha256": "105cd11357bde4c330bf12aac856b0ee3eae2c967bab6037c3dedacd55f59e7d",
+			"metadata": {
+				"publisherDisplayName": "Posit PBC"
+			}
+		}
+	],
+	"bootstrapExtensions": [
+		{
+			"name": "charliermarsh.ruff",
+			"version": "2026.90.0",
+			"repo": "https://github.com/astral-sh/ruff-vscode",
+			"metadata": {
+				"publisherId": {
+					"publisherName": "charliermarsh",
+					"displayName": "Ruff",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "charliermarsh",
+				"multiPlatformServiceUrl": "https://p3m.dev/openvsx/latest/vscode/asset"
+			}
+		},
+		{
+			"name": "ms-toolsai.vscode-jupyter-cell-tags",
+			"version": "0.1.9",
+			"sha256": "7cd43af55cf562a001dc475e92d9f3fd4b7173011adca0c02da22fbf891c274b",
+			"repo": "https://github.com/Microsoft/vscode-jupyter-cell-tags",
+			"metadata": {
+				"id": "ab4fb32a-befb-4102-adf9-1652d0cd6a5e",
+				"publisherId": {
+					"publisherId": "ac8eb7c9-3e59-4b39-8040-f0484d8170ce",
+					"publisherName": "ms-toolsai",
+					"displayName": "Jupyter Cell Tags",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "ms-toolsai"
+			}
+		},
+		{
+			"name": "ms-toolsai.jupyter-keymap",
+			"version": "1.1.2",
+			"sha256": "3d2998929bb43156f3b428116aee290543c437875df616ec755692219b4afa17",
+			"repo": "https://github.com/Microsoft/vscode-jupyter-keymap",
+			"metadata": {
+				"id": "9f6dc8db-620c-4844-b8c5-e74914f1be27",
+				"publisherId": {
+					"publisherId": "ac8eb7c9-3e59-4b39-8040-f0484d8170ce",
+					"publisherName": "ms-toolsai",
+					"displayName": "Jupyter Keymap",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "ms-toolsai"
+			}
+		},
+		{
+			"name": "ms-toolsai.vscode-jupyter-slideshow",
+			"version": "0.1.6",
+			"sha256": "5b8dee0d569b7e0990bb4847c34748cdc0102078779351ed415d9d71cfa3e945",
+			"repo": "https://github.com/Microsoft/vscode-jupyter-slideshow",
+			"metadata": {
+				"id": "e153ca70-b543-4865-b4c5-b31d34185948",
+				"publisherId": {
+					"publisherId": "ac8eb7c9-3e59-4b39-8040-f0484d8170ce",
+					"publisherName": "ms-toolsai",
+					"displayName": "Jupyter Slide Show",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "ms-toolsai"
+			}
+		},
+		{
+			"name": "ms-toolsai.jupyter-renderers",
+			"version": "1.3.0",
+			"sha256": "d09f6c517a8090a932bb4e2c31bcb2de34ddb2a71133477f6c47f28f36eb76ae",
+			"repo": "https://github.com/Microsoft/vscode-notebook-renderers",
+			"metadata": {
+				"id": "b15c72f8-d5fe-421a-a4f7-27ed9f6addbf",
+				"publisherId": {
+					"publisherId": "ac8eb7c9-3e59-4b39-8040-f0484d8170ce",
+					"publisherName": "ms-toolsai",
+					"displayName": "Microsoft",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "ms-toolsai"
+			}
+		},
+		{
+			"name": "ms-toolsai.jupyter",
+			"version": "2025.9.1",
+			"sha256": "110660656944c4ab0ff687db488c2e8c59c67ec121dcf09bcaa54b6edd9ce71f",
+			"repo": "https://github.com/Microsoft/vscode-jupyter",
+			"metadata": {
+				"id": "6c2f1801-1e7f-45b2-9b5c-7782f1e076e8",
+				"publisherId": {
+					"publisherId": "ac8eb7c9-3e59-4b39-8040-f0484d8170ce",
+					"publisherName": "ms-toolsai",
+					"displayName": "Jupyter",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "ms-toolsai"
+			}
+		},
+		{
+			"name": "meta.pyrefly",
+			"version": "1.4.0",
+			"repo": "https://github.com/facebook/pyrefly",
+			"metadata": {
+				"publisherId": {
+					"publisherName": "meta",
+					"displayName": "Pyrefly",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "meta",
+				"multiPlatformServiceUrl": "https://p3m.dev/openvsx/latest/vscode/asset"
+			}
+		},
+		{
+			"name": "ms-python.debugpy",
+			"version": "2026.6.0",
+			"repo": "https://github.com/microsoft/vscode-python-debugger",
+			"metadata": {
+				"id": "4bd5d2c9-9d65-401a-b0b2-7498d9f17615",
+				"publisherid": {
+					"publisherid": "998b010b-e2af-44a5-a6cd-0b5fd3b9b6f8",
+					"publishername": "ms-python",
+					"displayname": "python debugger",
+					"flags": "verified"
+				},
+				"publisherdisplayname": "ms-python",
+				"multiPlatformServiceUrl": "https://p3m.dev/openvsx/latest/vscode/asset"
+			}
+		},
+		{
+			"name": "posit.publisher",
+			"version": "2.12.0",
+			"repo": "https://github.com/posit-dev/publisher",
+			"metadata": {
+				"id": "ccc4be7e-a835-4fcf-b439-79c25a0ae11e",
+				"publisherId": "090804ff-7eb2-4fbd-bb61-583e34f2b070",
+				"displayName": "Posit Publisher"
+			},
+			"publisherDisplayName": "Posit Software, PBC"
+		},
+		{
+			"name": "quarto.quarto",
+			"version": "1.139.0",
+			"sha256": "f81a865c511a1c674d020d727b30b0cf499365fe0908ee1edbeb579f116cf22b",
+			"repo": "https://github.com/quarto-dev/quarto/tree/main/apps/vscode",
+			"metadata": {
+				"id": "a1be81fc-0f3a-4f2e-92ee-3fdc7ab96c73",
+				"publisherId": {
+					"publisherId": "b21355c9-18d2-46e4-95da-d2d98de81e96",
+					"publisherName": "quarto",
+					"displayName": "Quarto",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "Quarto"
+			}
+		},
+		{
+			"name": "posit.air-vscode",
+			"version": "0.30.0",
+			"repo": "https://github.com/posit-dev/air",
+			"metadata": {
+				"publisherId": "090804ff-7eb2-4fbd-bb61-583e34f2b070",
+				"displayName": "Air - R Language Support",
+				"multiPlatformServiceUrl": "https://p3m.dev/openvsx/latest/vscode/asset"
+			},
+			"publisherDisplayName": "Posit Software, PBC"
+		},
+		{
+			"name": "posit.shiny",
+			"version": "1.5.0",
+			"sha256": "0bf87dd2adc6786ecfe3688c368c70e9c1ea170735e12523a3fa2a743b8feb3f",
+			"repo": "https://github.com/posit-dev/shiny-vscode",
+			"metadata": {
+				"id": "7ffa9a66-85ab-44de-ab80-2eecce45b0fe",
+				"publisherId": "090804ff-7eb2-4fbd-bb61-583e34f2b070",
+				"displayName": "Shiny"
+			},
+			"publisherDisplayName": "Posit Software, PBC"
+		},
+		{
+			"name": "GitHub.vscode-pull-request-github",
+			"version": "0.166.1",
+			"sha256": "898a1f264e5d49067815df5ba04f6340addeb89e55c949a2995c3181d8c05249",
+			"repo": "https://github.com/Microsoft/vscode-pull-request-github",
+			"metadata": {
+				"publisherId": {
+					"publisherName": "GitHub",
+					"displayName": "GitHub Pull Requests",
+					"flags": "verified"
+				},
+				"publisherDisplayName": "GitHub"
+			}
+		},
+		{
+			"name": "posit.assistant",
+			"version": "1.9.1",
+			"sha256": "98a78112e42c864a424e6e688cc903b0f2581a72bfdf948a184291587b721349",
+			"metadata": {
+				"publisherId": "090804ff-7eb2-4fbd-bb61-583e34f2b070",
+				"displayName": "Posit Assistant"
+			},
+			"publisherDisplayName": "Posit Software, PBC"
+		}
+	],
+	"nlsCoreBaseUrl": "https://cdn.posit.co/positron/nls/",
+	"extensionsGallery": {
+		"serviceUrl": "https://p3m.dev/openvsx/latest/vscode/gallery",
+		"itemUrl": "https://p3m.dev/openvsx/latest/vscode/item",
+		"resourceUrlTemplate": "https://p3m.dev/openvsx/latest/vscode/asset/{publisher}/{name}/{version}/Microsoft.VisualStudio.Code.WebResources/{path}",
+		"controlUrl": "",
+		"recommendationsUrl": "",
+		"extensionUrlTemplate": "https://p3m.dev/openvsx/latest/vscode/gallery/{publisher}/{name}/latest",
+		"nlsBaseUrl": "",
+		"publisherUrl": ""
+	},
+	"linkProtectionTrustedDomains": [
+		"https://open-vsx.org",
+		"https://p3m.dev",
+		"https://github.com/posit-dev/positron",
+		"https://positron.posit.co",
+		"https://github.com/login/device",
+		"https://login.posit.cloud",
+		"https://connect.posit.cloud",
+		"https://login.staging.posit.cloud",
+		"https://staging.connect.posit.cloud",
+		"https://posit.co",
+		"https://support.posit.co",
+		"https://*.cloud.databricks.com",
+		"https://*.azuredatabricks.net",
+		"https://*.gcp.databricks.com",
+		"https://oidc.*.amazonaws.com"
+	],
+	"defaultChatAgent": {
+		"extensionId": "GitHub.copilot-chat",
+		"chatExtensionId": "GitHub.copilot-chat",
+		"chatExtensionOutputId": "GitHub.copilot-chat.GitHub Copilot Chat.log",
+		"chatExtensionOutputExtensionStateCommand": "github.copilot.debug.extensionState",
+		"documentationUrl": "https://aka.ms/github-copilot-overview",
+		"termsStatementUrl": "https://aka.ms/github-copilot-terms-statement",
+		"privacyStatementUrl": "https://aka.ms/github-copilot-privacy-statement",
+		"skusDocumentationUrl": "https://aka.ms/github-copilot-plans",
+		"optimizeUsageDocumentationUrl": "https://aka.ms/token-usage-tips",
+		"publicCodeMatchesUrl": "https://aka.ms/github-copilot-match-public-code",
+		"managePlanUrl": "https://aka.ms/github-copilot-manage-plan",
+		"upgradePlanUrl": "https://aka.ms/github-copilot-upgrade-plan",
+		"signUpUrl": "https://aka.ms/github-sign-up",
+		"provider": {
+			"default": {
+				"id": "github",
+				"name": "GitHub"
+			},
+			"enterprise": {
+				"id": "github-enterprise",
+				"name": "GHE"
+			},
+			"google": {
+				"id": "google",
+				"name": "Google"
+			},
+			"apple": {
+				"id": "apple",
+				"name": "Apple"
+			},
+			"microsoft": {
+				"id": "microsoft",
+				"name": "Microsoft"
+			}
+		},
+		"providerExtensionId": "vscode.github-authentication",
+		"providerUriSetting": "github-enterprise.uri",
+		"providerScopes": [
+			[
+				"read:user",
+				"user:email",
+				"repo",
+				"workflow"
+			],
+			[
+				"user:email"
+			],
+			[
+				"read:user"
+			]
+		],
+		"entitlementUrl": "https://api.github.com/copilot_internal/user",
+		"entitlementSignupLimitedUrl": "https://api.github.com/copilot_internal/subscribe_limited_user",
+		"chatQuotaExceededContext": "github.copilot.chat.quotaExceeded",
+		"completionsQuotaExceededContext": "github.copilot.completions.quotaExceeded",
+		"walkthroughCommand": "github.copilot.open.walkthrough",
+		"completionsMenuCommand": "github.copilot.toggleStatusMenu",
+		"completionsEnablementSetting": "github.copilot.enable",
+		"completionsRefreshTokenCommand": "github.copilot.signIn",
+		"chatRefreshTokenCommand": "github.copilot.refreshToken",
+		"generateCommitMessageCommand": "github.copilot.git.generateCommitMessage",
+		"resolveMergeConflictsCommand": "github.copilot.git.resolveMergeConflicts",
+		"completionsAdvancedSetting": "github.copilot.advanced",
+		"nextEditSuggestionsSetting": "github.copilot.nextEditSuggestions.enabled",
+		"manageSettingsUrl": "https://aka.ms/github-copilot-settings",
+		"manageOverageUrl": "https://aka.ms/github-copilot-manage-overage",
+		"tokenEntitlementUrl": "https://api.github.com/copilot_internal/v2/token",
+		"mcpRegistryDataUrl": "https://api.github.com/copilot/mcp_registry",
+		"managedSettingsUrl": "https://api.github.com/copilot_internal/managed_settings"
+	},
+	"extensionsEnabledWithApiProposalVersion": [
+		"GitHub.copilot-chat"
+	],
+	"extensionEnabledApiProposals": {
+		"ms-vscode.vscode-selfhost-test-provider": [
+			"testObserver",
+			"testRelatedCode",
+			"attributableCoverage"
+		],
+		"VisualStudioExptTeam.vscodeintellicode-completions": [
+			"inlineCompletionsAdditions"
+		],
+		"ms-vsliveshare.vsliveshare": [
+			"contribMenuBarHome",
+			"contribShareMenu",
+			"contribStatusBarItems",
+			"diffCommand",
+			"documentFiltersExclusive",
+			"fileSearchProvider",
+			"findTextInFiles",
+			"notebookCellExecutionState",
+			"notebookLiveShare",
+			"terminalDimensions",
+			"terminalDataWriteEvent",
+			"textSearchProvider"
+		],
+		"ms-vscode.js-debug": [
+			"portsAttributes",
+			"findTextInFiles",
+			"workspaceTrust",
+			"tunnels"
+		],
+		"ms-toolsai.vscode-ai-remote": [
+			"resolvers"
+		],
+		"ms-python.python": [
+			"contribEditorContentMenu",
+			"quickPickSortByLabel",
+			"portsAttributes",
+			"testObserver",
+			"quickPickItemTooltip",
+			"terminalDataWriteEvent",
+			"terminalExecuteCommandEvent",
+			"contribIssueReporter",
+			"terminalShellIntegration"
+		],
+		"ms-dotnettools.dotnet-interactive-vscode": [
+			"notebookMessaging"
+		],
+		"GitHub.codespaces": [
+			"contribEditSessions",
+			"contribMenuBarHome",
+			"contribRemoteHelp",
+			"contribViewsRemote",
+			"resolvers",
+			"tunnels",
+			"terminalDataWriteEvent",
+			"treeViewReveal",
+			"notebookKernelSource"
+		],
+		"ms-vscode.azure-repos": [
+			"extensionRuntime",
+			"fileSearchProvider",
+			"textSearchProvider"
+		],
+		"ms-vscode.remote-repositories": [
+			"canonicalUriProvider",
+			"contribEditSessions",
+			"contribRemoteHelp",
+			"contribMenuBarHome",
+			"contribViewsRemote",
+			"contribViewsWelcome",
+			"contribShareMenu",
+			"documentFiltersExclusive",
+			"editSessionIdentityProvider",
+			"extensionRuntime",
+			"fileSearchProvider",
+			"quickPickSortByLabel",
+			"workspaceTrust",
+			"shareProvider",
+			"scmActionButton",
+			"scmSelectedProvider",
+			"scmValidation",
+			"textSearchProvider",
+			"timeline"
+		],
+		"ms-vscode-remote.remote-wsl": [
+			"resolvers",
+			"contribRemoteHelp",
+			"contribViewsRemote",
+			"telemetry"
+		],
+		"ms-vscode-remote.remote-ssh": [
+			"resolvers",
+			"tunnels",
+			"terminalDataWriteEvent",
+			"contribRemoteHelp",
+			"contribViewsRemote",
+			"telemetry"
+		],
+		"ms-vscode.remote-server": [
+			"resolvers",
+			"tunnels",
+			"contribViewsWelcome"
+		],
+		"ms-vscode.remote-explorer": [
+			"contribRemoteHelp",
+			"contribViewsRemote",
+			"extensionsAny"
+		],
+		"ms-vscode-remote.remote-containers": [
+			"contribEditSessions",
+			"resolvers",
+			"portsAttributes",
+			"tunnels",
+			"workspaceTrust",
+			"terminalDimensions",
+			"contribRemoteHelp",
+			"contribViewsRemote"
+		],
+		"ms-vscode.js-debug-nightly": [
+			"portsAttributes",
+			"findTextInFiles",
+			"workspaceTrust",
+			"tunnels"
+		],
+		"ms-vscode.lsif-browser": [
+			"documentFiltersExclusive"
+		],
+		"ms-vscode.vscode-speech": [
+			"speech"
+		],
+		"GitHub.vscode-pull-request-github": [
+			"activeComment",
+			"codiconDecoration",
+			"codeActionRanges",
+			"commentingRangeHint",
+			"commentReactor",
+			"commentReveal",
+			"commentThreadApplicability",
+			"contribAccessibilityHelpContent",
+			"contribCommentEditorActionsMenu",
+			"contribCommentPeekContext",
+			"contribCommentThreadAdditionalMenu",
+			"contribCommentsViewThreadMenus",
+			"contribEditorContentMenu",
+			"contribMultiDiffEditorMenus",
+			"contribShareMenu",
+			"diffCommand",
+			"fileComments",
+			"quickDiffProvider",
+			"shareProvider",
+			"tabInputTextMerge",
+			"tokenInformation",
+			"treeViewMarkdownMessage"
+		],
+		"GitHub.copilot": [
+			"authGetSessions",
+			"inlineCompletionsAdditions"
+		],
+		"GitHub.copilot-nightly": [
+			"inlineCompletionsAdditions"
+		],
+		"GitHub.copilot-chat": [
+			"interactive",
+			"terminalDataWriteEvent",
+			"terminalExecuteCommandEvent",
+			"terminalSelection",
+			"terminalQuickFixProvider",
+			"chatParticipantAdditions",
+			"defaultChatParticipant",
+			"embeddings",
+			"chatVariableResolver",
+			"chatProvider",
+			"mappedEditsProvider",
+			"aiRelatedInformation",
+			"codeActionAI",
+			"findTextInFiles",
+			"textSearchProvider",
+			"activeComment",
+			"commentReveal",
+			"contribSourceControlInputBoxMenu",
+			"contribCommentEditorActionsMenu",
+			"contribCommentThreadAdditionalMenu",
+			"contribCommentsViewThreadMenus",
+			"newSymbolNamesProvider",
+			"findFiles2",
+			"extensionsAny",
+			"authGetSessions",
+			"authLearnMore",
+			"testObserver",
+			"aiTextSearchProvider",
+			"documentFiltersExclusive",
+			"chatParticipantPrivate",
+			"lmTools"
+		],
+		"GitHub.remotehub": [
+			"contribRemoteHelp",
+			"contribMenuBarHome",
+			"contribViewsRemote",
+			"contribViewsWelcome",
+			"documentFiltersExclusive",
+			"extensionRuntime",
+			"fileSearchProvider",
+			"quickPickSortByLabel",
+			"workspaceTrust",
+			"scmSelectedProvider",
+			"scmValidation",
+			"textSearchProvider",
+			"timeline"
+		],
+		"ms-python.gather": [
+			"notebookCellExecutionState"
+		],
+		"ms-python.vscode-pylance": [
+			"notebookCellExecutionState"
+		],
+		"ms-python.debugpy": [
+			"contribIssueReporter",
+			"contribViewsWelcome",
+			"debugVisualization",
+			"portsAttributes"
+		],
+		"ms-toolsai.jupyter-renderers": [
+			"contribNotebookStaticPreloads"
+		],
+		"ms-toolsai.jupyter": [
+			"notebookDeprecated",
+			"notebookMessaging",
+			"notebookMime",
+			"notebookCellExecutionState",
+			"portsAttributes",
+			"quickPickSortByLabel",
+			"notebookKernelSource",
+			"interactiveWindow",
+			"notebookControllerAffinityHidden",
+			"contribNotebookStaticPreloads",
+			"quickPickItemTooltip",
+			"notebookExecution",
+			"notebookCellExecution",
+			"notebookVariableProvider"
+		],
+		"dbaeumer.vscode-eslint": [
+			"notebookCellExecutionState"
+		],
+		"ms-vscode.azure-sphere-tools-ui": [
+			"tunnels"
+		],
+		"ms-azuretools.vscode-azureappservice": [
+			"terminalDataWriteEvent"
+		],
+		"ms-azuretools.vscode-azureresourcegroups": [
+			"authGetSessions"
+		],
+		"ms-azuretools.vscode-azure-github-copilot": [
+			"chatParticipantAdditions",
+			"embeddings",
+			"languageModelSystem",
+			"lmTools"
+		],
+		"ms-vscode.anycode": [
+			"extensionsAny"
+		],
+		"ms-vscode.cpptools": [
+			"terminalDataWriteEvent"
+		],
+		"redhat.java": [
+			"documentPaste"
+		],
+		"ms-dotnettools.csdevkit": [
+			"inlineCompletionsAdditions"
+		],
+		"ms-dotnettools.vscodeintellicode-csharp": [
+			"inlineCompletionsAdditions"
+		],
+		"microsoft-IsvExpTools.powerplatform-vscode": [
+			"fileSearchProvider",
+			"textSearchProvider"
+		],
+		"microsoft-IsvExpTools.powerplatform-vscode-preview": [
+			"fileSearchProvider",
+			"textSearchProvider"
+		],
+		"TeamsDevApp.ms-teams-vscode-extension": [
+			"chatParticipantAdditions",
+			"languageModelSystem"
+		]
+	},
+	"trustedExtensionPublishers": [
+		"posit",
+		"rstudio"
+	],
+	"trustedExtensionAuthAccess": {
+		"github": [
+			"posit.assistant"
+		],
+		"github-enterprise": [
+			"GitHub.copilot-chat",
+			"posit.assistant"
+		],
+		"posit-workbench": [
+			"posit.assistant"
+		],
+		"anthropic": [
+			"posit.assistant"
+		],
+		"positai": [
+			"posit.assistant",
+			"positron.next-edit-suggestions"
+		],
+		"ms-foundry": [
+			"posit.assistant"
+		],
+		"bedrock": [
+			"positron.authentication",
+			"posit.assistant"
+		],
+		"snowflake-cortex": [
+			"positron.authentication",
+			"posit.assistant"
+		],
+		"openai": [
+			"posit.assistant"
+		],
+		"deepseek": [
+			"posit.assistant"
+		],
+		"openai-compatible": [
+			"posit.assistant"
+		],
+		"gemini": [
+			"posit.assistant"
+		],
+		"google-vertex": [
+			"posit.assistant"
+		],
+		"databricks": [
+			"positron.authentication",
+			"posit.assistant"
+		],
+		"custom-providers": [
+			"posit.assistant"
+		],
+		"microsoft": [
+			"vscode.github-authentication"
+		]
+	},
+	"onboardingKeymaps": [
+		{
+			"id": "vscode",
+			"label": "VS Code",
+			"description": "Default keyboard mapping"
+		},
+		{
+			"id": "sublime",
+			"label": "Sublime Text",
+			"extensionId": "ms-vscode.sublime-keybindings",
+			"description": "Keyboard mapping from Sublime Text"
+		},
+		{
+			"id": "intellij",
+			"label": "IntelliJ / JetBrains",
+			"extensionId": "k--kato.intellij-idea-keybindings",
+			"description": "Keyboard mapping from IntelliJ IDEA"
+		},
+		{
+			"id": "vim",
+			"label": "Vim",
+			"extensionId": "vscodevim.vim",
+			"description": "Vim modal editing"
+		},
+		{
+			"id": "eclipse",
+			"label": "Eclipse",
+			"extensionId": "alphabotsec.vscode-eclipse-keybindings",
+			"description": "Keyboard mapping from Eclipse"
+		},
+		{
+			"id": "notepadpp",
+			"label": "Notepad++",
+			"extensionId": "ms-vscode.notepadplusplus-keybindings",
+			"description": "Keyboard mapping from Notepad++"
+		}
+	],
+	"onboardingThemes": [
+		{
+			"id": "dark-2026",
+			"label": "Dark 2026",
+			"themeId": "Dark 2026",
+			"type": "dark"
+		},
+		{
+			"id": "hc-dark",
+			"label": "Dark High Contrast",
+			"themeId": "Default High Contrast",
+			"type": "hcDark"
+		},
+		{
+			"id": "solarized-dark",
+			"label": "Solarized Dark",
+			"themeId": "Solarized Dark",
+			"type": "dark"
+		},
+		{
+			"id": "light-2026",
+			"label": "Light 2026",
+			"themeId": "Light 2026",
+			"type": "light"
+		},
+		{
+			"id": "hc-light",
+			"label": "Light High Contrast",
+			"themeId": "Default High Contrast Light",
+			"type": "hcLight"
+		},
+		{
+			"id": "solarized-light",
+			"label": "Solarized Light",
+			"themeId": "Solarized Light",
+			"type": "light"
+		}
+	],
+	"builtInExtensionsEnabledWithAutoUpdates": [
+		"GitHub.copilot-chat"
+	],
+	"sessionsWindowAllowedExtensions": [],
+	"voiceWsUrl": "wss://falcon-caas.mai.microsoft.com/voice-code/api/v1/realtime/voice"
+}

@@ -1,0 +1,49 @@
+# pin setoptconf to prevent issue with 'use_2to3'
+setoptconf==0.3.0
+
+flake8
+bandit
+pylint
+pycodestyle
+pydocstyle
+prospector
+# --- Start Positron ---
+# upstream bug; pin for now
+pytest<9.1.0
+# --- End Positron ---
+flask
+fastapi
+uvicorn
+django
+testresources
+testscenarios
+
+# Integrated TensorBoard tests
+tensorboard
+torch-tb-profiler
+
+# extension build tests
+freezegun
+
+# testing custom pytest plugin require the use of named pipes
+namedpipe; platform_system == "Windows"
+
+# typing for Django files
+# --- Start Positron ---
+# django-stubs 6.1.1 resolves `objects` through a ModelBase.__getattr__ overload
+# that pyright 1.1.308 mishandles. Unpin when we bump pyright.
+django-stubs<6.1.1
+# --- End Positron ---
+
+coverage
+pytest-cov
+pytest-json
+pytest-timeout
+
+
+# for pytest-describe related tests
+pytest-describe
+
+# for pytest-ruff related tests
+pytest-ruff
+pytest-black

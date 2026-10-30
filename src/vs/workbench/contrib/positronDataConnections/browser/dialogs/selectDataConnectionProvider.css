@@ -1,0 +1,128 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/* The provider list. Its row layout mirrors the Configure LLM Providers modal. */
+.select-data-connection-provider {
+	--provider-row-gap: 20px;
+	--provider-row-height: 36px;
+	--provider-list-padding: 4px;
+	gap: 8px;
+	display: flex;
+	flex-direction: column;
+}
+
+/*
+ * Sized by its content. The dialog's fixed height comes from the contentMinHeight and
+ * contentMaxHeight passed to PositronDynamicModalDialog, and overflow is the content area's own
+ * scrollbar. Do not scroll here: a second scroller inside the content area is inset from the
+ * dialog edges and stops short of the title bar.
+ */
+.select-data-connection-provider .provider-rows {
+	display: flex;
+	flex-direction: column;
+	gap: var(--provider-row-gap);
+	padding: var(--provider-list-padding) 0;
+}
+
+/* Both messages take the row's horizontal padding so their text lines up with the row names. */
+.select-data-connection-provider .provider-list-placeholder {
+	padding: 0 8px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.select-data-connection-provider .provider-list-error {
+	padding: 0 8px;
+	flex-shrink: 0;
+	font-size: 12px;
+	color: var(--vscode-errorForeground);
+}
+
+/* Not `driver-list-item`: the old Connections pane declares that class unscoped. */
+.select-data-connection-provider .provider-row {
+	gap: 10px;
+	display: flex;
+	padding: 0 8px;
+	flex-shrink: 0;
+	text-align: left;
+	align-items: center;
+	height: var(--provider-row-height);
+}
+
+/* Driver logos are full color and several are dark, so they keep a near-white plate in every theme. */
+.select-data-connection-provider .provider-row-icon {
+	display: flex;
+	flex-shrink: 0;
+	border-radius: 6px;
+	align-items: center;
+	box-sizing: border-box;
+	justify-content: center;
+	background: #f8f8f8;
+	width: var(--provider-row-height);
+	height: var(--provider-row-height);
+	border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+}
+
+.select-data-connection-provider .provider-row-logo {
+	width: 22px;
+	height: 22px;
+	object-fit: contain;
+}
+
+/* Explicit line heights stack the name and description to the plate's 36px (18 + 2 + 16). */
+.select-data-connection-provider .provider-row-text {
+	gap: 2px;
+	flex: 1;
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+}
+
+.select-data-connection-provider .provider-row-name {
+	overflow: hidden;
+	font-weight: 600;
+	line-height: 18px;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+.select-data-connection-provider .provider-row-desc {
+	font-size: 12px;
+	overflow: hidden;
+	line-height: 16px;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	color: var(--vscode-descriptionForeground);
+}
+
+/* Action button */
+.select-data-connection-provider .provider-row-actions {
+	flex-shrink: 0;
+}
+
+.select-data-connection-provider .provider-row-action {
+	gap: 4px;
+	cursor: pointer;
+	font-size: 12px;
+	padding: 3px 10px;
+	border-radius: 4px;
+	align-items: center;
+	display: inline-flex;
+	color: var(--vscode-button-secondaryForeground);
+	background-color: var(--vscode-button-secondaryBackground);
+	border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, transparent));
+}
+
+.select-data-connection-provider .provider-row-action .codicon {
+	font-size: 14px;
+}
+
+.select-data-connection-provider .provider-row-action:hover {
+	background-color: var(--vscode-button-secondaryHoverBackground);
+}
+
+.select-data-connection-provider .provider-row-action:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 1px;
+}

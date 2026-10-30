@@ -1,0 +1,1495 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+// React.
+import { ReactNode } from 'react';
+
+// Other dependencies.
+import { localize } from '../../../../../nls.js';
+import { DataConnectionEntryRow } from '../components/dataConnectionEntryRow.js';
+import { DataConnectionNodeRow, kindIcon } from '../components/dataConnectionNodeRow.js';
+import { canPreview, openNodeInDataExplorer, reportOpenInDataExplorerFailed } from './dataConnectionNodePreview.js';
+import { MutableDisposable } from '../../../../../base/common/lifecycle.js';
+import { TreeNode, TreeNodeContext, VisibleNode } from '../../../../browser/positronTree/classes/treeNode.js';
+import { MouseSelectionType } from '../../../../browser/positronDataGrid/classes/dataGridInstance.js';
+import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+import { INotificationService } from '../../../../../platform/notification/common/notification.js';
+import { IHoverService } from '../../../../../platform/hover/browser/hover.js';
+import { PositronActionBarHoverManager } from '../../../../../platform/positronActionBar/browser/positronActionBarHoverManager.js';
+import { POSITRON_DATA_CONNECTIONS_MINIMUM_INDENT_WIDTH, POSITRON_DATA_CONNECTIONS_TREE_INDENT_KEY, POSITRON_DATA_CONNECTIONS_TREE_SHOW_SINGLE_SCHEMA_KEY } from '../positronDataConnectionsConfiguration.js';
+import { CONTAINER_ONLY_KINDS } from '../../../../services/positronDataConnections/common/dataConnectionSchemaSummary.js';
+import { PositronTreeInstance } from '../../../../browser/positronTree/classes/positronTreeInstance.js';
+import { findParentIndex } from '../../../../browser/positronTree/classes/treeProjection.js';
+import { nodeReloadKey } from './dataConnectionNodeKey.js';
+import { IEditorService } from '../../../../services/editor/common/editorService.js';
+import { openDataConnectionNodeDetails, pinDataConnectionNodeDetails } from '../editor/dataConnectionNodeDetailsEditor.js';
+import { IDataConnectionNodeDetailsTarget } from '../editor/dataConnectionNodeDetailsEditorInput.js';
+import { IDataConnectionNodeDTO } from '../../../../services/positronDataConnections/common/interfaces/dataConnectionDTOs.js';
+import { IDataConnectionInstance } from '../../../../services/positronDataConnections/common/interfaces/dataConnectionInstance.js';
+import { Event } from '../../../../../base/common/event.js';
+import { raceTimeout } from '../../../../../base/common/async.js';
+import { IDataConnectionNodeOpener, IDataConnectionNodeStep, IDataConnectionNodeRevealRequest, IPositronDataConnectionsService } from '../../../../services/positronDataConnections/common/interfaces/positronDataConnectionsService.js';
+import { DataConnectionNodeKind, IDataConnectionHandle, IDataConnectionProfile } from '../../../../services/positronDataConnections/common/interfaces/dataConnectionDriver.js';
+
+/**
+ * The row height in pixels. Matches the height used by the previous list-based panel so the
+ * panel keeps its current visual rhythm. DTO rows reuse this height.
+ */
+const ROW_HEIGHT = 24;
+
+/**
+ * A data connection entry.
+ */
+export interface DataConnectionEntry {
+	// The data connection profile.
+	readonly profile: IDataConnectionProfile;
+
+	// The data connection instance, if connected. Undefined if not connected.
+	readonly instance?: IDataConnectionInstance;
+}
+
+/**
+ * DataConnectionNode discriminated union. Each tree node wraps exactly one of:
+ * - an entry (root rows; expanding connects, collapsing may disconnect -- see collapse below),
+ * - a server-side node DTO returned from a connection's getChildren / nodeGetChildren calls.
+ *
+ * DTO nodes carry the originating IDataConnectionHandle so deeper children can be fetched
+ * with handle.nodeGetChildren(dto.nodeHandle) without walking back up the tree.
+ */
+export type DataConnectionNode =
+	| { readonly kind: 'entry'; readonly entry: DataConnectionEntry }
+	| {
+		readonly kind: 'dto';
+		readonly dto: IDataConnectionNodeDTO;
+		readonly handle: IDataConnectionHandle;
+
+		// The name of the namespace group this node was breadcrumbed into, set when the node was
+		// that group's only child. Rendered ahead of the node's own name, as "Schemas / public".
+		readonly labelPrefix?: string;
+
+		// The name of the lone schema this node was spliced up out of, set when the tree dropped that
+		// schema's row -- see _elideSingleSchema. A reveal path still names the schema, so this is
+		// what lets the walk recognize the level that stands in for it.
+		readonly elidedSchema?: string;
+	};
+
+/**
+ * The schemas group kind. Called out on its own because it is the one namespace tier that is hidden
+ * outright when it holds a single schema, rather than breadcrumbed like the rest -- see
+ * POSITRON_DATA_CONNECTIONS_TREE_SHOW_SINGLE_SCHEMA_KEY, the opt-in that brings it back.
+ */
+const SCHEMAS_GROUP_KIND = DataConnectionNodeKind.GroupSchemas;
+
+/**
+ * Group kinds that name a namespace tier -- the levels a connection is organized by, above the
+ * objects themselves. A group of these kinds holding exactly one child is breadcrumbed into that
+ * child, because it is pure ceremony: "Schemas" over a lone "public" costs a level and a click to
+ * say something the row beneath it already says.
+ *
+ * Deliberately not every container kind. A lone "Tables" or "Columns" group still tells the user
+ * what the single row beneath it is, which the row itself does not.
+ */
+const BREADCRUMB_GROUP_KINDS: ReadonlySet<string> = new Set<string>([
+	DataConnectionNodeKind.GroupDatabases,
+	DataConnectionNodeKind.GroupCatalogs,
+	SCHEMAS_GROUP_KIND,
+]);
+
+const entryNodeId = (profileId: string): string => `entry:${profileId}`;
+
+/**
+ * The start every DTO node id from one connection shares.
+ */
+const dtoNodeIdPrefix = (handle: IDataConnectionHandle): string => `dto:${handle.handle}:`;
+
+/**
+ * Builds the id for a DTO node. Scoped by the originating connection's numeric handle so DTOs
+ * from different connections can't collide.
+ */
+const dtoNodeId = (handle: IDataConnectionHandle, dto: IDataConnectionNodeDTO): string =>
+	`${dtoNodeIdPrefix(handle)}${dto.nodeHandle}`;
+
+/**
+ * The identity a node keeps across a refresh, used by the tree to re-expand a subtree after
+ * reload: an entry's profile, or a DTO's kind and name (see nodeReloadKey).
+ *
+ * DTO keys deliberately don't include the originating connection handle: the tree matches a node
+ * to its counterpart among its own siblings, which always come from the same connection, so a
+ * kind/name pair only ever has to be unique within one level.
+ *
+ * Exported for tests.
+ */
+export const reloadKey = (node: DataConnectionNode): string =>
+	node.kind === 'entry'
+		? entryNodeId(node.entry.profile.id)
+		: nodeReloadKey(node.dto.kind, node.dto.name);
+
+/**
+ * Compares a node name to one from a reveal path. Case-insensitive as a fallback, because the
+ * case a driver reports a name in is not necessarily the case the path was built from.
+ */
+const namesMatch = (name: string, wanted: string): boolean =>
+	name === wanted || name.toLowerCase() === wanted.toLowerCase();
+
+/**
+ * Formats a group row's count (see DataConnectionsTreeInstance.groupCount) as the row shows it after
+ * the group's name, as "(14)": parenthesized after the name, the way database tools such as pgAdmin
+ * label their groups.
+ *
+ * Exported for tests.
+ */
+export const formatGroupCount = (count: number): string =>
+	localize('positron.dataConnections.groupCount', "({0})", count.toLocaleString());
+
+const wrapEntry = (entry: DataConnectionEntry): TreeNode<DataConnectionNode> => ({
+	id: entryNodeId(entry.profile.id),
+	data: { kind: 'entry', entry },
+	// Entries always show a twisty -- clicking it connects (or collapses, which may disconnect).
+	// Whether children exist is only knowable after the connect succeeds.
+	hasChildren: true,
+});
+
+/**
+ * The workbench-wide per-level tree indent setting, in pixels, which this view's own indent falls
+ * back to. listService.ts registers the key and reads it for VS Code's own trees but keeps the
+ * constant private, so it is repeated here rather than making an upstream file export it.
+ */
+const TREE_INDENT_KEY = 'workbench.tree.indent';
+
+/**
+ * Resolves the tree's per-level indent width: this view's own setting when set, and the
+ * workbench-wide tree indent when it is left at the inheriting default of 0. Both keys register
+ * numeric defaults, so both reads are trusted to be numbers -- the same trust explorerViewer.ts
+ * places in the workbench key.
+ *
+ * The view has a knob of its own because it nests far deeper than the trees workbench.tree.indent
+ * was tuned for -- see POSITRON_DATA_CONNECTIONS_TREE_INDENT_KEY -- but it inherits by default so
+ * that a user who turns the workbench setting down doesn't have to discover a second one.
+ *
+ * @param configurationService The configuration service.
+ * @returns The indent width in pixels.
+ */
+const resolveIndentWidth = (configurationService: IConfigurationService): number => {
+	// Zero is this view's "inherit the workbench setting" sentinel rather than a width, and anything
+	// under the workbench key's own floor of 4 is treated the same way: a JSON schema can't express
+	// "0, or 4 through 40", and at an indent of 1 or 2 the guides tile into a solid bar.
+	const viewIndentWidth = configurationService.getValue<number>(POSITRON_DATA_CONNECTIONS_TREE_INDENT_KEY);
+	return viewIndentWidth >= POSITRON_DATA_CONNECTIONS_MINIMUM_INDENT_WIDTH
+		? viewIndentWidth
+		: configurationService.getValue<number>(TREE_INDENT_KEY);
+};
+
+/**
+ * Whether a node is a notice: a note about a listing, such as that it was cut short, rather than a
+ * row of it. Notices are not counted as a group's children.
+ */
+const isNotice = (dto: IDataConnectionNodeDTO): boolean => dto.kind === DataConnectionNodeKind.Notice;
+
+/**
+ * A group's DTO carrying the count of the children the look-ahead fetched for it, so the group's row
+ * can show how many it holds while still collapsed. The count rides on the row itself rather than
+ * being read from the look-ahead's parked query: that is dropped whenever any row of the connection
+ * reloads (see _parkLookAhead), while the row's DTO lives exactly as long as the row. Fresher than
+ * any count the driver sent with the group, so it replaces that.
+ */
+const withLookAheadCount = (dto: IDataConnectionNodeDTO, children: readonly IDataConnectionNodeDTO[]): IDataConnectionNodeDTO =>
+	({ ...dto, childCount: children.filter(child => !isNotice(child)).length });
+
+const wrapDto = (
+	dto: IDataConnectionNodeDTO,
+	handle: IDataConnectionHandle,
+	labelPrefix?: string,
+	elidedSchema?: string
+): TreeNode<DataConnectionNode> => ({
+	id: dtoNodeId(handle, dto),
+	data: { kind: 'dto', dto, handle, labelPrefix, elidedSchema },
+	hasChildren: dto.hasGetChildren,
+	// A group node names a category rather than a thing it holds, so it keeps its children at its
+	// own indent: "Tables" above a list of tables already says what they are, and spending a level
+	// to repeat it is what makes a column sit eight steps in. The same set decides which nodes the
+	// schema summarizer flattens, for the same reason.
+	flattensChildren: CONTAINER_ONLY_KINDS.has(dto.kind),
+	// Both ways this tree drops a level get marked: a group holding its children at its own indent,
+	// and a row breadcrumbed together with the group above it. They read as one thing to the user --
+	// a row standing where two levels used to be -- however differently they got there.
+	foldsLevel: CONTAINER_ONLY_KINDS.has(dto.kind) || labelPrefix !== undefined,
+});
+
+/**
+ * Where a recorded path led (see DataConnectionsTreeInstance._lookUpPath).
+ */
+interface PathLookup {
+	// The rows reached, from the connection's entry down to the deepest one the path still leads
+	// to, groups the path left out included.
+	readonly chain: readonly TreeNode<DataConnectionNode>[];
+
+	// Whether the path led all the way: the last row in the chain is the node it names.
+	readonly found: boolean;
+
+	// When a load on the way failed, the error and the row whose children failed to load.
+	readonly error?: unknown;
+	readonly failedId?: string;
+}
+
+/**
+ * DataConnectionsTreeInstance. Backs the Data Connections panel.
+ *
+ * Roots are one entry per saved profile, joined with its live instance (if connected). Expanding
+ * an entry opens the connection via the service and fetches the connection's top-level DTOs;
+ * collapsing an entry closes the connection -- immediately, or once the last Data Explorer previewed
+ * from it closes -- and drops the loaded subtree so the next expand re-fetches against a fresh
+ * handle.
+ */
+/**
+ * How long a reveal waits for the tree's roots before giving up. Only reached when the pane was
+ * opened by the reveal itself; bounded so a connection that never loads cannot leave the promise
+ * pending for the life of the window.
+ */
+const REVEAL_ROOTS_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a level's look-aheads can hold it before it renders. A look-ahead still waiting then
+ * keeps its row, so one hung metadata query cannot leave the whole level pending. The deadline is
+ * per level, shared by look-aheads that run one after another, not per query. The cost: when the
+ * level's queries are slow together, a look-ahead can run out of time, and the level renders
+ * without the shape it would otherwise get. A namespace group is not breadcrumbed, a lone schema is
+ * not elided, or an empty Views group is shown.
+ */
+const LOOK_AHEAD_TIMEOUT_MS = 5_000;
+
+/**
+ * What a look-ahead found out about a node's children.
+ */
+interface ILookAhead {
+	/** The children, or undefined when the fetch failed or did not answer by the deadline. */
+	readonly children: readonly IDataConnectionNodeDTO[] | undefined;
+	/** The fetch, for a kept row's expand to await. Undefined when the fetch failed. */
+	readonly query: Promise<readonly IDataConnectionNodeDTO[]> | undefined;
+}
+
+export class DataConnectionsTreeInstance extends PositronTreeInstance<DataConnectionNode> implements IDataConnectionNodeOpener {
+	// The look-ahead query for a namespace group or Views group that kept its row, possibly still in
+	// flight. Opening the row awaits this instead of sending the query again. Only kept rows are
+	// parked, so nothing is stored for a row the look-ahead drops. Keyed by the group's node id. See
+	// _parkLookAhead and _takeLookAhead.
+	private readonly _lookAheadChildren = new Map<string, Promise<readonly IDataConnectionNodeDTO[]>>();
+
+	// Rows whose children a path lookup loaded without the row ever being expanded. Having loaded
+	// children is otherwise what marks a row the user opened and closed, so these are told apart
+	// to keep _expandBreadcrumbed opening them as it would a row seen for the first time. A row
+	// leaves the set when it is expanded or its children are dropped.
+	private readonly _loadedUnopened = new Set<string>();
+
+	// Collapsed rows refreshed since their children were last loaded. Refreshing a collapsed row
+	// drops its children without fetching them again, so a group row among these has no count it can
+	// trust -- the one its DTO carries came from its parent's last fetch, before the refresh -- and
+	// shows none until its children load. Keyed by node id: a refresh keeps the row's id, and anything
+	// that rebuilds the row gives it a new one, with a fresh count. A row leaves the set when it is
+	// expanded, or when its connection closes. See groupCount.
+	private readonly _countsAwaitingLoad = new Set<string>();
+
+	// The opens in Data Explorer in flight for each profile, and whether the connection was already
+	// open when the first of them started, so only the last to finish gives up a connection that
+	// was opened for them. See openInDataExplorer.
+	private readonly _opensInFlight = new Map<string, { count: number; wasConnected: boolean }>();
+
+	// Counts details requests, so a preview-mode open whose fetch was overtaken by a later request
+	// can tell and drop its result. See openNodeDetails.
+	private _detailsRequestCount = 0;
+
+	// A scroll waiting for the grid to be laid out, held so a second reveal replaces the first
+	// rather than leaving two listeners racing to scroll to different rows. See
+	// _scrollToCursorWhenLaidOut.
+	private readonly _pendingScrollToCursor = this._register(new MutableDisposable());
+
+	// Shared by every row so moving between rows' buttons re-hovers instantly, and so a row
+	// unmounting doesn't dispose a manager (which hides every hover in the workbench).
+	private readonly _hoverManager: PositronActionBarHoverManager;
+
+	constructor(
+		private readonly _service: IPositronDataConnectionsService,
+		private readonly _configurationService: IConfigurationService,
+		private readonly _notificationService: INotificationService,
+		hoverService: IHoverService,
+		private readonly _editorService: IEditorService,
+	) {
+		super({
+			rowHeight: ROW_HEIGHT,
+			indentWidth: resolveIndentWidth(_configurationService),
+			getRoots: async () => buildEntries(_service).map(wrapEntry),
+			// Bound to `this` so the closure can reach _service for the connect-on-expand path.
+			getChildren: node => this._fetchChildrenForNode(node),
+			getReloadKey: node => reloadKey(node.data),
+			renderNode: (visible, context) => this._renderRow(visible, context),
+		});
+
+		this._hoverManager = this._register(new PositronActionBarHoverManager(true, _configurationService, hoverService));
+
+		// When profiles or instances change, rebuild roots so each entry sees its current
+		// connected/disconnected state. setRoots is sync and preserves existing expansion /
+		// loaded children by id, so unaffected entries keep their state.
+		const refreshRoots = () => {
+			const entries = buildEntries(this._service);
+			this.setRoots(entries.map(wrapEntry));
+
+			// A loaded DTO subtree is only valid while its connection is open, so drop the subtree of
+			// any entry that no longer has a live instance.
+			this._dropClosedEntrySubtrees(entries);
+		};
+		this._register(this._service.onDidChangeProfiles(refreshRoots));
+		this._register(this._service.onDidChangeInstances(refreshRoots));
+		this._register(this._service.onDidChangeDiscoveredProfiles(refreshRoots));
+
+		// Show a connection something outside the pane has put the user's attention on (the
+		// database file editor, after creating or opening one). Taken rather than listened for,
+		// because the request may well have been made while this tree was being built -- the pane
+		// is opened first and renders a moment later -- in which case there was nothing here to
+		// hear it. Both paths run the same take, so whichever gets there first honors it.
+		const revealRequested = () => { void this._revealRequestedConnection(); };
+		this._register(this._service.onDidRequestRevealConnection(revealRequested));
+		revealRequested();
+
+		// Track both indent settings live -- the workbench one matters even while this view's own is
+		// set, since clearing the latter back to 0 has to fall through to it. Indent takes effect
+		// without a reload everywhere else in the workbench, and a user dialing it in wants the tree
+		// to answer as they drag.
+		this._register(this._configurationService.onDidChangeConfiguration(e => {
+			if (e.affectsConfiguration(POSITRON_DATA_CONNECTIONS_TREE_INDENT_KEY) ||
+				e.affectsConfiguration(TREE_INDENT_KEY)) {
+				this.setIndentWidth(resolveIndentWidth(this._configurationService));
+			}
+
+			// Whether a lone schema is shown is decided by the fetch, so the rows already on screen
+			// were built under the old answer and a reload is what re-decides them -- the same
+			// re-decision a schema gaining or losing a sibling gets. Without it the setting would
+			// appear to do nothing until the user reloaded the window, which for a display toggle
+			// reads as a bug.
+			if (e.affectsConfiguration(POSITRON_DATA_CONNECTIONS_TREE_SHOW_SINGLE_SCHEMA_KEY)) {
+				// Fire and forget, as the panel's own Refresh button does: nothing here can act on
+				// the result, and a failed reload surfaces through the tree's per-node error state.
+				void this.reloadAll();
+			}
+		}));
+
+		// Reveal requests are claimed from the service rather than read off the event, because a
+		// reveal that had to open the view fired before this instance existed. Claiming covers
+		// both cases with one path, and a claimed request is never acted on twice.
+		const claimReveal = () => {
+			const request = this._service.takePendingReveal();
+			if (request !== undefined) {
+				void this.reveal(request);
+			}
+		};
+		this._register(this._service.onDidRequestReveal(claimReveal));
+		claimReveal();
+	}
+
+	/**
+	 * Shows the connection the service has been asked to reveal, if there is one: selects its row
+	 * and opens it, which for an entry means connecting it and fetching what it holds. Nothing
+	 * happens when no request is outstanding, which is the usual case -- this runs once when the
+	 * tree is built as well as on every request.
+	 *
+	 * An entry the user already has open is left expanded as it is; the selection still moves to
+	 * it, which is the part that answers "where did my connection go".
+	 *
+	 * A request with a node path goes on down to that node (see _lookUpPath) and selects it
+	 * instead, opening just the way to it, and with openDetails opens its details too. When the path
+	 * no longer leads all the way -- something was renamed or dropped since it was recorded -- the
+	 * deepest node it still leads to is opened and selected instead, and when a load on the way
+	 * failed, that node is left as the failure left it and reported. With preserveFocus the tree
+	 * leaves focus where it is -- a breadcrumb in a details editor, where the user is reading --
+	 * instead of taking it.
+	 */
+	private async _revealRequestedConnection(): Promise<void> {
+		const request = this._service.takePendingRevealConnection();
+		if (request === undefined) {
+			return;
+		}
+		const { profileId, nodePath = [], openDetails = false, preserveFocus = false } = request;
+
+		const entry = await this._entryNode(profileId);
+		if (entry === undefined) {
+			return;
+		}
+
+		// Expanding an entry is what opens its connection, so this is the "open" in the request.
+		// Failures surface on the row itself, the same as a user-driven expand, and leave nothing
+		// below it to look for.
+		if (!this.isExpanded(entry.id)) {
+			await this.expand(entry.id);
+		}
+		const lookup: PathLookup = this.getError(entry.id) === undefined
+			? await this._lookUpPath(entry, nodePath)
+			: { chain: [entry], found: false };
+
+		// Open the way to the node -- or, when the path stops short, to and including the deepest
+		// node it reached, which is where it would have gone on -- leaving a node whose children
+		// failed to load as the failure left it: collapsed, showing the error.
+		const toOpen = lookup.found ? lookup.chain.slice(0, -1) : lookup.chain.filter(node => node.id !== lookup.failedId);
+		for (const node of toOpen) {
+			await this.expand(node.id);
+		}
+		if (lookup.failedId !== undefined) {
+			this._notifyIfFailed(lookup.failedId);
+		}
+
+		// Located after the expands, which insert the rows each node holds and so move everything
+		// below it.
+		const targetId = lookup.chain[lookup.chain.length - 1].id;
+		const rowIndex = this.visibleNodes.findIndex(visible => visible.node.id === targetId);
+		if (rowIndex === -1) {
+			return;
+		}
+
+		this.setCursorRow(rowIndex);
+		this.selectRow(rowIndex);
+		this._scrollToCursorWhenLaidOut();
+
+		if (openDetails) {
+			// Opened without taking focus (see openDataConnectionNodeDetails).
+			await this.openNodeDetails(rowIndex, false);
+		}
+
+		// Put keyboard focus on the row, not merely the selection highlight: the user pressed a
+		// button elsewhere to get here, so this is where they are now, and the arrow keys should
+		// move from this row. Harmless if the tree already has focus. Unless the request says to
+		// leave focus where it is.
+		if (!preserveFocus) {
+			this.requestFocus();
+		}
+	}
+
+	/**
+	 * Opens the node at a path below a connection in the Data Explorer, for a details editor, which
+	 * holds the node's path rather than its live handle. See IDataConnectionNodeOpener.
+	 *
+	 * Opening a node's data is a request to see the data, not to go to the node, so the tree finds
+	 * the node without showing it (see _lookUpPath): nothing is expanded, so nothing on screen moves
+	 * and the selection and focus stay where they are. A connection opened just for this is handed to
+	 * the Data Explorer, which keeps it open while the Data Explorer is, or lets it close straight
+	 * away if the preview failed: the tree holds a connection open only while it shows what the
+	 * connection holds.
+	 *
+	 * Only the node itself is opened, and a failure is reported for what it is: a load on the way
+	 * that failed, as the reason -- leaving no error behind on a row the user hasn't opened, since the
+	 * report is about the node -- or a node that can no longer be previewed, or one the path no
+	 * longer leads to (something was renamed or dropped since it was recorded, or the connection was
+	 * removed).
+	 * @param profileId The id of the connection's profile.
+	 * @param nodePath The reload key of each row on the way down from the connection to the node.
+	 * @param name The node's name, for reporting a failure.
+	 */
+	async openInDataExplorer(profileId: string, nodePath: readonly string[], name: string): Promise<void> {
+		// Another open already in flight on the profile may have connected it, so the first open's
+		// answer is the one that counts; and closing must wait for the last open, since an earlier
+		// one finishing could otherwise close the connection under a later one's preview.
+		const inFlight = this._opensInFlight.get(profileId) ??
+			{ count: 0, wasConnected: this._service.getInstanceForProfile(profileId) !== undefined };
+		inFlight.count++;
+		this._opensInFlight.set(profileId, inFlight);
+		try {
+			const entry = await this._entryNode(profileId);
+			const lookup = entry === undefined ? undefined : await this._lookUpPath(entry, nodePath);
+			const data = lookup?.found ? lookup.chain[lookup.chain.length - 1].data : undefined;
+			if (data?.kind === 'dto' && canPreview(data.dto)) {
+				await openNodeInDataExplorer(this._service, this._notificationService, data.handle, data.dto);
+			} else if (data?.kind === 'dto') {
+				this._notificationService.error(localize(
+					'positron.dataConnections.openInDataExplorerCannotPreview',
+					"Could not open '{0}' in the Data Explorer: it can no longer be previewed.",
+					name
+				));
+			} else if (lookup?.error !== undefined) {
+				reportOpenInDataExplorerFailed(this._notificationService, name, lookup.error);
+				if (lookup.failedId !== undefined && !this.isExpanded(lookup.failedId)) {
+					this.dropLoadedChildren(lookup.failedId);
+				}
+			} else {
+				this._notificationService.error(localize(
+					'positron.dataConnections.openInDataExplorerNotFound',
+					"Could not open '{0}' in the Data Explorer: it is no longer in its connection.",
+					name
+				));
+			}
+		} finally {
+			if (--inFlight.count === 0) {
+				this._opensInFlight.delete(profileId);
+				if (!inFlight.wasConnected && !this.isExpanded(entryNodeId(profileId))) {
+					this._service.disconnectWhenUnused(profileId);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Gets a connection's entry row. The entry may not be among the rows yet: a connection saved a
+	 * moment ago reaches this tree through a roots refresh, and a tree built just now has no rows at
+	 * all until its first refresh. Either way, one refresh puts the saved profiles on screen.
+	 * @param profileId The id of the connection's profile.
+	 * @returns The entry, or undefined when the profile isn't in the tree.
+	 */
+	private async _entryNode(profileId: string): Promise<TreeNode<DataConnectionNode> | undefined> {
+		const id = entryNodeId(profileId);
+		if (!this.visibleNodes.some(visible => visible.node.id === id)) {
+			await this.refresh();
+		}
+		return this.visibleNodes.find(visible => visible.node.id === id)?.node;
+	}
+
+	/**
+	 * Follows a path -- the reload key of each row on the way, recorded from the tree -- down from a
+	 * connection's entry, without changing what the tree shows: the children of each node on the
+	 * way are loaded if they aren't already, as expanding the node would load them (connecting, for
+	 * the entry), but nothing is expanded. The one matcher for recorded paths, for a reveal and for
+	 * opening a node's data alike.
+	 * @param entry The connection's entry.
+	 * @param nodePath The reload keys of the nodes on the way down; empty for the connection itself.
+	 */
+	private async _lookUpPath(entry: TreeNode<DataConnectionNode>, nodePath: readonly string[]): Promise<PathLookup> {
+		const chain = [entry];
+		for (const key of nodePath) {
+			const found = await this._findLoadedChildByReloadKey(chain[chain.length - 1], key);
+			if (found.path === undefined) {
+				return { chain, found: false, error: found.error, failedId: found.failedId };
+			}
+			chain.push(...found.path);
+		}
+		return { chain, found: true };
+	}
+
+	/**
+	 * Finds the child with a reload key below a node, loading the node's children if need be but
+	 * expanding nothing. Paths normally name every row on the way, group rows included, so the node
+	 * is a direct child; failing that -- a path recorded without its group rows, or a tree regrouped
+	 * since -- rows that only group others ("Tables", "Metrics") are looked inside. A load that fails
+	 * stops the search below that node: it is not tried a second time.
+	 * @param parent The node to look under.
+	 * @param key The reload key of the child to find.
+	 * @returns The rows from just below the parent down to the child -- the child alone, or the
+	 * groups it was found inside and then the child -- if it is there; otherwise the first load
+	 * that failed, if one did.
+	 */
+	private async _findLoadedChildByReloadKey(
+		parent: TreeNode<DataConnectionNode>,
+		key: string
+	): Promise<{ path?: TreeNode<DataConnectionNode>[]; error?: unknown; failedId?: string }> {
+		if (!this.isExpanded(parent.id) && !this.hasLoadedChildren(parent.id)) {
+			this._loadedUnopened.add(parent.id);
+		}
+		const children = await this.loadChildren(parent.id);
+		if (children === undefined) {
+			const error = this.getError(parent.id);
+			return error === undefined ? {} : { error, failedId: parent.id };
+		}
+
+		const match = children.find(child => reloadKey(child.data) === key);
+		if (match) {
+			return { path: [match] };
+		}
+
+		let failure: { error?: unknown; failedId?: string } = {};
+		for (const child of children) {
+			if (child.data.kind === 'dto' && CONTAINER_ONLY_KINDS.has(child.data.dto.kind) && child.data.dto.hasGetChildren) {
+				const found = await this._findLoadedChildByReloadKey(child, key);
+				if (found.path !== undefined) {
+					return { path: [child, ...found.path] };
+				}
+				if (failure.error === undefined && found.error !== undefined) {
+					failure = found;
+				}
+			}
+		}
+		return failure;
+	}
+
+	/**
+	 * Scrolls the cursor row into view, waiting for the grid to have a viewport if it doesn't yet.
+	 * A reveal routinely lands while the view is still coming up -- the pane is opened and the
+	 * grid is laid out a frame later -- and a grid with no height can't scroll anything into view,
+	 * so the scroll would otherwise be dropped and the row left below the fold.
+	 */
+	private _scrollToCursorWhenLaidOut(): void {
+		if (this.layoutHeight > 0) {
+			this._pendingScrollToCursor.clear();
+			void this.scrollToCursor();
+			return;
+		}
+
+		// onDidUpdate fires when the grid is sized, among many other times; the first one with a
+		// viewport is the one to scroll on, and the listener is done at that point.
+		this._pendingScrollToCursor.value = this.onDidUpdate(() => {
+			if (this.layoutHeight <= 0) {
+				return;
+			}
+
+			this._pendingScrollToCursor.clear();
+			void this.scrollToCursor();
+		});
+	}
+
+	/**
+	 * Reveals a row of a connection's tree: expands down to it, selects it and scrolls it into view.
+	 *
+	 * The path names rows by kind and name rather than by node id, since ids embed the handle a
+	 * node was fetched under and do not survive a refetch. Display-only grouping rows ("Tables",
+	 * "Columns") are walked past rather than named, so a caller works in terms of the schema
+	 * rather than of how the pane chooses to lay it out.
+	 *
+	 * Gives up quietly if any step is missing. A path comes from a snapshot of the schema -- a
+	 * link in a SQL editor, say -- and the table it names may since have been dropped or renamed,
+	 * which is not worth an error dialog over a click.
+	 * @param request The row to reveal.
+	 */
+	async reveal(request: IDataConnectionNodeRevealRequest): Promise<void> {
+		// The roots may still be loading when a reveal arrives with the view: expand() no-ops on a
+		// node the tree does not have yet, which would lose the reveal silently.
+		await raceTimeout(this._whenRootsLoaded(), REVEAL_ROOTS_TIMEOUT_MS);
+
+		let targetId = entryNodeId(request.profileId);
+		for (const step of request.path) {
+			const childId = await this._findStep(targetId, step);
+			if (childId === undefined) {
+				return;
+			}
+			targetId = childId;
+		}
+
+		// Recomputed after the walk: every expand above rebuilt the projection, so an index taken
+		// earlier would point at a different row.
+		const index = this.visibleNodes.findIndex(visible => visible.node.id === targetId);
+		if (index >= 0) {
+			await this.mouseSelectRow(index, MouseSelectionType.Single);
+		}
+	}
+
+	/** Resolves once the tree has roots to walk, or immediately if it already does. */
+	private async _whenRootsLoaded(): Promise<void> {
+		while (!this.initialLoadCompleted) {
+			await Event.toPromise(this.onDidChangeLoading);
+		}
+	}
+
+	/**
+	 * Finds the child of a node matching one step of a reveal path, expanding as needed.
+	 *
+	 * Kind is preferred but not required: the kinds in a path come from a schema snapshot, and a
+	 * driver that has since started calling a table a view should still be reachable.
+	 */
+	private async _findStep(
+		parentId: string,
+		step: IDataConnectionNodeStep
+	): Promise<string | undefined> {
+		await this.expand(parentId);
+
+		const children = this._childrenOf(parentId);
+		const named = children.filter(child =>
+			child.data.kind === 'dto' && namesMatch(child.data.dto.name, step.name)
+		);
+		// A name in the same case wins over one that only matches without it, so a database that
+		// keeps both `Users` and `users` (quoted identifiers) reveals the one the path asked for.
+		const sameCase = named.filter(child =>
+			child.data.kind === 'dto' && child.data.dto.name === step.name
+		);
+		const candidates = sameCase.length > 0 ? sameCase : named;
+		const exact = candidates.find(child =>
+			child.data.kind === 'dto' && child.data.dto.kind === step.kind
+		);
+		const match = exact ?? candidates[0];
+		if (match !== undefined) {
+			return match.id;
+		}
+
+		// The step names a lone schema the tree dropped (see _elideSingleSchema): its contents stand
+		// at this level, so the walk is already where the step would have taken it.
+		const elided = children.some(child =>
+			child.data.kind === 'dto' &&
+			child.data.elidedSchema !== undefined &&
+			namesMatch(child.data.elidedSchema, step.name)
+		);
+		if (elided) {
+			return parentId;
+		}
+
+		// Not a child directly: descend through the grouping rows the path leaves out.
+		for (const child of children) {
+			if (child.data.kind === 'dto' && CONTAINER_ONLY_KINDS.has(child.data.dto.kind)) {
+				const found = await this._findStep(child.id, step);
+				if (found !== undefined) {
+					return found;
+				}
+			}
+		}
+
+		return undefined;
+	}
+
+	/**
+	 * The immediate children of a node, read off the current projection.
+	 *
+	 * The projection is the only public view of the loaded tree, and it is rebuilt on every
+	 * structural change, so this is read fresh after each expand rather than cached.
+	 */
+	private _childrenOf(parentId: string): TreeNode<DataConnectionNode>[] {
+		const nodes = this.visibleNodes;
+		const parentIndex = nodes.findIndex(visible => visible.node.id === parentId);
+		if (parentIndex < 0) {
+			return [];
+		}
+
+		const parentDepth = nodes[parentIndex].depth;
+		const children: TreeNode<DataConnectionNode>[] = [];
+		for (let index = parentIndex + 1; index < nodes.length; index++) {
+			const visible = nodes[index];
+			if (visible.depth <= parentDepth) {
+				break;
+			}
+			if (visible.depth === parentDepth + 1) {
+				children.push(visible.node);
+			}
+		}
+		return children;
+	}
+
+	/**
+	 * Tree-semantic expand. Expanding a connected entry means the user wants the connection again, so
+	 * it cancels any pending close a previous collapse left behind.
+	 */
+	override async expand(id: string): Promise<void> {
+		const node = this._findEntryNode(id);
+		if (node !== undefined) {
+			this._service.cancelDisconnectWhenUnused(node.entry.profile.id);
+		}
+		const fetches = !this.isExpanded(id) && !this.hasLoadedChildren(id);
+		this._loadedUnopened.delete(id);
+		this._countsAwaitingLoad.delete(id);
+		await super.expand(id);
+		if (fetches) {
+			this._notifyIfFailed(id);
+		}
+		await this._expandBreadcrumbed();
+	}
+
+	/**
+	 * Reloads a subtree. Breadcrumbing is decided by the fetch, so a reload re-decides it: a schema
+	 * that has gained a sibling comes back as an ordinary "Schemas" group, and one that has lost its
+	 * siblings comes back breadcrumbed.
+	 *
+	 * Deliberately does not auto-open breadcrumbed rows the way a first expand does. The base
+	 * restores the expansion the user had, matching rows to their counterparts by reload key rather
+	 * than by id, so a reload already reopens the breadcrumbed rows that were open and leaves the
+	 * ones the user had closed alone. Running the auto-open on top of that would reopen the closed
+	 * ones, since after a reload they are indistinguishable from rows appearing for the first time.
+	 */
+	override async reload(id: string): Promise<void> {
+		// The reloaded rows must go back to the source, so their parked queries go, including the one
+		// for a collapsed row that keeps its id. See _parkLookAhead. Only this connection's entries:
+		// another connection's parked queries are still good, and can still be in flight.
+		const data = this.visibleNodes.find(visible => visible.node.id === id)?.node.data;
+		const handle = data?.kind === 'entry' ? data.entry.instance?.connectionHandle : data?.handle;
+		if (handle !== undefined) {
+			const prefix = dtoNodeIdPrefix(handle);
+			for (const lookAheadId of [...this._lookAheadChildren.keys()]) {
+				if (lookAheadId.startsWith(prefix)) {
+					this._lookAheadChildren.delete(lookAheadId);
+				}
+			}
+		}
+		// A collapsed row's refresh fetches nothing, so its count waits for its next load.
+		if (!this.isExpanded(id)) {
+			this._countsAwaitingLoad.add(id);
+		}
+		const fetches = this.isExpanded(id) && !this.isRefreshing(id);
+		await super.reload(id);
+		if (fetches) {
+			this._notifyIfFailed(id);
+		}
+	}
+
+	/**
+	 * Reloads every connection. Same breadcrumb re-decision, and the same deference to the base's
+	 * expansion restoration, as reload.
+	 */
+	override async reloadAll(): Promise<void> {
+		this._lookAheadChildren.clear();
+		await super.reloadAll();
+	}
+
+	/**
+	 * Re-fetches a subtree in place. Reaches the same fetch as expand and reload, so it can
+	 * breadcrumb too, and opens whatever it produced.
+	 */
+	override async invalidate(id?: string): Promise<void> {
+		await super.invalidate(id);
+		await this._expandBreadcrumbed();
+	}
+
+	/**
+	 * Tree-semantic collapse. Collapsing an entry gives up the tree's use of its connection, which
+	 * closes the connection unless Data Explorers previewed from it are still open. In that case the
+	 * connection stays up and closes when the last of them does: collapsing an entry is how a user
+	 * reclaims the panel's vertical space, and previews opened from it should keep working. The entry
+	 * row's connected indicator shows the connection is still live in the meantime, and its loaded
+	 * subtree is kept too, so re-expanding is immediate rather than a fresh round trip.
+	 *
+	 * The subtree is dropped when the connection actually closes, wherever that happens -- see the
+	 * roots refresh in the constructor.
+	 */
+	override collapse(id: string): void {
+		const node = this._findEntryNode(id);
+		if (node !== undefined && node.entry.instance !== undefined) {
+			this._service.disconnectWhenUnused(node.entry.profile.id);
+		}
+		super.collapse(id);
+	}
+
+	/**
+	 * Disconnects an entry's connection outright, at the user's explicit request, and collapses the
+	 * entry: with the connection gone there is nothing under it to browse, so leaving it expanded
+	 * would show an empty or re-connecting subtree. The Data Explorers previewed from it close too,
+	 * because their backends die with the connection.
+	 *
+	 * Collapsing goes straight to the base implementation rather than through this class's collapse:
+	 * that override means the conditional, wait-for-the-previews close a user-driven collapse asks
+	 * for, which is the opposite of what is wanted here. The loaded subtree is dropped by the roots
+	 * refresh in the constructor once the connection is actually gone.
+	 * @param id The node id of the entry to disconnect.
+	 */
+	async disconnectEntry(id: string): Promise<void> {
+		const node = this._findEntryNode(id);
+		if (node === undefined) {
+			return;
+		}
+		super.collapse(id);
+		await this._service.disconnect(node.entry.profile.id);
+	}
+
+	/**
+	 * Collapses and unloads every entry that no longer has a live connection. A loaded DTO subtree is
+	 * only valid while its connection is open -- its node handles live in the ext host and die with
+	 * the connection -- so the subtree is dropped and the next expand re-fetches against a fresh
+	 * handle.
+	 *
+	 * Collapsing matters as much as dropping: an entry left expanded with no children renders as a
+	 * twisty that spins forever, because the projection reads "expanded but not loaded" as a fetch in
+	 * flight and nothing is fetching. It goes through the base implementation rather than this class's
+	 * collapse, which means "the user gave up the connection" and would ask to close one that is
+	 * already gone.
+	 *
+	 * Called on every roots refresh, so it covers every route a connection can close by, not just the
+	 * ones the tree starts: a collapse, a deferred close once the last Data Explorer closed, an edit
+	 * to the profile's parameters, or the driver dropping the connection on its own.
+	 */
+	private _dropClosedEntrySubtrees(entries: readonly DataConnectionEntry[]): void {
+		for (const entry of entries) {
+			const id = entryNodeId(entry.profile.id);
+			if (entry.instance === undefined && this.hasLoadedChildren(id)) {
+				// Node ids carry the connection handle, and a restarted extension host issues handles
+				// from the start again, so a closed connection's refreshed rows are forgotten before a
+				// fresh row could come back under one of their ids. The loaded rows still hold the
+				// handle that has gone.
+				const loadedRow = this.getLoadedChildren(id)?.find(child => child.data.kind === 'dto')?.data;
+				if (loadedRow?.kind === 'dto') {
+					const prefix = dtoNodeIdPrefix(loadedRow.handle);
+					for (const countId of [...this._countsAwaitingLoad]) {
+						if (countId.startsWith(prefix)) {
+							this._countsAwaitingLoad.delete(countId);
+						}
+					}
+				}
+				super.collapse(id);
+				this.dropLoadedChildren(id);
+
+				// The dropped subtree's node handles die with the connection, so anything the
+				// look-ahead is still holding for it is unusable. Cleared wholesale rather than per
+				// connection: the entries are keyed by node id, which cannot be mapped back to a
+				// connection that is already gone, and the cost of clearing is one repeated query
+				// on some other connection's next expand.
+				this._lookAheadChildren.clear();
+			}
+		}
+	}
+
+	/**
+	 * Fetches children for a node. For an entry node without a live instance, opens the
+	 * connection first, then fetches the top-level DTOs against the new handle. Running this
+	 * inside the base class's _fetchChildren means the loading state (twisty spinner) covers
+	 * the connect + getChildren as one continuous operation, and a connect failure surfaces
+	 * through the tree's existing error state.
+	 *
+	 * A namespace group or Views group that kept its row is answered from the look-ahead's query, so
+	 * opening it does not send that query again. The query may still be in flight if the look-ahead
+	 * timed out.
+	 *
+	 * Failures are not reported from here. The base also calls this while restoring a reload's
+	 * expansion, where a failed branch is deliberately left collapsed rather than shown as an error;
+	 * see _notifyIfFailed for where failures are reported.
+	 */
+	private async _fetchChildrenForNode(
+		node: TreeNode<DataConnectionNode>
+	): Promise<readonly TreeNode<DataConnectionNode>[]> {
+		const data = node.data;
+		switch (data.kind) {
+			case 'entry': {
+				const instance = data.entry.instance
+					?? await this._service.connect(data.entry.profile.id);
+				const dtos = await instance.connectionHandle.getChildren();
+				return this._breadcrumbNamespaceGroups(dtos, instance.connectionHandle);
+			}
+			case 'dto': {
+				const dtos = await this._takeLookAhead(node.id)
+					?? await data.handle.nodeGetChildren(data.dto.nodeHandle);
+				return this._breadcrumbNamespaceGroups(dtos, data.handle);
+			}
+		}
+	}
+
+	/**
+	 * Reports a node's fetch failure as a notification, if the fetch that just ran left the node in
+	 * the error state. The error twisty's message is a native `title` tooltip, easy to miss and only
+	 * visible on hover, so without this a user whose connection fails to open would see no sign of
+	 * it short of the driver's own output channel.
+	 *
+	 * Called only after a fetch this tree's own expand or reload ran for the node, never from the
+	 * shared fetch, so there is one notification per row that turns into an error: the failed
+	 * descendants a reload's restore leaves collapsed stay silent until the user expands them.
+	 *
+	 * @param id The node whose fetch just completed.
+	 */
+	private _notifyIfFailed(id: string): void {
+		const error = this.getError(id);
+		const node = this.visibleNodes.find(visible => visible.node.id === id)?.node;
+		if (error === undefined || node === undefined) {
+			return;
+		}
+
+		this._notificationService.error(localize(
+			'positron.dataConnections.expandFailed',
+			"Could not expand '{0}': {1}",
+			node.data.kind === 'entry' ? node.data.entry.profile.connectionName : node.data.dto.name,
+			error instanceof Error ? error.message : String(error)
+		));
+	}
+
+	/**
+	 * Returns the children the look-ahead fetched for a node, if it has any waiting, and forgets
+	 * them. The entry may still be in flight when the look-ahead timed out; this waits for that same
+	 * query. Taken rather than read: the entry answers exactly one fetch, so a later re-fetch of the
+	 * same node goes to the source and sees anything that has changed since.
+	 *
+	 * @param id The node id to take the look-ahead result for.
+	 * @returns The children, or undefined when the look-ahead has nothing for this node.
+	 */
+	private async _takeLookAhead(id: string): Promise<readonly IDataConnectionNodeDTO[] | undefined> {
+		const children = this._lookAheadChildren.get(id);
+		this._lookAheadChildren.delete(id);
+		return children;
+	}
+
+	/**
+	 * Wraps a level's DTOs, breadcrumbing any namespace group that turned out to hold exactly one
+	 * child: the group is dropped and its child takes its place, labeled with the group's name
+	 * ("Schemas" over a lone "public" becomes "Schemas / public"). See BREADCRUMB_GROUP_KINDS for
+	 * which groups qualify and why, and _expandBreadcrumbed for how the replacement comes to be open.
+	 *
+	 * Deciding this needs the group's children, so a namespace group costs one extra round trip on
+	 * the level above it, paid whether or not the user goes on to open it.
+	 *
+	 * A lone schema goes further than breadcrumbing and disappears altogether, unless the user has
+	 * opted to keep it -- see _elideSingleSchema. That is why this returns a level rather than a
+	 * node per DTO: one group can expand into the several rows that stood beneath it.
+	 *
+	 * @param dtos The level's DTOs.
+	 * @param handle The connection handle the DTOs came from.
+	 * @returns The level's tree nodes, with qualifying groups replaced by their only child, or by
+	 * that child's own children when the schema tier is being hidden.
+	 */
+	private async _breadcrumbNamespaceGroups(
+		dtos: readonly IDataConnectionNodeDTO[],
+		handle: IDataConnectionHandle
+	): Promise<readonly TreeNode<DataConnectionNode>[]> {
+		// One deadline for the whole level, shared by every look-ahead its siblings run. A timer
+		// rather than clock arithmetic, so a change to the system clock cannot stretch it. See
+		// LOOK_AHEAD_TIMEOUT_MS.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<undefined>(resolve => {
+			timer = setTimeout(() => resolve(undefined), LOOK_AHEAD_TIMEOUT_MS);
+		});
+		const level = await Promise.all(dtos.map(async dto => {
+			if (!BREADCRUMB_GROUP_KINDS.has(dto.kind)) {
+				const row = await this._wrapUnlessEmptyViews(dto, handle, deadline);
+				return row === undefined ? [] : [row];
+			}
+
+			const lookAhead = await this._lookAhead(dto, handle, deadline);
+			const children = lookAhead?.children;
+			if (children === undefined) {
+				this._parkLookAhead(dto, handle, lookAhead);
+				return [wrapDto(dto, handle)];
+			}
+
+			if (children.length === 1) {
+				if (dto.kind === SCHEMAS_GROUP_KIND && !this._showSingleSchema()) {
+					const contents = await this._elideSingleSchema(children[0], handle, deadline);
+					if (contents !== undefined) {
+						return contents;
+					}
+				}
+				return [wrapDto(children[0], handle, dto.name)];
+			}
+
+			// The group keeps its row, and the children the look-ahead just fetched are the ones its
+			// expand would ask for. Parking the query lets opening the group await it rather than
+			// send it twice. On a warehouse connection that second query is seconds, at every
+			// namespace level, on every reload.
+			//
+			// Held to the side rather than handed straight to the tree with setChildren: that writes
+			// into the live children map, and this also runs inside a reload's staged fetch, whose
+			// result is discarded if its node was collapsed while the fetch was in flight. The
+			// entries would outlive the rows they belong to.
+			this._parkLookAhead(dto, handle, lookAhead);
+			return [wrapDto(withLookAheadCount(dto, children), handle)];
+		}));
+		clearTimeout(timer);
+
+		return level.flat();
+	}
+
+	/**
+	 * Whether the user has asked to keep a connection's only schema in the tree, breadcrumbed into
+	 * its group, rather than have it dropped. Read live rather than cached in the constructor, so a
+	 * toggle takes effect on the next fetch; the constructor's change handler reloads to make that
+	 * immediate. Compared against true so that an unset value -- and a configuration service that
+	 * does not know the key -- reads as the registered default of off.
+	 */
+	private _showSingleSchema(): boolean {
+		return this._configurationService.getValue<boolean>(
+			POSITRON_DATA_CONNECTIONS_TREE_SHOW_SINGLE_SCHEMA_KEY) === true;
+	}
+
+	/**
+	 * Drops a lone schema out of the tree, returning the rows that stand in its place: its own
+	 * children, spliced into the level where its "Schemas" group would have been. Two tiers vanish
+	 * at once, so a connection to a single-schema database reads straight from the connection to
+	 * Tables and Views.
+	 *
+	 * This costs a second look-ahead -- the group's children found the schema, and this fetches the
+	 * schema's -- so opening a single-schema connection is three sequential round trips rather than
+	 * two, and a fourth when the schema has a Views group (see _wrapUnlessEmptyViews). That is the
+	 * price of the default; the result is not wasted, since these are the rows the level goes on to
+	 * hold.
+	 * Turning the setting on takes the second one back off.
+	 *
+	 * Returns undefined when the schema cannot stand aside, leaving the caller to breadcrumb it as
+	 * usual. A schema with no children is one of those cases: eliding it would leave the connection
+	 * looking like it holds nothing, which reads as a failed connection rather than an empty schema.
+	 *
+	 * @param schema The lone schema DTO.
+	 * @param handle The connection handle the DTO came from.
+	 * @param deadline Settles when the level stops waiting for its look-aheads.
+	 * @returns The schema's children as this level's rows, or undefined to fall back.
+	 */
+	private async _elideSingleSchema(
+		schema: IDataConnectionNodeDTO,
+		handle: IDataConnectionHandle,
+		deadline: Promise<undefined>
+	): Promise<readonly TreeNode<DataConnectionNode>[] | undefined> {
+		const lookAhead = await this._lookAhead(schema, handle, deadline);
+		const contents = lookAhead?.children ?? [];
+		const rows = await Promise.all(contents.map(dto => this._wrapUnlessEmptyViews(dto, handle, deadline, schema.name)));
+		const level = rows.filter(row => row !== undefined);
+
+		// A schema whose only content was an empty Views group holds nothing after all, and falls
+		// back for the same reason an empty schema does. The schema then keeps a row, so its
+		// expand gets the query.
+		if (level.length === 0) {
+			this._parkLookAhead(schema, handle, lookAhead);
+			return undefined;
+		}
+
+		return level;
+	}
+
+	/**
+	 * Fetches a node's children ahead of its expand, to decide how its row is shown.
+	 *
+	 * The look-ahead is an optimization, so a node it cannot look into or a fetch that fails leaves
+	 * the row as it would have been without it. Expanding then runs the call again and surfaces any
+	 * error through the tree's own error state, where the user can retry it. A fetch that does not
+	 * answer by the level's deadline leaves the row too, and returns the query still in flight so
+	 * the caller can park it for the expand.
+	 *
+	 * Stores nothing itself: only the caller knows whether the row is kept, so it parks the query
+	 * with _parkLookAhead when it is.
+	 *
+	 * @param dto The node to look into.
+	 * @param handle The connection handle the DTO came from.
+	 * @param deadline Settles when the level stops waiting for its look-aheads.
+	 * @returns What the look-ahead found, or undefined when the node has no children to fetch.
+	 */
+	private async _lookAhead(
+		dto: IDataConnectionNodeDTO,
+		handle: IDataConnectionHandle,
+		deadline: Promise<undefined>
+	): Promise<ILookAhead | undefined> {
+		if (!dto.hasGetChildren) {
+			return undefined;
+		}
+
+		try {
+			const query = handle.nodeGetChildren(dto.nodeHandle);
+			return { children: await Promise.race([query, deadline]), query };
+		} catch {
+			return { children: undefined, query: undefined };
+		}
+	}
+
+	/**
+	 * Parks a kept row's look-ahead query, so opening the row awaits it rather than sending the
+	 * query again. The query can still be in flight, when the look-ahead ran out of time.
+	 *
+	 * A query that fails later is dropped, so opening the row retries, which is how the user
+	 * recovers. A row opened while the query is still in flight shares its outcome, error included.
+	 * The drop checks that the entry is still this query, since a reload can park a fresh one under
+	 * the same id.
+	 *
+	 * The clear() calls in reload and reloadAll are what make a reloaded row go back to the source.
+	 * Refreshing a collapsed row keeps its id, so without the clear its next expand would take the
+	 * answer from before the reload. The clears also free entries that a reload made unreachable:
+	 * within one extension host node handles only go up, so the rows a reload rebuilds get new ids.
+	 * _dropClosedEntrySubtrees clears for a closed connection, which also covers an extension host
+	 * restart, when the handles start over.
+	 *
+	 * @param dto The node whose row was kept.
+	 * @param handle The connection handle the DTO came from.
+	 * @param lookAhead What the look-ahead found for the node, if it ran.
+	 */
+	private _parkLookAhead(dto: IDataConnectionNodeDTO, handle: IDataConnectionHandle, lookAhead: ILookAhead | undefined): void {
+		const query = lookAhead?.query;
+		if (query === undefined) {
+			return;
+		}
+
+		const id = dtoNodeId(handle, dto);
+		this._lookAheadChildren.set(id, query);
+		query.catch(() => {
+			if (this._lookAheadChildren.get(id) === query) {
+				this._lookAheadChildren.delete(id);
+			}
+		});
+	}
+
+	/**
+	 * Wraps a DTO as a row, unless it is a Views group that holds no views: a "Views" row with
+	 * nothing under it is noise beside a Tables group, and most drivers build one whether or not
+	 * there is anything to put in it. Deciding that needs the group's children, so a Views group
+	 * costs one extra round trip on the level above, paid whether or not the user goes on to open it.
+	 *
+	 * A group that is kept has its look-ahead query parked, the same as a namespace group in
+	 * _breadcrumbNamespaceGroups, and carries the count of what the look-ahead found. A group whose
+	 * emptiness is unknown, because the look-ahead could not run or failed, is kept as an ordinary
+	 * row. A timed-out look-ahead keeps the row too, without a count. A group its driver has already
+	 * counted as empty is dropped without looking.
+	 *
+	 * @param dto The DTO to wrap.
+	 * @param handle The connection handle the DTO came from.
+	 * @param deadline Settles when the level stops waiting for its look-aheads.
+	 * @param elidedSchema The lone schema the row stands in for, when it was dropped.
+	 * @returns The row, or undefined for a Views group that holds no views.
+	 */
+	private async _wrapUnlessEmptyViews(
+		dto: IDataConnectionNodeDTO,
+		handle: IDataConnectionHandle,
+		deadline: Promise<undefined>,
+		elidedSchema?: string
+	): Promise<TreeNode<DataConnectionNode> | undefined> {
+		if (dto.kind !== DataConnectionNodeKind.GroupViews) {
+			return wrapDto(dto, handle, undefined, elidedSchema);
+		}
+
+		if (dto.childCount === 0) {
+			return undefined;
+		}
+
+		const lookAhead = await this._lookAhead(dto, handle, deadline);
+		const children = lookAhead?.children;
+		if (children?.length === 0) {
+			return undefined;
+		}
+
+		this._parkLookAhead(dto, handle, lookAhead);
+		return wrapDto(children === undefined ? dto : withLookAheadCount(dto, children), handle, undefined, elidedSchema);
+	}
+
+	/**
+	 * Opens the breadcrumbed rows that are on screen and still closed. A breadcrumbed row stands in
+	 * for a group the user would have had to expand anyway, so leaving it shut would just move the
+	 * click down a row. Its children were not part of the look-ahead -- that fetched the group's
+	 * children, which is the row itself -- so each one costs a round trip of its own.
+	 *
+	 * Read from the projection rather than from a list built during the fetch. Reloads run
+	 * concurrently (reloadAll fans out across roots) and invalidate reaches the same fetch, so a list
+	 * handed between the two is drained by whichever operation finishes first, against rows another
+	 * one has not inserted yet. The projection is the same answer whoever asks and whenever.
+	 *
+	 * A row the user has closed is left closed, and having loaded children is what tells the two
+	 * apart: a row that has never been opened has none, and one the user opened and then closed
+	 * keeps them (a collapse does not drop them). The exception is a row whose children a path lookup
+	 * loaded without opening it, which _loadedUnopened tracks and which counts as never opened.
+	 * Deliberately not a set of ids the tree has already opened -- the extension host mints a fresh node handle every time it serializes a node, so a
+	 * row's id changes on every fetch and such a set would treat every replacement row as unseen.
+	 * The reload path avoids the question entirely by leaving expansion to the base, which matches
+	 * rows by reload key; see reload.
+	 */
+	private async _expandBreadcrumbed(): Promise<void> {
+		for (const id of this._loadedUnopened) {
+			if (!this.hasLoadedChildren(id)) {
+				this._loadedUnopened.delete(id);
+			}
+		}
+
+		const toExpand = this.visibleNodes
+			.filter(visible =>
+				visible.node.data.kind === 'dto' &&
+				visible.node.data.labelPrefix !== undefined &&
+				!this.isExpanded(visible.node.id) &&
+				(!this.hasLoadedChildren(visible.node.id) || this._loadedUnopened.has(visible.node.id)))
+			.map(visible => visible.node.id);
+
+		await Promise.all(toExpand.map(id => this.expand(id)));
+	}
+
+	/**
+	 * Renders one row. Each row gets callbacks bound to its own node id and position, so a row can
+	 * act on itself without knowing anything about the tree.
+	 *
+	 * Reload (rather than invalidate) is required at every level: re-fetching a connection's
+	 * top-level nodes invalidates every node handle the extension host has issued for that
+	 * connection, and re-fetching an interior node's children issues new handles for them. In
+	 * both cases the descendants loaded under the old handles are stale, so they're dropped and
+	 * re-fetched rather than left in place. Reload restores the expansion the user had open (see
+	 * reloadKey for how a node is matched to its post-refresh counterpart).
+	 */
+	private _renderRow(visible: VisibleNode<DataConnectionNode>, context: TreeNodeContext): ReactNode {
+		const { id, data } = visible.node;
+
+		// Fire-and-forget: reload drives the twisty's loading state and records any failure
+		// against the node, so there's nothing for the row to await.
+		// Offered whatever the node's expansion state: on an expanded node the subtree visibly
+		// swaps, and on a collapsed one the stale children are dropped so the next expand fetches
+		// from the source. Nothing is on screen beneath a collapsed node, so the absence of a
+		// visible change there isn't the silent no-op it would be on an expanded one.
+		const onRefresh = () => { void this.reload(id); };
+
+		// Fire-and-forget for the same reason as refresh: the row has nothing to await. The entry's
+		// connected indicator and subtree follow from the instance change the disconnect fires.
+		const onDisconnect = () => { void this.disconnectEntry(id); };
+
+		// Rows announce their context menu here rather than selecting themselves directly, so the
+		// tree owns what opening a menu means: select the row the menu belongs to (as a left click
+		// would), and keep the tree looking focused while the menu holds DOM focus. The returned
+		// handle is disposed when the menu closes.
+		const onMenuOpening = () => {
+			void this.mouseSelectRow(context.index, MouseSelectionType.Single);
+			return this.holdFocusAppearance();
+		};
+
+		// Bound to the row's index at render time, like the callbacks above.
+		const onOpenDetails = (pinned: boolean) => this.openNodeDetails(context.index, pinned);
+		const onPinDetails = () => this.pinNodeDetails(context.index);
+		const onOpeningDataExplorer = () => this.dropPendingDetails();
+
+		switch (data.kind) {
+			case 'entry':
+				// Entries are roots, so no ancestor can be refreshing them out from under the row.
+				return <DataConnectionEntryRow entry={data.entry} hoverManager={this._hoverManager} onDisconnect={onDisconnect} onMenuOpening={onMenuOpening} onRefresh={onRefresh} />;
+			case 'dto': {
+				const count = this.groupCount(context.index);
+				const countLabel = count === undefined ? undefined : formatGroupCount(count);
+				return <DataConnectionNodeRow countLabel={countLabel} dto={data.dto} handle={data.handle} labelPrefix={data.labelPrefix} stale={visible.stale} onMenuOpening={onMenuOpening} onOpenDetails={onOpenDetails} onOpeningDataExplorer={onOpeningDataExplorer} onPinDetails={onPinDetails} onRefresh={onRefresh} />;
+			}
+		}
+	}
+
+	/**
+	 * Counts the rows a group row holds. A group row ("Tables", "Columns") labels a list, and on a
+	 * connection with many tables the list alone doesn't say how long it is.
+	 *
+	 * The group's loaded children are counted when there are any: they are what the user sees on
+	 * expanding it, and a group collapsed after being opened keeps them. Before that, the count is
+	 * what is already known without a query of its own: the children the look-ahead fetched for the
+	 * row, or failing that the count the driver sent with it. A group with neither has no count
+	 * until it is opened -- fetching its children just to count them would put a query behind every
+	 * group row on screen. Notices are not rows of the list -- they say something about it, such as
+	 * that it was cut short -- so they are not counted.
+	 *
+	 * Derived on every render rather than kept: every change to the tree repaints the rows, so there
+	 * is nothing to keep in step.
+	 * @param rowIndex The index of the row.
+	 * @returns The count; undefined for a row that isn't a group, or a group whose count isn't known.
+	 */
+	groupCount(rowIndex: number): number | undefined {
+		const visible = this.visibleNodes[rowIndex];
+		if (visible === undefined || visible.node.data.kind !== 'dto' || !CONTAINER_ONLY_KINDS.has(visible.node.data.dto.kind)) {
+			return undefined;
+		}
+		// A group whose listing failed shows its error, not a count the failure leaves unconfirmed.
+		if (this.getError(visible.node.id) !== undefined) {
+			return undefined;
+		}
+
+		const loaded = this.getLoadedChildren(visible.node.id);
+		if (loaded !== undefined) {
+			return loaded.filter(child => child.data.kind !== 'dto' || !isNotice(child.data.dto)).length;
+		}
+
+		// Refreshed while collapsed, so the count on the row's DTO is from before the refresh the user
+		// asked for. See _countsAwaitingLoad.
+		if (this._countsAwaitingLoad.has(visible.node.id)) {
+			return undefined;
+		}
+
+		// Not loaded: the look-ahead's count, when it ran, was put on the row's DTO (see
+		// withLookAheadCount); otherwise it is the driver's, if it sent one.
+		return visible.node.data.dto.childCount;
+	}
+
+	/**
+	 * Enter commits the selection (see the base class) and, on a node that has details, opens its
+	 * details editor -- the keyboard counterpart of single-clicking the row. openNodeDetails does
+	 * nothing for a node without details.
+	 */
+	override async onEnterKey(): Promise<void> {
+		await super.onEnterKey();
+		await this.openNodeDetails(this.cursorRowIndex, false);
+	}
+
+	/**
+	 * Opens the details editor for the node at a row, fetching its details from the driver. Does
+	 * nothing for a row that has no details, or one on its way out under an ancestor's refresh
+	 * (its handle may already be dead).
+	 * @param rowIndex The index of the row.
+	 * @param pinned Whether to open the tab pinned rather than in preview mode.
+	 */
+	async openNodeDetails(rowIndex: number, pinned: boolean): Promise<void> {
+		const visible = this.visibleNodes[rowIndex];
+		if (visible === undefined || visible.stale || visible.node.data.kind !== 'dto' || !visible.node.data.dto.hasDetails) {
+			return;
+		}
+
+		const { dto, handle } = visible.node.data;
+		// Built before the fetch: rows above can come and go while it's in flight (a group expanded,
+		// a refresh landing), and rowIndex would then name some other row.
+		const target = this._detailsTarget(rowIndex, dto);
+		const request = ++this._detailsRequestCount;
+		try {
+			const details = await handle.nodeGetDetails(dto.nodeHandle);
+			// A slow fetch (a semantic view's GET_DDL resuming a warehouse) can be overtaken by a
+			// click on another node whose details arrive first. A preview-mode result that has been
+			// overtaken is dropped, or it would replace the newer preview with a node the tree no
+			// longer has selected. A pinned open was asked for outright, so it always lands.
+			if (!pinned && request !== this._detailsRequestCount) {
+				return;
+			}
+			await openDataConnectionNodeDetails(this._editorService, target, details, pinned);
+		} catch (error) {
+			this._notificationService.error(localize(
+				'positron.dataConnections.showDetailsFailed',
+				"Could not show the details of '{0}': {1}",
+				dto.name,
+				error instanceof Error ? error.message : String(error)
+			));
+		}
+	}
+
+	/**
+	 * Drops any preview-mode details still on their way, so they don't open over what the user has
+	 * opened since -- the Data Explorer a double-click opens, whose first click started fetching the
+	 * node's details. Details tabs open active, so ones that arrived after the Data Explorer would
+	 * cover it. A pinned open still lands: it was asked for outright.
+	 */
+	dropPendingDetails(): void {
+		this._detailsRequestCount++;
+	}
+
+	/**
+	 * Keeps the node at a row's details tab open, taking it out of preview mode. When the tab is
+	 * already open its details are current, so it is pinned as it is; otherwise the details are
+	 * fetched and opened pinned.
+	 * @param rowIndex The index of the row.
+	 */
+	async pinNodeDetails(rowIndex: number): Promise<void> {
+		const visible = this.visibleNodes[rowIndex];
+		if (visible === undefined || visible.node.data.kind !== 'dto') {
+			return;
+		}
+		const target = this._detailsTarget(rowIndex, visible.node.data.dto);
+		if (!await pinDataConnectionNodeDetails(this._editorService, target.key)) {
+			await this.openNodeDetails(rowIndex, true);
+		}
+	}
+
+	/**
+	 * Builds the details target for the DTO node at a row by walking up to its connection entry.
+	 * Group rows ("Tables", "Metrics") are left out of the key and the breadcrumb names -- they only
+	 * label the rows under them, and the kind in each node's reload key already tells same-named
+	 * siblings of different kinds apart -- but kept in the node path, so a reveal can walk it.
+	 * @param rowIndex The index of the row.
+	 * @param dto The DTO node at the row.
+	 */
+	private _detailsTarget(rowIndex: number, dto: IDataConnectionNodeDTO): IDataConnectionNodeDetailsTarget {
+		// The rows from the connection down to this one.
+		const chain: DataConnectionNode[] = [];
+		for (let index: number | undefined = rowIndex; index !== undefined; index = findParentIndex(this.visibleNodes, index)) {
+			chain.unshift(this.visibleNodes[index].node.data);
+		}
+
+		// The key and the breadcrumb names leave the group rows out; the node path keeps them, so
+		// the tree can walk it back without searching.
+		const keys: string[] = [];
+		const path: string[] = [];
+		const nodePath: string[] = [];
+		const breadcrumbNodePathLengths: number[] = [];
+		let profileId = '';
+		for (const data of chain) {
+			if (data.kind === 'entry') {
+				keys.push(reloadKey(data));
+				path.push(data.entry.profile.connectionName);
+				breadcrumbNodePathLengths.push(0);
+				profileId = data.entry.profile.id;
+				continue;
+			}
+			nodePath.push(reloadKey(data));
+			if (!CONTAINER_ONLY_KINDS.has(data.dto.kind)) {
+				keys.push(reloadKey(data));
+				path.push(data.dto.name);
+				breadcrumbNodePathLengths.push(nodePath.length);
+			}
+		}
+
+		return { key: JSON.stringify(keys), name: dto.name, icon: kindIcon(dto), path, profileId, nodePath, breadcrumbNodePathLengths, canPreview: canPreview(dto) };
+	}
+
+	private _findEntryNode(id: string): { entry: DataConnectionEntry } | undefined {
+		const visible = this.visibleNodes.find(v => v.node.id === id);
+		if (visible === undefined) {
+			return undefined;
+		}
+		const data = visible.node.data;
+		return data.kind === 'entry' ? { entry: data.entry } : undefined;
+	}
+}
+
+/**
+ * Builds the entries from the service's current catalog + instance collections. One entry per
+ * profile -- saved first, then discovered, an ordering getAllProfiles owns -- with the entry's
+ * instance set when a live connection exists for that profile.
+ */
+function buildEntries(service: IPositronDataConnectionsService): DataConnectionEntry[] {
+	return service.getAllProfiles().map(profile => ({
+		profile,
+		instance: service.getInstanceForProfile(profile.id),
+	}));
+}

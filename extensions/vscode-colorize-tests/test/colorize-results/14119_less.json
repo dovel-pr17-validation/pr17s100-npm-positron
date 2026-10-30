@@ -1,0 +1,254 @@
+[
+	{
+		"c": "#",
+		"t": "source.css.less meta.selector.less entity.other.attribute-name.id.less punctuation.definition.entity.less",
+		"r": {
+			"hc_black": "source.css.less entity.other.attribute-name.id: #D7BA7D",
+			"2026-light": "source.css.less entity.other.attribute-name.id: #800000",
+			"2026-dark": "source.css.less entity.other.attribute-name.id: #D7BA7D",
+			"positron_dark": "source.css.less entity.other.attribute-name.id: #D7BA7D",
+			"positron_light": "source.css.less entity.other.attribute-name.id: #800000",
+			"hc_light": "source.css.less entity.other.attribute-name.id: #0F4A85"
+		}
+	},
+	{
+		"c": "f",
+		"t": "source.css.less meta.selector.less entity.other.attribute-name.id.less",
+		"r": {
+			"hc_black": "source.css.less entity.other.attribute-name.id: #D7BA7D",
+			"2026-light": "source.css.less entity.other.attribute-name.id: #800000",
+			"2026-dark": "source.css.less entity.other.attribute-name.id: #D7BA7D",
+			"positron_dark": "source.css.less entity.other.attribute-name.id: #D7BA7D",
+			"positron_light": "source.css.less entity.other.attribute-name.id: #800000",
+			"hc_light": "source.css.less entity.other.attribute-name.id: #0F4A85"
+		}
+	},
+	{
+		"c": "(",
+		"t": "source.css.less meta.selector.less meta.group.less punctuation.definition.group.begin.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": "@",
+		"t": "source.css.less meta.selector.less meta.group.less meta.property-value.less variable.other.readwrite.less punctuation.definition.variable.less",
+		"r": {
+			"hc_black": "source.css variable: #D4D4D4",
+			"2026-light": "variable.other: #1F2328",
+			"2026-dark": "variable.other: #C9D1D9",
+			"positron_dark": "source.css variable: #9CDCFE",
+			"positron_light": "source.css variable: #E50000",
+			"hc_light": "source.css variable: #264F78"
+		}
+	},
+	{
+		"c": "hm",
+		"t": "source.css.less meta.selector.less meta.group.less meta.property-value.less variable.other.readwrite.less support.other.variable.less",
+		"r": {
+			"hc_black": "source.css variable: #D4D4D4",
+			"2026-light": "support: #0550AE",
+			"2026-dark": "support: #79C0FF",
+			"positron_dark": "source.css variable: #9CDCFE",
+			"positron_light": "source.css variable: #E50000",
+			"hc_light": "source.css variable: #264F78"
+		}
+	},
+	{
+		"c": ":",
+		"t": "source.css.less meta.selector.less meta.group.less meta.property-value.less punctuation.separator.key-value.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": " ",
+		"t": "source.css.less meta.selector.less meta.group.less meta.property-value.less meta.property-value.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": "\"",
+		"t": "source.css.less meta.selector.less meta.group.less meta.property-value.less string.quoted.double.less punctuation.definition.string.begin.less",
+		"r": {
+			"hc_black": "string: #CE9178",
+			"2026-light": "string: #0A3069",
+			"2026-dark": "string: #A5D6FF",
+			"positron_dark": "string: #CE9178",
+			"positron_light": "string: #A31515",
+			"hc_light": "string: #0F4A85"
+		}
+	},
+	{
+		"c": "broken highlighting in VS Code",
+		"t": "source.css.less meta.selector.less meta.group.less meta.property-value.less string.quoted.double.less",
+		"r": {
+			"hc_black": "string: #CE9178",
+			"2026-light": "string: #0A3069",
+			"2026-dark": "string: #A5D6FF",
+			"positron_dark": "string: #CE9178",
+			"positron_light": "string: #A31515",
+			"hc_light": "string: #0F4A85"
+		}
+	},
+	{
+		"c": "\"",
+		"t": "source.css.less meta.selector.less meta.group.less meta.property-value.less string.quoted.double.less punctuation.definition.string.end.less",
+		"r": {
+			"hc_black": "string: #CE9178",
+			"2026-light": "string: #0A3069",
+			"2026-dark": "string: #A5D6FF",
+			"positron_dark": "string: #CE9178",
+			"positron_light": "string: #A31515",
+			"hc_light": "string: #0F4A85"
+		}
+	},
+	{
+		"c": ")",
+		"t": "source.css.less meta.selector.less meta.group.less punctuation.definition.group.end.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": " ",
+		"t": "source.css.less meta.selector.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": "{",
+		"t": "source.css.less meta.property-list.less punctuation.definition.block.begin.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": "    ",
+		"t": "source.css.less meta.property-list.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": "content",
+		"t": "source.css.less meta.property-list.less support.type.property-name.less",
+		"r": {
+			"hc_black": "support.type.property-name: #D4D4D4",
+			"2026-light": "support.type.property-name: #E50000",
+			"2026-dark": "support.type.property-name: #9CDCFE",
+			"positron_dark": "support.type.property-name: #9CDCFE",
+			"positron_light": "support.type.property-name: #E50000",
+			"hc_light": "support.type.property-name: #264F78"
+		}
+	},
+	{
+		"c": ":",
+		"t": "source.css.less meta.property-list.less punctuation.separator.key-value.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": " ",
+		"t": "source.css.less meta.property-list.less meta.property-value.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": "\"",
+		"t": "source.css.less meta.property-list.less meta.property-value.less string.quoted.double.less punctuation.definition.string.begin.less",
+		"r": {
+			"hc_black": "string: #CE9178",
+			"2026-light": "string: #0A3069",
+			"2026-dark": "string: #A5D6FF",
+			"positron_dark": "string: #CE9178",
+			"positron_light": "string: #A31515",
+			"hc_light": "string: #0F4A85"
+		}
+	},
+	{
+		"c": "\"",
+		"t": "source.css.less meta.property-list.less meta.property-value.less string.quoted.double.less punctuation.definition.string.end.less",
+		"r": {
+			"hc_black": "string: #CE9178",
+			"2026-light": "string: #0A3069",
+			"2026-dark": "string: #A5D6FF",
+			"positron_dark": "string: #CE9178",
+			"positron_light": "string: #A31515",
+			"hc_light": "string: #0F4A85"
+		}
+	},
+	{
+		"c": ";",
+		"t": "source.css.less meta.property-list.less punctuation.terminator.rule.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	},
+	{
+		"c": "}",
+		"t": "source.css.less punctuation.definition.block.end.less",
+		"r": {
+			"hc_black": "default: #FFFFFF",
+			"2026-light": "default: #202020",
+			"2026-dark": "default: #BBBEBF",
+			"positron_dark": "default: #CCCCCC",
+			"positron_light": "default: #3B3B3B",
+			"hc_light": "default: #292929"
+		}
+	}
+]

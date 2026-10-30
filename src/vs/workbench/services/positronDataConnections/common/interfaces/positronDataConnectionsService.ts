@@ -1,0 +1,418 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { Event } from '../../../../../base/common/event.js';
+import { IDisposable } from '../../../../../base/common/lifecycle.js';
+import { IDataConnectionInstance } from './dataConnectionInstance.js';
+import { createDecorator } from '../../../../../platform/instantiation/common/instantiation.js';
+import { DataConnectionNodeKind, DataConnectionParameterValues, IDataConnectionHandle, IDataConnectionProfile } from './dataConnectionDriver.js';
+import { IDataConnectionsDriverManager } from './dataConnectionsDriverManager.js';
+
+// DI token used to inject IPositronDataConnectionsService throughout the workbench.
+export const IPositronDataConnectionsService = createDecorator<IPositronDataConnectionsService>('positronDataConnectionsService');
+
+// Id of the Data Connections view. Lives here rather than with the view registration so the
+// service can open its own view, matching POSITRON_CONNECTIONS_VIEW_ID in the older service.
+export const POSITRON_DATA_CONNECTIONS_VIEW_ID = 'workbench.panel.positronDataConnections';
+
+/**
+ * One level of a reveal path: what the pane calls the row, and which kind of row it is.
+ *
+ * A path is named rather than addressed by node id because a node's id embeds the handle it was
+ * fetched under, and a fresh fetch mints new handles. Kind and name are what survive.
+ */
+export interface IDataConnectionNodeStep {
+	readonly kind: DataConnectionNodeKind;
+
+	readonly name: string;
+}
+
+/**
+ * A request to reveal one row of a connection's tree: expand down to it, select it, scroll it
+ * into view. Raised by {@link IPositronDataConnectionsService.revealNode}.
+ */
+export interface IDataConnectionNodeRevealRequest {
+	// The profile whose tree holds the row.
+	readonly profileId: string;
+
+	// The row's path from the connection down. Display-only grouping rows ("Tables", "Columns")
+	// are left out; the walk descends through them on its own.
+	readonly path: readonly IDataConnectionNodeStep[];
+}
+
+/**
+ * Where in a connection a reveal should go (see IPositronDataConnectionsService.revealConnection).
+ */
+export interface IDataConnectionRevealOptions {
+	// The node to go to, as the reload key (see nodeReloadKey) of each row on the way down from the
+	// connection, group rows ("Tables", "Metrics") included. Empty or absent for the connection
+	// itself.
+	readonly nodePath?: readonly string[];
+
+	// Whether to open the node's details once it is revealed, when it has any.
+	readonly openDetails?: boolean;
+
+	// Whether to leave keyboard focus where it is rather than move it to the revealed row -- for a
+	// request made from somewhere the user is still reading, such as a details editor's breadcrumbs.
+	readonly preserveFocus?: boolean;
+}
+
+/**
+ * An outstanding reveal request: the connection, and where in it to go.
+ */
+export interface IDataConnectionRevealRequest extends IDataConnectionRevealOptions {
+	readonly profileId: string;
+}
+
+/**
+ * Opens a node in the Data Explorer given only its path below its connection, for a caller that
+ * holds the path rather than the node's live handle, as a details editor does. Implemented by the
+ * Data Connections pane's tree, which holds the connections' live nodes, and registered with the
+ * service for as long as the tree exists (see IPositronDataConnectionsService.registerNodeOpener).
+ */
+export interface IDataConnectionNodeOpener {
+	/**
+	 * Opens the node at a path below a connection in the Data Explorer, connecting if need be, and
+	 * reports any failure itself: that the node is no longer there, or that it couldn't be opened.
+	 * @param profileId The id of the connection's profile.
+	 * @param nodePath The reload key (see nodeReloadKey) of each row on the way down from the
+	 * connection to the node, group rows included.
+	 * @param name The node's name, for reporting a failure.
+	 */
+	openInDataExplorer(profileId: string, nodePath: readonly string[], name: string): Promise<void>;
+}
+
+/**
+ * Service that manages data connection drivers and active data connection instances. Drivers are
+ * registered by extensions via the ext host RPC pipeline; the UI consumes this service to list
+ * drivers, connect, browse schema trees, and so on.
+ */
+export interface IPositronDataConnectionsService extends IDisposable {
+	// Required by the DI system to make this interface structurally unique.
+	readonly _serviceBrand: undefined;
+
+	// Manages registered data connection drivers (register, remove, list, change events).
+	readonly driverManager: IDataConnectionsDriverManager;
+
+	// Fires when data connection profiles change.
+	onDidChangeProfiles: Event<IDataConnectionProfile[]>;
+
+	// Fires when data connection instances change.
+	onDidChangeInstances: Event<IDataConnectionInstance[]>;
+
+	// Fires when the discovered data connections change.
+	onDidChangeDiscoveredProfiles: Event<IDataConnectionProfile[]>;
+
+	// Fires when something has asked for a row of a connection's tree to be revealed.
+	onDidRequestReveal: Event<IDataConnectionNodeRevealRequest>;
+
+	// Fires when a connection should be shown in the Data Connections pane. A nudge, not the
+	// request itself: the profile to show comes from takePendingRevealConnection, so the tree
+	// honors a request the same way whether it was already listening or has just been built.
+	onDidRequestRevealConnection: Event<void>;
+
+	/**
+	 * Asks the Data Connections pane to show a connection: select it, and open it so its contents
+	 * can be browsed. Called by anything outside the pane that has just put the user's attention on
+	 * one connection in particular -- the database file editor, after creating or opening one -- or on
+	 * a node within one: a breadcrumb in a node's details editor.
+	 *
+	 * With a node path, the pane also opens its way down to that node and selects it instead,
+	 * stopping at the deepest node it can still find if the path no longer matches the tree. With
+	 * openDetails, it then opens the node's details, when the node has any.
+	 *
+	 * Revealing the connection does not open the pane; a caller that needs the pane open does that
+	 * first (IViewsService.openView) and then calls this. Because the pane's tree is built as the
+	 * pane renders, which happens after openView resolves, the request is also recorded for a tree
+	 * that appears in a moment -- see {@link takePendingRevealConnection} -- so a caller doesn't
+	 * have to race it.
+	 * @param profileId The id of the profile to show.
+	 * @param options Where in the connection to go, and whether to open that node's details.
+	 */
+	revealConnection(profileId: string, options?: IDataConnectionRevealOptions): void;
+
+	/**
+	 * Takes the outstanding reveal request, if there is one, clearing it. Called by the pane's tree
+	 * when it is built, so a request made while the pane was still opening is honored by the tree
+	 * that arrives rather than lost. Subsequent requests reach a live tree through
+	 * {@link onDidRequestRevealConnection} instead.
+	 * @returns The request, or undefined if no request is outstanding.
+	 */
+	takePendingRevealConnection(): IDataConnectionRevealRequest | undefined;
+
+	/**
+	 * Registers the Data Connections pane's tree as the opener of nodes by their path, for as long as
+	 * the tree exists. A later registration replaces an earlier one.
+	 * @param opener The opener.
+	 * @returns A disposable that unregisters the opener.
+	 */
+	registerNodeOpener(opener: IDataConnectionNodeOpener): IDisposable;
+
+	/**
+	 * Whether the pane's tree is there to open nodes by their path. The tree lives as long as its
+	 * pane does, whether or not the pane is showing, so there is none only when the pane hasn't been
+	 * opened in this window or was closed since. A caller opens it (IViewsService.openView) before
+	 * calling {@link openNodeInDataExplorer} in that case.
+	 */
+	hasNodeOpener(): boolean;
+
+	/**
+	 * Opens the node at a path below a connection in the Data Explorer, through the pane's tree
+	 * (see {@link IDataConnectionNodeOpener.openInDataExplorer}), which reports any failure itself.
+	 * When there is no tree yet -- a pane opened just now builds its tree as it renders -- waits a
+	 * moment for one, rather than leaving the request behind for whenever one arrives.
+	 * @param profileId The id of the connection's profile.
+	 * @param nodePath The reload key of each row on the way down from the connection to the node.
+	 * @param name The node's name, for reporting a failure.
+	 * @returns Whether a tree was there to open the node; false when none arrived in time.
+	 */
+	openNodeInDataExplorer(profileId: string, nodePath: readonly string[], name: string): Promise<boolean>;
+
+	/**
+	 * Gets the connections drivers report as already configured on this machine (e.g. ODBC data
+	 * sources), as ephemeral profiles. These are not persisted and are never returned by
+	 * {@link getProfiles}. A discovery the user has already saved is omitted, so a data source the
+	 * user has configured appears once. Two things suppress a discovery: the saved profile records
+	 * which discovery it was saved from (see {@link saveDiscoveredProfile}), which survives renaming
+	 * and editing it; and, for a connection the user configured by hand instead, a match on driver,
+	 * mechanism, name, and values. The name is part of that match because the secret values that
+	 * would otherwise distinguish two same-shaped data sources are held out of both profiles, so
+	 * without it, saving either one would hide both.
+	 * Like a saved profile's, the returned profiles' parameterValues never contain values the
+	 * mechanism declares secret; those are held internally and merged back by
+	 * {@link getProfileWithSecrets}.
+	 * @returns The discovered data connection profiles.
+	 */
+	getDiscoveredProfiles(): readonly IDataConnectionProfile[];
+
+	/**
+	 * Gets the full connection catalog: every saved profile followed by every discovered
+	 * connection. The single owner of the "saved first, discovered after" ordering that the pane
+	 * and the payload commands both present -- a user's own saved connections keep the top, since
+	 * on a machine with a large odbc.ini the discoveries can outnumber them several times over.
+	 * Which discoveries are dropped is {@link getDiscoveredProfiles}'s to decide.
+	 * @returns The saved profiles followed by the discovered profiles.
+	 */
+	getAllProfiles(): readonly IDataConnectionProfile[];
+
+	/**
+	 * Saves a discovered connection as an ordinary profile, so it persists across sessions and can
+	 * be edited and removed. The discovered entry stops being reported separately once saved: the
+	 * saved profile records the discovery it came from. A no-op if the id is not a current
+	 * discovery.
+	 * @param id The discovered profile id.
+	 * @returns The id of the saved profile, or undefined if the discovery was not found.
+	 */
+	saveDiscoveredProfile(id: string): string | undefined;
+
+	/**
+	 * Adds or updates a data connection profile. An edit that changes a value the profile's live
+	 * connection was opened with closes that connection, since it no longer represents the profile;
+	 * {@link wouldCloseConnection} reports that in advance.
+	 * @param profile The data connection profile to add or update.
+	 */
+	addUpdateProfile(profile: IDataConnectionProfile): void;
+
+	/**
+	 * Whether saving the given profile would close its live connection: true when a connection is
+	 * open and the edit changes a value it was opened with. Use it to warn the user before a save
+	 * takes their Data Explorers down with the connection.
+	 * @param profile The edited data connection profile, as it would be passed to addUpdateProfile.
+	 */
+	wouldCloseConnection(profile: IDataConnectionProfile): boolean;
+
+	/**
+	 * Gets all saved data connection profiles.
+	 * @returns The data connection profiles array.
+	 */
+	getProfiles(): readonly IDataConnectionProfile[];
+
+	/**
+	 * Gets a data connection profile by id. The returned profile's parameterValues never contains
+	 * secret parameter values; use {@link getProfileWithSecrets} when those values are required.
+	 * @param id The data connection profile id.
+	 * @returns The matching data connection profile, or undefined if not found.
+	 */
+	getProfile(id: string): IDataConnectionProfile | undefined;
+
+	/**
+	 * Gets a data connection profile by id with its secret parameter values pulled from secret
+	 * storage. Callers should use it for an immediate operation and drop the reference right
+	 * afterward, not retain it.
+	 * @param id The data connection profile id.
+	 * @returns The matching data connection profile, or undefined if not found.
+	 */
+	getProfileWithSecrets(id: string): Promise<IDataConnectionProfile | undefined>;
+
+	/**
+	 * Gets the parameter ids for which a secret value is stored on the given profile, without
+	 * loading the values themselves. Used by the edit dialog to render a "saved" placeholder
+	 * for secret fields that already have a value, distinguishing them from never-set ones.
+	 * @param id The data connection profile id.
+	 * @returns The list of parameter ids with stored secrets. Empty if the profile has no
+	 * stored secrets (or no longer exists).
+	 */
+	getProfileSecretIds(id: string): readonly string[];
+
+	/**
+	 * Gets display-safe, redacted forms of stored secret parameter values, for showing as
+	 * placeholders when editing an existing connection (e.g. a connection string with its password
+	 * masked). The cleartext values are resolved from secret storage and passed to the driver, which
+	 * performs the format-specific redaction; only the redacted results are returned. The cleartext
+	 * is never exposed to callers. Resolves the profile once for all requested parameters, so
+	 * redacting M secrets costs one profile/secret-storage fetch rather than M.
+	 * @param id The data connection profile id.
+	 * @param parameterIds The ids of the secret parameters to redact.
+	 * @returns A map of parameter id to its redacted string. A parameter is omitted when it has no
+	 * stored value or the driver does not implement redaction.
+	 */
+	getRedactedParameterValues(id: string, parameterIds: readonly string[]): Promise<Record<string, string>>;
+
+	/**
+	 * Gets the profile's full parameter values in display-safe form, for showing the connection to
+	 * something other than the user who configured it (the agent-facing connection catalog). Every
+	 * parameter is offered to the driver for redaction, not only the ones the mechanism declares
+	 * secret, because a credential can sit inside an ordinary `string` parameter -- an ODBC
+	 * connection string embedding `PWD=` -- and only the driver knows its own formats. A value the
+	 * driver redacts appears in its redacted form; a value it does not is passed through when the
+	 * parameter is non-secret, and omitted when it is secret.
+	 *
+	 * When the driver or mechanism cannot be resolved, nothing can be redacted, so this falls back
+	 * to the profile's own secret-free parameterValues rather than risking a cleartext passthrough.
+	 *
+	 * Takes the profile rather than its id so a caller iterating a catalog snapshot gets the values
+	 * of the profile it is rendering. Discovered profiles come and go as drivers refresh discovery,
+	 * and an id looked up again after an await can already be gone.
+	 * @param profile The data connection profile.
+	 * @returns The display-safe parameter values.
+	 */
+	getDisplayParameterValues(profile: IDataConnectionProfile): Promise<DataConnectionParameterValues>;
+
+	/**
+	 * Sets the user's preferred connection code variant for a profile and language, persisted
+	 * across sessions. Used to initialize the variant selector in the Connect With dialog, and by
+	 * the getConnections command to report the profile's chosen package per language. A no-op if
+	 * the profile is not found.
+	 * @param profileId The data connection profile id.
+	 * @param languageId The language id the variant applies to (e.g. 'python', 'r').
+	 * @param variantId The id of the preferred variant, from the driver's generateConnectionCode results.
+	 */
+	setPreferredCodeVariant(profileId: string, languageId: string, variantId: string): void;
+
+	/**
+	 * Removes a data connection profile, deleting its persisted settings and stored secrets. Also
+	 * closes anything still using it: the Data Explorers previewed from its connection, and then the
+	 * connection itself, since a removed profile leaves no UI to manage a connection from. Callers
+	 * should confirm with the user first -- none of this is recoverable.
+	 * @param id The data connection profile id to remove.
+	 */
+	removeProfile(id: string): void;
+
+	/**
+	 * Opens a connection for the given profile. Looks up the driver, resolves the profile's
+	 * secret parameter values, calls driver.connect(), and registers the resulting instance.
+	 * If a live instance for this profile already exists, returns it without re-connecting.
+	 * @param profileId The data connection profile id to connect.
+	 * @returns The live data connection instance.
+	 * @throws If the profile is not found, the driver is not registered, or driver.connect() fails.
+	 */
+	connect(profileId: string): Promise<IDataConnectionInstance>;
+
+	/**
+	 * Closes the live connection for the given profile (if one exists). Calls disconnect() on
+	 * the underlying handle, releases ext host resources, and removes the instance from the
+	 * service. No-op if no instance exists for the profile.
+	 *
+	 * The Data Explorers previewed from the connection close with it: their backends die with the
+	 * connection, so leaving one open would leave a grid that errors on the next scroll or filter.
+	 * Use {@link disconnectWhenUnused} instead to give up a connection without cutting those off.
+	 * @param profileId The data connection profile id to disconnect.
+	 */
+	disconnect(profileId: string): Promise<void>;
+
+	/**
+	 * Previews a node in the Data Explorer, recording the dataset id the driver opened it under
+	 * against the connection's profile so {@link countOpenDataExplorers} can report it later. Callers
+	 * should preview through this method rather than calling handle.nodePreview() directly, so no
+	 * Data Explorer goes unrecorded.
+	 * @param handle The connection handle the node belongs to.
+	 * @param nodeHandle The handle of the node to preview.
+	 * @returns The dataset id the preview was opened under, or undefined if the driver reported none.
+	 */
+	previewNode(handle: IDataConnectionHandle, nodeHandle: number): Promise<string | undefined>;
+
+	/**
+	 * Gets how many Data Explorers are open on data previewed from the given profile's connection.
+	 * Counts only previews the driver reported a dataset id for, and only those whose editor is still
+	 * open -- the user closing a Data Explorer tab brings the count back down.
+	 * @param profileId The data connection profile id.
+	 */
+	countOpenDataExplorers(profileId: string): number;
+
+	/**
+	 * Gets the profile of the connection a dataset was previewed from.
+	 * @param datasetId The dataset id the preview was opened under.
+	 * @returns The profile, or undefined if the dataset wasn't previewed from a live connection.
+	 */
+	getProfileForDataset(datasetId: string): IDataConnectionProfile | undefined;
+
+	/**
+	 * Closes the profile's connection as soon as nothing is using it: right away when it has no open
+	 * Data Explorers, otherwise once the last one is closed. Lets a caller give up its own use of a
+	 * connection without cutting off the Data Explorers still reading from it. No-op if the profile
+	 * has no live connection. Cancel a pending close with {@link cancelDisconnectWhenUnused}.
+	 * @param profileId The data connection profile id.
+	 */
+	disconnectWhenUnused(profileId: string): void;
+
+	/**
+	 * Cancels a pending {@link disconnectWhenUnused} for the profile, keeping its connection open.
+	 * Call this when the connection is wanted again (e.g. the user re-expanded it). No-op if no close
+	 * is pending.
+	 * @param profileId The data connection profile id.
+	 */
+	cancelDisconnectWhenUnused(profileId: string): void;
+
+	/**
+	 * Asks the pane to reveal a row of a connection's tree, opening the view first.
+	 *
+	 * Only meaningful for a profile with a live connection: walking to a row fetches each level
+	 * from the driver, and a caller reaching in from outside the pane -- a link in a SQL editor,
+	 * say -- should not be able to open a database connection as a side effect of a click.
+	 *
+	 * The request is held until the pane picks it up, since the view may not have been rendered
+	 * yet when this is called; see {@link takePendingReveal}.
+	 * @param request The row to reveal.
+	 */
+	revealNode(request: IDataConnectionNodeRevealRequest): Promise<void>;
+
+	/**
+	 * Takes the reveal request the pane has not handled yet, if any, clearing it.
+	 *
+	 * For the pane to call on mount: a reveal that opened the view arrives before anything is
+	 * listening, so the request waits here rather than being lost. Returns undefined once
+	 * consumed, so one request is never acted on twice.
+	 */
+	takePendingReveal(): IDataConnectionNodeRevealRequest | undefined;
+
+	/**
+	 * Gets all data connection instances.
+	 * @returns The data connection instances array.
+	 */
+	getInstances(): IDataConnectionInstance[];
+
+	/**
+	 * Gets a data connection instance by id.
+	 * @param id The data connection instance id.
+	 * @returns The matching instance, or undefined if not found.
+	 */
+	getInstance(id: string): IDataConnectionInstance | undefined;
+
+	/**
+	 * Gets the live data connection instance for the given profile, or undefined if none exists.
+	 * @param profileId The data connection profile id.
+	 */
+	getInstanceForProfile(profileId: string): IDataConnectionInstance | undefined;
+}

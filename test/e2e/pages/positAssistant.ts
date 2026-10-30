@@ -1,0 +1,970 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2025-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { expect, FrameLocator, Locator } from '@playwright/test';
+import { Code } from '../infra/code';
+import { Toasts } from './dialog-toasts';
+import { HotKeys } from './hotKeys';
+
+// Webview frame selectors (Posit Assistant renders inside a VS Code webview)
+const OUTER_FRAME = '.webview';
+const INNER_FRAME = '#active-frame';
+
+// Activity bar button and sidebar view
+const ACTIVITY_BAR_BUTTON = 'a.action-label[aria-label="Posit Assistant"]';
+
+// Header buttons.
+// The new-chat button is scoped to the top bar because the conversation tab
+// strip and the vertical tab rail contribute their own new-conversation buttons
+// (`aria-label="New conversation tab"` and `aria-label="New conversation"`).
+// An unscoped selector goes strict-mode ambiguous as soon as that tab chrome
+// renders in the Positron panel.
+// Match on the aria-label, not the icon: assistant#2751 swapped the top bar's
+// lucide `Plus` for a custom speech-bubble icon that has no `lucide-plus` class.
+const NEW_CHAT_BUTTON = '[data-slot="topbar"] button[aria-label="New conversation"]';
+const HISTORY_BUTTON = 'button:has(svg.lucide-history)';
+const MORE_BUTTON = 'button:has(svg.lucide-ellipsis):has(.sr-only:text("More"))';
+const SETTINGS_BUTTON = 'button:has(svg.lucide-settings):has(.sr-only:text("Settings"))';
+
+// Workspace trust dialog
+const TRUST_DIALOG = '[role="dialog"]:has(h2:has-text("Do you trust this workspace?"))';
+const TRUST_BUTTON = 'button.bg-primary:has-text("Trust this workspace")';
+
+// Welcome/landing page elements
+const WELCOME_TITLE = '.text-4xl:has-text("Posit Assistant")';
+// How long the greeting must stay on screen before startNewConversation trusts
+// that a persisted conversation is not about to be restored over it.
+const NEW_CONVERSATION_SETTLE_MS = 1000;
+
+// Chat input area.
+// Posit Assistant migrated the chat input from a <textarea> to a TipTap/ProseMirror
+// rich-text editor: a contenteditable <div class="tiptap-input-editor">. The
+// placeholder is no longer a `placeholder` attribute -- it renders as a separate
+// aria-hidden overlay -- so target the editor element by its class instead.
+const CHAT_INPUT = '.tiptap-input-editor';
+const SEND_BUTTON = 'button:has(svg.lucide-arrow-up)';
+const STOP_BUTTON = 'button:has(svg.lucide-square)';
+
+// Chat-form overflow (...) menu — hosts the model picker for providers
+// (like OpenAI) that do not auto-select a default model.
+const CHAT_FORM_OVERFLOW_BUTTON = '.chat-form button[aria-haspopup="menu"]:has(svg.lucide-ellipsis)';
+
+// Model picker containers. The picker renders in two width-dependent modes
+// (see selectProviderModel): a flat radio group when inline, and per-provider
+// group containers when collapsed into the overflow (...) menu.
+const MODEL_RADIO_GROUP = '[data-slot="dropdown-menu-radio-group"]';
+const MODEL_MENU_GROUP = '[data-slot="dropdown-menu-group"]';
+// The inline model-picker trigger.
+const INLINE_MODEL_TRIGGER = '[data-testid="model-selector"]';
+
+/**
+ * Maps an e2e provider id to the provider's display name as shown in the model
+ * picker's group headers. Sourced from the assistant's provider registry
+ * (packages/core/src/platform/provider-registry.ts).
+ */
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+	'anthropic': 'Anthropic',
+	'bedrock': 'AWS Bedrock',
+	'databricks': 'Databricks',
+	'openai': 'OpenAI',
+	'ms-foundry': 'Microsoft Foundry',
+	'positai': 'Posit AI Pass',
+	'snowflake-cortex': 'Snowflake Cortex',
+};
+
+/**
+ * Older display names a provider's group header may still carry, matched in
+ * addition to the canonical name above.
+ *
+ * A rename lands in the assistant's provider registry well before it ships in a
+ * published release. Most suites run the bootstrapped release pinned in
+ * `product.json`, while `posit-assistant.test.ts` and `posit-assistant-mcp.test.ts`
+ * float their machine to the latest dev build, so which name a suite sees depends
+ * on which specs shared its runner. Both have to match until the rename ships.
+ *
+ * Drop an entry once `product.json` pins an assistant release that carries the
+ * new name.
+ */
+const PROVIDER_DISPLAY_NAME_ALIASES: Record<string, string[]> = {
+	// Renamed to "Posit AI Pass" in the assistant's provider registry after the
+	// bootstrapped 1.2.0 release; mirrored here in #15858.
+	'positai': ['Posit AI'],
+	// Renamed from "AWS Bedrock" in the assistant's provider registry after the
+	// bootstrapped 1.9.0 release (posit-dev/assistant#2842).
+	'bedrock': ['Amazon Bedrock'],
+};
+
+/**
+ * Builds a selector list matching `template` for every display name a provider
+ * may render, so a single locator covers the canonical name and its aliases.
+ */
+function providerNameSelector(providerNames: string[], template: (name: string) => string): string {
+	return providerNames.map(template).join(', ');
+}
+
+// Chat message elements
+const CHAT_MESSAGE_USER = '.chat-message-user';
+const CHAT_MESSAGE_ASSISTANT = '.chat-message-assistant';
+const CHAT_MESSAGE_CONTENT = '.message-content';
+
+// Inline plot image
+const INLINE_PLOT = '.chat-messages img[alt^="Plot"]';
+
+// Code block elements
+const CODE_BLOCK = '.monaco-editor[role="code"]';
+const CODE_BLOCK_COPY_BUTTON = 'button[aria-label="Copy"]';
+const CODE_BLOCK_INSERT_CURSOR_BUTTON = 'button[aria-label="Insert At Cursor"]';
+const CODE_BLOCK_INSERT_FILE_BUTTON = 'button[aria-label="Insert into New File"]';
+
+// Tool confirmation UI
+// `.bg-warning` alone also matches the legacy-config and restricted-mode banners.
+const TOOL_CONFIRM_CARD = '.bg-warning.border-warning-border';
+const TOOL_ALLOW_BUTTON = 'button.rounded-r-none:has-text("Allow")';
+const TOOL_ALLOW_DROPDOWN_TRIGGER = 'button[aria-label="More allow options"]';
+const TOOL_ALLOW_SESSION_MENU_ITEM = '[role="menuitem"]:has-text("for this session")';
+const TOOL_DECLINE_BUTTON = 'button.rounded-r-none:has-text("Decline")';
+
+// Tool result accordion (rendered in the transcript after a tool runs)
+const TOOL_RESULT_ACCORDION_ITEM = '[data-slot="accordion-item"]';
+
+/** Posit Assistant qualifies MCP tool names as `mcp__<server>__<tool>` in the UI. */
+function mcpToolId(server: string, tool: string): string {
+	return `mcp__${server}__${tool}`;
+}
+
+/**
+ * Page object for the Posit Assistant extension.
+ * Posit Assistant is an AI chat assistant that renders inside a VS Code webview,
+ * so most element access requires navigating through nested iframes.
+ */
+export class PositAssistant {
+
+	constructor(private code: Code) { }
+
+	/**
+	 * Gets the frame locator for the Posit Assistant webview content.
+	 * All UI elements live inside this nested iframe.
+	 */
+	get frame(): FrameLocator {
+		return this.code.driver.currentPage.frameLocator(OUTER_FRAME).frameLocator(INNER_FRAME);
+	}
+
+	/**
+	 * Ensures the Posit Assistant sidebar view is open.
+	 * Clicks the activity bar icon if it is not already selected.
+	 */
+	async open(): Promise<void> {
+		const button = this.code.driver.currentPage.locator(ACTIVITY_BAR_BUTTON);
+		const isSelected = await button.locator('..').getAttribute('aria-selected');
+		if (isSelected !== 'true') {
+			await button.click();
+		}
+		await this.expectViewOpen();
+	}
+
+	/**
+	 * Assert the Posit Assistant view is the active view in the sidebar by checking
+	 * that its activity bar button is selected. This avoids waiting on the webview
+	 * to load, so it is a reliable signal that the view container itself is open.
+	 */
+	async expectViewOpen(): Promise<void> {
+		const button = this.code.driver.currentPage.locator(ACTIVITY_BAR_BUTTON);
+		await expect(button.locator('..')).toHaveAttribute('aria-selected', 'true');
+	}
+
+	/**
+	 * Accepts the workspace trust dialog if it appears.
+	 * This dialog may or may not appear depending on workspace state.
+	 */
+	async acceptTrustDialogIfPresent(): Promise<void> {
+		const trustDialog = this.frame.locator(TRUST_DIALOG);
+		const isVisible = await trustDialog.isVisible().catch(() => false);
+		if (isVisible) {
+			await trustDialog.locator(TRUST_BUTTON).click();
+		}
+	}
+
+	/**
+	 * Waits for Posit Assistant to be ready by verifying the chat input is visible.
+	 * Handles the workspace trust dialog if it appears.
+	 * Works on both the landing page and a resumed chat session.
+	 * @param timeout Maximum time to wait in milliseconds (default: 30000)
+	 */
+	async waitForReady(timeout: number = 30000): Promise<void> {
+		await this.acceptTrustDialogIfPresent();
+		await expect(this.frame.locator(CHAT_INPUT)).toBeVisible({ timeout });
+		await expect(this.frame.locator(SEND_BUTTON)).toBeVisible({ timeout });
+		await expect(this.frame.locator(STOP_BUTTON)).not.toBeVisible({ timeout });
+	}
+
+	/**
+	 * Verifies that the welcome title "Posit Assistant" is displayed on the landing page.
+	 */
+	async expectWelcomeVisible(): Promise<void> {
+		await expect(this.frame.locator(WELCOME_TITLE)).toBeVisible();
+	}
+
+	// --- Header actions ---
+
+	/**
+	 * Starts a new conversation by clicking the new chat button.
+	 * If the pane is already showing a fresh conversation, this is a no-op.
+	 *
+	 * The click is handled asynchronously: for up to ~1s the pane still shows the
+	 * outgoing conversation, its model selection, and an editable input, so
+	 * `waitForReady()` alone is satisfied against the old conversation. We have to
+	 * wait for the fresh conversation to actually land -- which is also when the
+	 * model selection is dropped -- or a model the caller selects next gets
+	 * clobbered mid-test and Send stays disabled.
+	 *
+	 * The landing signal is the persona greeting, which the assistant renders
+	 * exactly when `isNewConversation` is true. That is the same predicate that
+	 * used to drive the button's disabled state, which this helper waited on until
+	 * assistant#2374 ("browser-style tab model") removed the `disableNewConversation`
+	 * gating and made the top bar `+` a composer-focusing no-op on a fresh
+	 * conversation instead. Greeting-visible works on both sides of that change.
+	 */
+	async startNewConversation(): Promise<void> {
+		const button = this.frame.locator(NEW_CHAT_BUTTON);
+		const welcome = this.frame.locator(WELCOME_TITLE);
+		await expect(async () => {
+			// Released assistant builds still disable this button on a fresh (or
+			// streaming) conversation, and clicking a disabled button just burns
+			// the click timeout. Skip the click in that case -- being on a fresh
+			// conversation is the desired end state anyway.
+			if (await button.isEnabled()) {
+				try {
+					await button.click({ timeout: 5000 });
+				} catch (e) {
+					// If the button flipped to disabled mid-click on such a build,
+					// the fresh conversation already landed; otherwise re-throw.
+					if (await button.isEnabled()) {
+						throw e;
+					}
+				}
+			}
+			await expect(welcome).toBeVisible({ timeout: 5000 });
+			// The webview paints the fresh/greeting state first and only then
+			// restores the last persisted conversation (machine-wide store, see
+			// posit-assistant.test.ts and #15187). That restore lands ~100-300ms
+			// after the chat input appears, so a single sample can read "disabled
+			// button + greeting visible" during the pre-hydration window, skip the
+			// click, and then have the restored conversation replace the greeting.
+			// Require the greeting to survive a settle window; if it does not, the
+			// retry sees an enabled button and performs a real click.
+			await this.code.wait(NEW_CONVERSATION_SETTLE_MS);
+			await expect(welcome).toBeVisible({ timeout: 1000 });
+		}).toPass({ timeout: 30000 });
+		await this.waitForReady();
+	}
+
+	/**
+	 * Clicks the history button in the header.
+	 */
+	async clickHistory(): Promise<void> {
+		await this.frame.locator(HISTORY_BUTTON).click();
+	}
+
+	/**
+	 * Clicks the more/ellipsis button in the header.
+	 */
+	async clickMore(): Promise<void> {
+		await this.frame.locator(MORE_BUTTON).click();
+	}
+
+	/**
+	 * Clicks the settings button in the header.
+	 */
+	async clickSettings(): Promise<void> {
+		await this.frame.locator(SETTINGS_BUTTON).click();
+	}
+
+	// --- Chat input ---
+
+	/**
+	 * Enters a message in the chat input.
+	 * @param message The message to enter
+	 */
+	async enterMessage(message: string): Promise<void> {
+		const chatInput = this.frame.locator(CHAT_INPUT);
+		await chatInput.waitFor({ state: 'visible' });
+		// The input is a TipTap/ProseMirror contenteditable, not a plain textarea.
+		// Click to focus then type so ProseMirror processes the input through its
+		// normal keystroke handling; `fill()` is unreliable on rich-text editors.
+		await chatInput.click();
+		await chatInput.pressSequentially(message);
+	}
+
+	/**
+	 * Clicks the send button to submit the current message.
+	 *
+	 * Send is disabled until the input has text and a model is selected. Waiting
+	 * for it to be enabled first turns "the model selection was dropped" into a
+	 * named assertion failure instead of a 30s click timeout that reports the send
+	 * button as the culprit.
+	 */
+	async clickSend(): Promise<void> {
+		const sendButton = this.frame.locator(SEND_BUTTON);
+		await expect(sendButton).toBeEnabled();
+		await sendButton.click();
+	}
+
+	/**
+	 * Clicks the stop button to cancel a running response.
+	 */
+	async clickStop(): Promise<void> {
+		await this.frame.locator(STOP_BUTTON).click();
+	}
+
+	/**
+	 * Sends a chat message with options.
+	 * @param message The message to send
+	 * @param waitForResponse Whether to wait for the response to complete (default: true)
+	 * @param options.newConversation Whether to start a new conversation first (default: true).
+	 *   If the pane is already showing a fresh conversation, this is a no-op.
+	 */
+	async sendMessage(message: string, waitForResponse: boolean = true, options: { newConversation?: boolean } = {}): Promise<void> {
+		const { newConversation = true } = options;
+		if (newConversation) {
+			await this.startNewConversation();
+		}
+		await this.enterMessage(message);
+		await this.clickSend();
+		if (waitForResponse) {
+			await this.waitForResponseComplete();
+		}
+	}
+
+	/**
+	 * Sends a message and waits for the response to complete, automatically
+	 * clicking "Allow for this session" whenever a tool confirmation dialog
+	 * appears. Handles multiple tool calls and dialogs that appear before or
+	 * after streaming begins.
+	 */
+	async sendMessageAndWait(message: string, options: { timeout?: number; newConversation?: boolean } = {}): Promise<void> {
+		const { timeout = 90000, newConversation = true } = options;
+		if (newConversation) {
+			await this.startNewConversation();
+		}
+		await this.enterMessage(message);
+		await this.clickSend();
+		await this.waitForResponseCompleteAllowingTools(timeout);
+	}
+
+	/**
+	 * Waits for an already-submitted response to complete, clicking "Allow for
+	 * this session" whenever a tool confirmation dialog appears, or "Allow once"
+	 * when the dialog offers nothing else. Use this when something other than
+	 * the chat input sent the message (e.g. a notebook's Fix button) and the
+	 * model may call tools before it is done.
+	 * @param timeout Maximum time to wait in milliseconds (default: 90000)
+	 */
+	async waitForResponseCompleteAllowingTools(timeout: number = 90000): Promise<void> {
+		const stopButton = this.frame.locator(STOP_BUTTON);
+		const trigger = this.frame.locator(TOOL_ALLOW_DROPDOWN_TRIGGER);
+		// Shown alone when a request has a danger warning or a single allowed scope.
+		const allowOnce = this.frame.getByRole('button', { name: 'Allow once', exact: true });
+		const deadline = Date.now() + timeout;
+
+		// Wait for streaming to start
+		await stopButton.waitFor({ state: 'visible', timeout });
+
+		// Loop while streaming: approve each tool confirmation that appears,
+		// then wait for it to clear.
+		while (await stopButton.isVisible()) {
+			if (Date.now() > deadline) {
+				throw new Error(`Response did not complete within ${timeout}ms`);
+			}
+			if (await trigger.isVisible().catch(() => false)) {
+				await trigger.click();
+				await this.frame.locator(TOOL_ALLOW_SESSION_MENU_ITEM).click();
+			} else if (await allowOnce.isVisible().catch(() => false)) {
+				await allowOnce.click();
+			} else {
+				await this.code.driver.currentPage.waitForTimeout(200);
+			}
+		}
+	}
+
+	/**
+	 * Waits for the chat response to complete by waiting for the stop button
+	 * to appear (busy) and then disappear (done).
+	 * @param timeout Maximum time to wait in milliseconds (default: 60000)
+	 */
+	async waitForResponseComplete(timeout: number = 60000): Promise<void> {
+		await this.frame.locator(STOP_BUTTON).waitFor({ state: 'visible' });
+		await this.frame.locator(STOP_BUTTON).waitFor({ state: 'hidden', timeout });
+	}
+
+	// --- Model selection ---
+
+	/**
+	 * Selects a model for the current conversation.
+	 *
+	 * In narrow viewports the Posit Assistant renders the model picker in
+	 * "menu mode" (see `ModelSelector.tsx`). The chat-form overflow (`...`)
+	 * menu contains a `DropdownMenuSub` whose trigger has two spans:
+	 * `"Model"` (label) and either the currently-selected model name or
+	 * `"Select"` (value when none is selected). Clicking the trigger opens
+	 * a submenu with provider groups and their models.
+	 *
+	 * Each model is a `role="menuitem"` whose display name lives in a
+	 * child `<span class="flex-1">`; the accessible name of the menuitem
+	 * includes decorations (check icon column, trailing note/multiplier),
+	 * so we match on the span text instead.
+	 *
+	 * Some providers auto-pick a default and do not need this call. Only
+	 * top-tier models appear in the initial slice; the rest are hidden behind a
+	 * "More models" disclosure, which this method expands automatically when the
+	 * requested model isn't already shown.
+	 *
+	 * @param modelName Exact model name as displayed in the menu (e.g. "GPT-5.4 Mini").
+	 */
+	async selectModel(modelName: string): Promise<void> {
+		const overflow = this.frame.locator(CHAT_FORM_OVERFLOW_BUTTON);
+		// The SubTrigger is a menuitem with aria-haspopup="menu" containing the
+		// literal "Model" label span; that label is stable across states.
+		const modelSubmenu = this.frame.locator('[role="menuitem"][aria-haspopup="menu"]:has(span:text-is("Model"))');
+		// `:text-is()` is exact-match so "GPT-5.4" does not collide with "GPT-5.4 Mini".
+		const model = this.frame.locator(`[role="menuitem"]:has(span.flex-1:text-is("${modelName}"))`);
+		// Within each provider group, less-preferred models (e.g. Microsoft
+		// Foundry's "model-router") are collapsed under a "More models" inline
+		// disclosure -- a plain <button>, not a menuitem -- and several groups can
+		// show one at once, so the locator must not assume a single match.
+		const moreModels = this.frame.getByRole('button', { name: 'More models' });
+		const submenuRendered = model.or(moreModels.first()).first();
+
+		// Retry the open->select->close cycle with short per-step timeouts, as in
+		// selectProviderModelMenuMode: the "Model" submenu only exists once a
+		// provider has delivered models, and a list populated by a live fetch can
+		// re-render mid-click. A stalled step fails fast and is retried against the
+		// current menu instead of hanging for the whole budget.
+		await expect(async () => {
+			if (!(await submenuRendered.isVisible().catch(() => false))) {
+				if (await overflow.getAttribute('aria-expanded') !== 'true') {
+					await overflow.click({ timeout: 5000 });
+				}
+				await modelSubmenu.click({ timeout: 5000 });
+				await expect(submenuRendered).toBeVisible({ timeout: 5000 });
+			}
+
+			// Expand disclosures one at a time, re-querying since a click removes
+			// the button, until the model is shown or every group is expanded.
+			for (let remaining = await moreModels.count(); remaining > 0 && !(await model.isVisible()); remaining--) {
+				await moreModels.first().click({ timeout: 5000 });
+			}
+			await model.click({ timeout: 5000 });
+
+			// Menu closes on selection; wait for the trigger to collapse so
+			// subsequent actions (e.g. Send) don't race an open overlay.
+			await expect(overflow).toHaveAttribute('aria-expanded', 'false', { timeout: 5000 });
+		}).toPass({ timeout: 30000 });
+	}
+
+	/**
+	 * Selects the top (first / default) model belonging to a specific provider,
+	 * scoping the choice to that provider's group in the model picker.
+	 *
+	 * WHY: More than one provider can be signed in at once. In particular AWS
+	 * Bedrock auto-signs-in whenever AWS credentials are present in the
+	 * environment, independent of whatever provider a test logged in with. The
+	 * picker then shows multiple provider groups, and model display names repeat
+	 * across them ("Claude Sonnet 5" appears under both Anthropic and AWS
+	 * Bedrock). Selecting by model name alone is provider-ambiguous and can
+	 * silently exercise the wrong provider (e.g. an auto-selected Bedrock
+	 * default). Scoping to the provider group guarantees the intended
+	 * provider+model combination. Picking the group's top model keeps this robust
+	 * to the frequent churn in the model list.
+	 *
+	 * Must be called on a fresh conversation (after `startNewConversation()`),
+	 * and the message that follows should be sent with `newConversation: false`,
+	 * because starting a new conversation drops the model selection.
+	 *
+	 * Handles both picker render modes (width-dependent):
+	 *  - menu mode (narrow status bar): the overflow (...) menu hosts a "Model"
+	 *    submenu where each provider is a `dropdown-menu-group` container.
+	 *  - inline mode (wide status bar, e.g. a maximized sidebar): the model
+	 *    trigger opens a flat radio group whose provider headers are sibling divs.
+	 *
+	 * @param provider e2e provider id (e.g. 'anthropic', 'bedrock').
+	 */
+	async selectProviderModel(provider: string): Promise<void> {
+		const providerName = PROVIDER_DISPLAY_NAMES[provider];
+		if (!providerName) {
+			throw new Error(`No model-picker display name mapped for provider "${provider}"`);
+		}
+
+		const providerNames = [providerName, ...(PROVIDER_DISPLAY_NAME_ALIASES[provider] ?? [])];
+
+		const overflow = this.frame.locator(CHAT_FORM_OVERFLOW_BUTTON);
+		const menuMode = await overflow.isVisible().catch(() => false);
+		if (menuMode) {
+			await this.selectProviderModelMenuMode(overflow, providerNames);
+		} else {
+			await this.selectProviderModelInlineMode(providerNames);
+		}
+	}
+
+	/**
+	 * Menu-mode path for {@link selectProviderModel}: open the overflow (...)
+	 * menu and its "Model" submenu, then click the first model in the provider's
+	 * group container.
+	 *
+	 * The open->select->close cycle is retried because a model list populated by
+	 * a live fetch (Posit AI Pass, or any provider in a remote session) can
+	 * re-render the group mid-click. Every click inside the loop carries a short
+	 * timeout: an unbounded one inherits the default, and a single stalled click
+	 * eats the whole retry budget.
+	 */
+	private async selectProviderModelMenuMode(overflow: Locator, providerNames: string[]): Promise<void> {
+		const modelSubmenu = this.frame.locator('[role="menuitem"][aria-haspopup="menu"]:has(span:text-is("Model"))');
+		// Scope to the provider's group (label + its model items live in one
+		// container).
+		const group = this.frame.locator(providerNameSelector(providerNames,
+			name => `${MODEL_MENU_GROUP}:has([data-slot="dropdown-menu-label"] span:text-is("${name}"))`,
+		));
+		const models = group.locator('[role="menuitem"]');
+
+		await expect(async () => {
+			// Open the overflow menu and its "Model" submenu if the provider's
+			// group isn't already visible (e.g. a prior iteration reopens after a
+			// stale click).
+			if (!(await group.isVisible().catch(() => false))) {
+				await overflow.click({ timeout: 5000 });
+				await modelSubmenu.click({ timeout: 5000 });
+				await expect(group).toBeVisible({ timeout: 5000 });
+			}
+
+			// Some providers (e.g. Microsoft Foundry) list every model under the
+			// "More models" disclosure with none shown directly, so the group has no
+			// model item until it's expanded.
+			if (await models.count() === 0) {
+				await group.locator('button:has-text("More models")').click({ timeout: 5000 });
+			}
+			await this.waitForModelListToSettle(models);
+			await models.first().click({ timeout: 5000 });
+
+			// Menu closes on selection; wait for the trigger to collapse so subsequent
+			// actions (e.g. Send) don't race an open overlay.
+			await expect(overflow).toHaveAttribute('aria-expanded', 'false', { timeout: 5000 });
+		}).toPass({ timeout: 30000 });
+	}
+
+	/**
+	 * Waits for a provider group's model items to stop churning: two consecutive
+	 * samples agreeing on the item count and the first item's generated id.
+	 *
+	 * WHY: while the group re-renders, Base UI re-mounts the items behind an inert
+	 * `role="presentation"` backdrop, so a click landing mid-render is blocked and
+	 * then loses its element. The id is sampled alongside the count because a
+	 * re-mount can replace the items without changing how many there are.
+	 */
+	private async waitForModelListToSettle(models: Locator): Promise<void> {
+		let previous = '';
+		await expect.poll(async () => {
+			const count = await models.count();
+			// A sample can lose its element to the very re-mount being waited out.
+			// Only the thrown case is `undefined`: a genuinely missing id attribute
+			// resolves to `null`, a stable value worth comparing.
+			const id = await models.first().getAttribute('id', { timeout: 1000 }).catch(() => undefined);
+			if (id === undefined) {
+				return false;
+			}
+			const current = `${count}:${id}`;
+			const settled = current === previous;
+			previous = current;
+			return settled;
+		}, { timeout: 5000, intervals: [200] }).toBe(true);
+	}
+
+	/**
+	 * Inline-mode path for {@link selectProviderModel}: open the model trigger and
+	 * click the provider's top model. The radio group is flat, so the provider's
+	 * top model is the header div's immediately-following radio item (adjacent
+	 * sibling combinator scopes the choice to that provider).
+	 *
+	 * The open→select→close cycle is retried because the inline picker is not
+	 * stable to drive one-shot:
+	 *  - On open it auto-scrolls the selected item into view and runs refocus
+	 *    logic, which can transiently close the menu out from under a pending
+	 *    click.
+	 *  - Base UI radio items do NOT close the menu on selection (unlike the
+	 *    regular menu items used in menu mode), so the menu must be dismissed
+	 *    explicitly with Escape afterwards, or the overlay blocks the chat input.
+	 */
+	private async selectProviderModelInlineMode(providerNames: string[]): Promise<void> {
+		const trigger = this.frame.locator(INLINE_MODEL_TRIGGER);
+		const radioGroup = this.frame.locator(MODEL_RADIO_GROUP);
+		// Each alias needs its own full selector: a trailing combinator binds to the
+		// last item of a selector list, so it cannot be appended to the list as a
+		// whole.
+		const headerSelector = (suffix = '') => providerNameSelector(providerNames,
+			name => `div:has(> span:text-is("${name}"))${suffix}`,
+		);
+		const header = radioGroup.locator(headerSelector());
+		// A model shown directly under the provider header (adjacent sibling).
+		const directTopModel = radioGroup.locator(headerSelector(' + [role="menuitemradio"]'));
+		// The provider's "More models" disclosure, present as the header's adjacent
+		// sibling only when the provider has no model shown directly.
+		const moreModels = radioGroup.locator(headerSelector(' + button:has-text("More models")'));
+		// The provider's top model, whether shown directly or revealed by expanding
+		// "More models": the first radio item following this provider's header.
+		const topModel = header.locator('xpath=./following-sibling::*[@role="menuitemradio"][1]');
+		const page = this.code.driver.currentPage;
+
+		await expect(async () => {
+			// Open the picker if it isn't already open (e.g. a prior iteration
+			// selected the model but Escape didn't land).
+			if (!(await radioGroup.isVisible().catch(() => false))) {
+				await trigger.click({ timeout: 5000 });
+				await expect(radioGroup).toBeVisible({ timeout: 5000 });
+			}
+			// Some providers (e.g. Microsoft Foundry) list every model under the
+			// "More models" disclosure with none shown directly; expand it so the
+			// provider has a selectable model.
+			if (await directTopModel.count() === 0 && await moreModels.isVisible().catch(() => false)) {
+				await moreModels.click({ timeout: 5000 });
+			}
+			// Short click timeout so a menu that closed mid-open fails fast and we
+			// reopen on the next iteration rather than hanging.
+			await topModel.click({ timeout: 5000 });
+			// Radio selection leaves the menu open; dismiss it so it can't obscure
+			// the chat input, and confirm it detached.
+			await page.keyboard.press('Escape');
+			await expect(radioGroup).toBeHidden({ timeout: 5000 });
+		}).toPass({ timeout: 30000 });
+	}
+
+	// --- Chat messages ---
+
+	/**
+	 * Verifies that an assistant response is visible. Targets the most recent
+	 * one so a multi-turn conversation (or the persona greeting, which renders
+	 * as an assistant message) does not trip strict mode.
+	 */
+	async expectResponseVisible(): Promise<void> {
+		await expect(this.frame.locator(CHAT_MESSAGE_ASSISTANT).last()).toBeVisible();
+	}
+
+	/**
+	 * Gets the text content of the most recent assistant response.
+	 */
+	async getLastResponseText(): Promise<string> {
+		const response = this.frame.locator(`${CHAT_MESSAGE_ASSISTANT} ${CHAT_MESSAGE_CONTENT}`).last();
+		return await response.textContent() ?? '';
+	}
+
+	/**
+	 * Verifies a user message is visible.
+	 */
+	async expectUserMessageVisible(): Promise<void> {
+		await expect(this.frame.locator(CHAT_MESSAGE_USER)).toBeVisible();
+	}
+
+	/**
+	 * Verifies the most recent user message contains the given text, including
+	 * the name of any attachment it carries.
+	 */
+	async expectUserMessageToContainText(text: string): Promise<void> {
+		await expect(this.frame.locator(CHAT_MESSAGE_USER).last()).toContainText(text);
+	}
+
+	// --- Inline plots ---
+
+	/**
+	 * Verifies that an inline plot image is visible in the chat.
+	 * @param timeout Maximum time to wait in milliseconds (default: 30000)
+	 */
+	async expectInlinePlotVisible(timeout: number = 30000): Promise<void> {
+		await expect(this.frame.locator(INLINE_PLOT).first()).toBeVisible({ timeout });
+	}
+
+	/**
+	 * Verifies the first inline plot image is not blank.
+	 *
+	 * Inline plots are served as vscode-resource PNGs (e.g.
+	 * https://file+.vscode-resource.vscode-cdn.net/.../<hash>.png). Drawing
+	 * them to a canvas taints it cross-origin, so pixel sampling is
+	 * unreliable. Instead, we fetch the PNG bytes directly and check:
+	 *   1. The <img> loaded with non-zero natural dimensions.
+	 *   2. The response is a PNG (full 8-byte signature: 89 50 4E 47 0D 0A 1A 0A).
+	 *   3. The PNG payload is larger than a blank/empty figure would be.
+	 *
+	 * A real matplotlib/plotnine PNG is typically tens of KB; the "blank
+	 * Python chat plot" bug produces a very small PNG (empty figure or a
+	 * placeholder). The minBytes threshold targets that.
+	 *
+	 * @param options.timeout Max time to wait for the plot image (default: 30000)
+	 * @param options.minBytes Minimum PNG byte size to consider non-blank (default: 3000)
+	 */
+	async expectInlinePlotNotBlank(options: { timeout?: number; minBytes?: number } = {}): Promise<void> {
+		const { timeout = 30000, minBytes = 3000 } = options;
+		const plot = this.frame.locator(INLINE_PLOT).first();
+		await expect(plot).toBeVisible({ timeout });
+
+		// Wait for the image to finish loading.
+		await plot.evaluate(async (img: HTMLImageElement) => {
+			if (!img.complete) {
+				await new Promise<void>((resolve, reject) => {
+					img.addEventListener('load', () => resolve(), { once: true });
+					img.addEventListener('error', () => reject(new Error('image failed to load')), { once: true });
+				});
+			}
+		});
+
+		const result = await plot.evaluate(async (img: HTMLImageElement) => {
+			const width = img.naturalWidth;
+			const height = img.naturalHeight;
+			const src = img.src;
+
+			if (!width || !height) {
+				return { ok: false, reason: `image has no natural dimensions (${width}x${height})`, byteLength: 0 };
+			}
+			if (!src) {
+				return { ok: false, reason: 'image src is empty', byteLength: 0 };
+			}
+
+			try {
+				const response = await fetch(src);
+				if (!response.ok) {
+					return { ok: false, reason: `fetch failed: HTTP ${response.status}`, byteLength: 0 };
+				}
+				const bytes = new Uint8Array(await response.arrayBuffer());
+				// Full 8-byte PNG signature: 89 50 4E 47 0D 0A 1A 0A
+				const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+				const isPng =
+					bytes.length >= pngSignature.length &&
+					pngSignature.every((b, i) => bytes[i] === b);
+				if (!isPng) {
+					return {
+						ok: false,
+						reason: `response is not a PNG (length=${bytes.length}, first bytes=${Array.from(bytes.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ')})`,
+						byteLength: bytes.length,
+						isPng,
+					};
+				}
+				return {
+					ok: true,
+					reason: `fetched ${bytes.length} bytes (png=true)`,
+					byteLength: bytes.length,
+					isPng,
+				};
+			} catch (e) {
+				return { ok: false, reason: `failed to fetch image src: ${String(e)}`, byteLength: 0 };
+			}
+		});
+
+		expect(result.ok, `Inline plot fetch failed: ${result.reason}`).toBe(true);
+		expect(
+			result.byteLength,
+			`Inline plot appears blank - PNG is only ${result.byteLength} bytes (threshold ${minBytes}). ${result.reason}`,
+		).toBeGreaterThanOrEqual(minBytes);
+	}
+
+	// --- Code block actions ---
+
+	/**
+	 * Clicks the copy button on a code block.
+	 * @param index The index of the code block (0-based)
+	 */
+	async copyCodeBlock(index: number = 0): Promise<void> {
+		await this.frame.locator(CODE_BLOCK).nth(index).hover();
+		await this.frame.locator(CODE_BLOCK_COPY_BUTTON).nth(index).click();
+	}
+
+	/**
+	 * Clicks the "Insert At Cursor" button on a code block.
+	 * @param index The index of the code block (0-based)
+	 */
+	async insertCodeBlockAtCursor(index: number = 0): Promise<void> {
+		await this.frame.locator(CODE_BLOCK).nth(index).hover();
+		await this.frame.locator(CODE_BLOCK_INSERT_CURSOR_BUTTON).nth(index).click();
+	}
+
+	/**
+	 * Clicks the "Insert into New File" button on a code block.
+	 * @param index The index of the code block (0-based)
+	 */
+	async insertCodeBlockIntoNewFile(index: number = 0): Promise<void> {
+		await this.frame.locator(CODE_BLOCK).nth(index).hover();
+		await this.frame.locator(CODE_BLOCK_INSERT_FILE_BUTTON).nth(index).click();
+	}
+
+	// --- Tool confirmation ---
+
+	/**
+	 * Verifies the tool confirmation dialog is visible.
+	 */
+	async expectToolConfirmVisible(): Promise<void> {
+		await expect(this.frame.locator(TOOL_CONFIRM_CARD).getByRole('heading', { level: 4 })).toBeVisible();
+	}
+
+	/** Verifies the tool confirmation dialog identifies a specific MCP server + tool. */
+	async expectMcpToolConfirmVisible(server: string, tool: string): Promise<void> {
+		await expect(this.frame.locator(TOOL_CONFIRM_CARD)).toContainText(mcpToolId(server, tool));
+	}
+
+	/** Locator for the MCP tool-result accordion, rendered after the tool executes. */
+	mcpToolResult(server: string, tool: string) {
+		return this.frame.locator(
+			`${TOOL_RESULT_ACCORDION_ITEM}:has(:scope :text("${mcpToolId(server, tool)}"))`,
+		);
+	}
+
+	/** Verifies the MCP tool-result accordion is in the transcript. */
+	async expectMcpToolResultVisible(server: string, tool: string): Promise<void> {
+		await expect(this.mcpToolResult(server, tool)).toBeVisible();
+	}
+
+	/**
+	 * Asserts a literal text string is anywhere in the chat frame DOM.
+	 *
+	 * Uses `toBeAttached()` not `toBeVisible()`: tool-result accordion panels
+	 * use overflow-hidden + animated height that can read as visually hidden
+	 * even when fully expanded.
+	 */
+	async expectChatContainsText(text: string): Promise<void> {
+		await expect(this.frame.getByText(text, { exact: false }).first()).toBeAttached();
+	}
+
+	/**
+	 * Selects "Allow for this session" from the tool confirmation dropdown.
+	 */
+	async allowToolForSession(): Promise<void> {
+		await this.frame.locator(TOOL_ALLOW_DROPDOWN_TRIGGER).click();
+		await this.frame.locator(TOOL_ALLOW_SESSION_MENU_ITEM).click();
+	}
+
+	/**
+	 * Selects "Allow for this session" if the tool confirmation dropdown appears
+	 * within the given timeout. Silently does nothing if it never shows up.
+	 *
+	 * The tool dialog can appear before OR after streaming begins, so this does
+	 * not race against the stop button — it simply waits the full timeout.
+	 */
+	async allowToolForSessionIfVisible(timeout = 30000): Promise<void> {
+		const appeared = await this.frame.locator(TOOL_ALLOW_DROPDOWN_TRIGGER)
+			.waitFor({ state: 'visible', timeout })
+			.then(() => true)
+			.catch(() => false);
+		if (appeared) {
+			await this.frame.locator(TOOL_ALLOW_DROPDOWN_TRIGGER).click();
+			await this.frame.locator(TOOL_ALLOW_SESSION_MENU_ITEM).click();
+		}
+	}
+
+	/**
+	 * Clicks the main "Allow" button on the tool confirmation dialog (allow once).
+	 */
+	async allowToolOnce(): Promise<void> {
+		await this.frame.locator(TOOL_ALLOW_BUTTON).click();
+	}
+
+	/**
+	 * Clicks "Decline" on the tool confirmation dialog.
+	 */
+	async declineTool(): Promise<void> {
+		await this.frame.locator(TOOL_DECLINE_BUTTON).click();
+	}
+
+	// --- Dev build update check ---
+
+	/**
+	 * Enables the Posit Assistant auto dev-build update check, triggers the
+	 * `posit-assistant.checkForDevBuildUpdate` command, and drives the resulting
+	 * toast flow: clicks "Update Now" on the first toast, then clicks "Reload"
+	 * on the follow-up toast to reload Positron.
+	 *
+	 * Note: this is for Posit Assistant (not Positron Assistant).
+	 *
+	 * @param settings The settings fixture used to write the user setting.
+	 * @param quickaccess The quickaccess page object used to run the command.
+	 * @param options.toastTimeout Maximum time to wait for each toast (default: 30000).
+	 * @param options.waitForReady Wait for runtime startup messaging to clear after
+	 *   writing the setting and after the reload (default: true). Pass false where
+	 *   interpreter discovery never settles and the suite uses no runtime.
+	 * @param options.writeSetting Write the setting through the settings fixture
+	 *   (default: true). Pass false on Workbench, where the fixture can't reach the
+	 *   container's settings file; set it with `extraSettings` instead.
+	 * @returns Whether a dev build was installed and the window reloaded.
+	 */
+	async checkForDevBuildUpdate(
+		settings: {
+			set: (
+				settings: Record<string, unknown>,
+				options?: { reload?: boolean | 'web'; waitMs?: number; waitForReady?: boolean; keepOpen?: boolean }
+			) => Promise<void>;
+		},
+		quickaccess: {
+			runCommand: (command: string, options?: { exactLabelMatch?: boolean }) => Promise<any>;
+		},
+		options: { toastTimeout?: number; waitForReady?: boolean; writeSetting?: boolean } = {},
+	): Promise<boolean> {
+		const { toastTimeout = 30000, waitForReady = true, writeSetting = true } = options;
+
+		// A local Assistant checkout is the build under test; don't replace it with a dev build.
+		if (process.env.POSITRON_E2E_ASSISTANT_PATH) {
+			return false;
+		}
+
+		// 1. Enable the auto dev-build update check setting.
+		if (writeSetting) {
+			await settings.set({ 'assistant.autoDevBuildUpdateCheck': true }, { waitForReady });
+		}
+
+		// 2. Trigger the dev-build update check command.
+		await quickaccess.runCommand('posit-assistant.checkForDevBuildUpdate');
+
+		const toasts = new Toasts(this.code);
+		const updateAvailable = /newer Posit Assistant dev build is available/i;
+		// Assistant answers the check with exactly one of these.
+		const checkResult = /newer Posit Assistant dev build is available|Posit Assistant is up to date|Posit Assistant dev build update check failed/i;
+
+		// 3. Wait for the check's result. Anything but "newer dev build available"
+		//    (up to date, check failed, or no answer) is a no-op; log which one it was.
+		try {
+			await toasts.waitForAppear(checkResult, { timeout: toastTimeout });
+		} catch {
+			console.log(`[checkForDevBuildUpdate] No result from the update check within ${toastTimeout}ms; keeping the installed Posit Assistant.`);
+			return false;
+		}
+
+		const message = await this.readNotification(checkResult);
+		console.log(`[checkForDevBuildUpdate] ${message}`);
+		if (!updateAvailable.test(message)) {
+			return false;
+		}
+
+		await toasts.clickButton('Update Now', { notificationFilter: updateAvailable });
+
+		// 4. Wait for the follow-up "reload to apply changes" toast and click "Reload".
+		//    A visible .monaco-workbench is not enough afterwards: the provider modal
+		//    opened against a still-starting extension host took over 15s on Windows.
+		await toasts.waitForAppear(/Posit Assistant has been updated\. You must reload Positron/i, { timeout: toastTimeout });
+		await new HotKeys(this.code).reloadWindowWith(
+			() => toasts.clickButton('Reload', { notificationFilter: /Posit Assistant has been updated\. You must reload Positron/i }),
+			waitForReady,
+		);
+		const commit = message.match(/commit (?<commit>[0-9a-f]+)/i)?.groups?.commit ?? 'unknown';
+		console.log(`[checkForDevBuildUpdate] Installed Posit Assistant dev build ${commit} and reloaded.`);
+		return true;
+	}
+
+	/**
+	 * Returns the text of the first notification matching `filter`, read from the
+	 * notification center so it works whether or not toasts are shown.
+	 */
+	private async readNotification(filter: RegExp): Promise<string> {
+		const toasts = new Toasts(this.code);
+		await toasts.openNotificationCenter();
+		try {
+			const message = toasts.notificationsCenter.locator('.notification-list-item-message').filter({ hasText: filter }).first();
+			return (await message.textContent({ timeout: 5000 }))?.trim() ?? '';
+		} finally {
+			await toasts.closeNotificationCenter().catch(() => { });
+		}
+	}
+
+}

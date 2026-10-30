@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Stops a disposable Positron instance started by launch.sh and optionally
+# removes its run directory.
+#
+# `kill $PID` is not sufficient on every platform. On Windows the PID that
+# launch.sh reports belongs to the MSYS shell that exec'd the native Electron
+# binary; killing it leaves the application running and holding several
+# gigabytes. Locating the process that owns the CDP port works everywhere, so
+# this script does that instead of trusting the reported PID.
+#
+# Usage:
+#   stop.sh --cdp-port <port> [--run-dir <dir>] [--timeout <seconds>]
+#
+# It signals the process that owns the CDP port, waits for the port to stop
+# answering, forces the stop if it does not, then removes --run-dir. Without
+# --run-dir it stops the instance and deletes nothing (reseed.sh relies on
+# that). Pass only the runDir launch.sh printed: a path without a
+# positron-dev-launch component is refused. Each stop adds a line to
+# instances.log. Do not signal the Electron helper processes yourself: the app
+# reads that as a window crash, respawns them, and then ignores the stop.
+#
+# Exits non-zero when the instance is still reachable after the timeout, or when
+# --run-dir does not look like a launch.sh run directory.
+
+set -euo pipefail
+DIR="$(dirname "${BASH_SOURCE[0]}")"
+# A usage error: the error on stderr, a FAILED line in the action log, exit 2.
+ARGV=("$@")
+usage_error() { exec node "$DIR/dp.ts" usage-error --text "${0##*/}" "$1" ${ARGV[@]+"${ARGV[@]}"}; }
+
+CDP_PORT=""
+RUN_DIR=""
+TIMEOUT=15
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--cdp-port=*|--run-dir=*|--timeout=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;  # --flag=value is --flag value, as in the dp.ts helpers
+		--cdp-port) CDP_PORT="${2-}"; shift 2 || usage_error "$1 needs a value" ;;
+		--run-dir) RUN_DIR="${2-}"; shift 2 || usage_error "$1 needs a value" ;;
+		--timeout) TIMEOUT="${2-}"; shift 2 || usage_error "$1 needs a value" ;;
+		-h|--help) exec node "$DIR/dp.ts" help "$0" ;;
+		*) usage_error "unknown argument $1" ;;
+	esac
+done
+
+[[ -n "$CDP_PORT" ]] || usage_error "give --cdp-port <port> [--run-dir <dir>] [--timeout <seconds>]"
+
+case "$(uname -s)" in
+	MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+	*) IS_WINDOWS=0 ;;
+esac
+
+cdp_alive() {
+	curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$CDP_PORT/json/version" 2>/dev/null
+}
+
+# Report every PID listening on the CDP port. netstat is the only listener query
+# available in a bare Git Bash; lsof covers macOS and Linux.
+listener_pids() {
+	if [[ "$IS_WINDOWS" == "1" ]]; then
+		netstat -ano \
+			| awk -v port=":$CDP_PORT" '$1 == "TCP" && $2 ~ (port "$") && $4 == "LISTENING" { print $5 }' \
+			| sort -u
+	else
+		lsof -ti "tcp:$CDP_PORT" -sTCP:LISTEN 2>/dev/null | sort -u
+	fi
+}
+
+# Ask the instance to stop. Electron spawns a process tree, but the children are
+# the main process's responsibility: they exit with it.
+#
+# Do not signal the children first on macOS or Linux. The main process reads a
+# terminated renderer as a window crash, respawns the helpers, shows the "window
+# terminated unexpectedly" dialog, and then does not act on the signal that
+# follows -- the instance survives the timeout and keeps holding memory.
+stop_tree() {
+	local pid="$1"
+	if [[ "$IS_WINDOWS" == "1" ]]; then
+		# Double slashes keep MSYS from rewriting the flags as paths.
+		taskkill //F //T //PID "$pid" >/dev/null 2>&1 || true
+	else
+		kill -TERM "$pid" 2>/dev/null || true
+	fi
+}
+
+# Last resort for a main process that ignored SIGTERM. Collect the children
+# first: once the parent is gone they are reparented and no longer findable
+# through it.
+force_stop_tree() {
+	local pid="$1"
+	if [[ "$IS_WINDOWS" == "1" ]]; then
+		taskkill //F //T //PID "$pid" >/dev/null 2>&1 || true
+	else
+		local children
+		children=$(pgrep -P "$pid" 2>/dev/null || true)
+		kill -KILL "$pid" 2>/dev/null || true
+		if [[ -n "$children" ]]; then
+			# shellcheck disable=SC2086 # deliberate word splitting: one PID per line
+			kill -KILL $children 2>/dev/null || true
+		fi
+	fi
+}
+
+if ! cdp_alive; then
+	echo "[stop.sh] nothing listening on CDP port $CDP_PORT" >&2
+else
+	PIDS=$(listener_pids || true)
+	if [[ -z "$PIDS" ]]; then
+		echo "[stop.sh] CDP port $CDP_PORT answers but no listening PID was found." >&2
+		echo "[stop.sh] Stop the instance by hand before reusing the port." >&2
+		exit 1
+	fi
+	echo "[stop.sh] stopping PID(s) on CDP port $CDP_PORT: $(echo "$PIDS" | tr '\n' ' ')" >&2
+	for pid in $PIDS; do
+		stop_tree "$pid"
+	done
+
+	for _ in $(seq 1 "$TIMEOUT"); do
+		if ! cdp_alive; then
+			break
+		fi
+		sleep 1
+	done
+
+	# Escalate rather than report failure while the app still holds memory. A
+	# modal dialog can keep a graceful shutdown from completing.
+	if cdp_alive; then
+		echo "[stop.sh] still answering after ${TIMEOUT}s; forcing" >&2
+		for pid in $PIDS; do
+			force_stop_tree "$pid"
+		done
+		for _ in $(seq 1 5); do
+			if ! cdp_alive; then
+				break
+			fi
+			sleep 1
+		done
+	fi
+
+	if cdp_alive; then
+		echo "[stop.sh] CDP port $CDP_PORT is still answering after a forced stop." >&2
+		exit 1
+	fi
+	echo "[stop.sh] instance stopped" >&2
+	# The counterpart of the start line launch.sh writes.
+	{ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) stop cdp=$CDP_PORT" >> "${POSITRON_LAUNCH_TMP:-/tmp}/positron-dev-launch/instances.log"; } 2>/dev/null || true
+fi
+
+# Remove the run directory only when it looks like one launch.sh generated. The
+# path may be POSIX or Windows form, and the glob matches either.
+if [[ -n "$RUN_DIR" ]]; then
+	case "$RUN_DIR" in
+		*/positron-dev-launch/*)
+			rm -rf -- "${RUN_DIR:?}"
+			echo "[stop.sh] removed run directory $RUN_DIR" >&2
+			;;
+		*)
+			echo "[stop.sh] refusing to remove unexpected run directory: $RUN_DIR" >&2
+			exit 1
+			;;
+	esac
+fi

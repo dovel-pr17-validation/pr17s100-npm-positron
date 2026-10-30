@@ -1,0 +1,329 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/// <reference types="vitest/globals" />
+
+import type * as vscode from 'vscode';
+import { mock } from '../../../../../base/test/common/mock.js';
+import { stubInterface } from '../../../../../test/vitest/stubInterface.js';
+import { URI } from '../../../../../base/common/uri.js';
+import { ExtHostCommands } from '../../../common/extHostCommands.js';
+import { ExtHostDialogs } from '../../../common/extHostDialogs.js';
+import { ExtHostDocuments } from '../../../common/extHostDocuments.js';
+import { ExtHostEditors } from '../../../common/extHostTextEditors.js';
+import { ExtHostQuickOpen } from '../../../common/extHostQuickOpen.js';
+import { Range } from '../../../common/extHostTypes.js';
+import { ExtHostWorkspace } from '../../../common/extHostWorkspace.js';
+import { IMainPositronContext } from '../../../common/positron/extHost.positron.protocol.js';
+import { ExtHostConsoleService } from '../../../common/positron/extHostConsoleService.js';
+import { ExtHostContextKeyService } from '../../../common/positron/extHostContextKeyService.js';
+import { ExtHostLanguageRuntime } from '../../../common/positron/extHostLanguageRuntime.js';
+import { ExtHostMethods } from '../../../common/positron/extHostMethods.js';
+import { ExtHostModalDialogs } from '../../../common/positron/extHostModalDialogs.js';
+import { UiFrontendRequest } from '../../../../services/languageRuntime/common/positronUiComm.js';
+
+/** A minimal fake `vscode.TextEditor` over a single-line document, with edits recorded. */
+function createFakeEditor(fileName: string, text = 'hello'): vscode.TextEditor & { readonly editedRanges: unknown[] } {
+	const editedRanges: unknown[] = [];
+	const document = {
+		fileName,
+		eol: 1, // vscode.EndOfLine.LF
+		isClosed: false,
+		isDirty: false,
+		isUntitled: false,
+		languageId: 'r',
+		lineCount: 1,
+		version: 1,
+		lineAt: () => ({ text }),
+		getText: () => text,
+	};
+	const selection = { active: { line: 0, character: 0 }, start: { line: 0, character: 0 }, end: { line: 0, character: text.length } };
+	const editor = {
+		document,
+		selections: [selection],
+		edit: (callback: (editBuilder: { replace: (location: unknown, value: string) => void }) => void) => {
+			callback({ replace: (location, value) => editedRanges.push({ location, value }) });
+			return Promise.resolve(true);
+		},
+		editedRanges,
+	};
+	return editor as unknown as vscode.TextEditor & { readonly editedRanges: unknown[] };
+}
+
+function createMethods(options: {
+	paneEditor?: vscode.TextEditor;
+	/** Console input editors by session id. */
+	consoleEditors?: Record<string, vscode.TextEditor>;
+	/** The session whose console input was the most recently focused text editor, if any. */
+	consoleInputFocusedLastSessionId?: string;
+	runtime?: ExtHostLanguageRuntime;
+	fileDialogs?: ExtHostDialogs;
+}) {
+	const editors = new class extends mock<ExtHostEditors>() {
+		override getActiveTextEditor(): vscode.TextEditor | undefined {
+			return options.paneEditor;
+		}
+	};
+	const consoleService = new class extends mock<ExtHostConsoleService>() {
+		override getConsoleInputFocusedLastSessionId(): Promise<string | undefined> {
+			return Promise.resolve(options.consoleInputFocusedLastSessionId);
+		}
+		override consoleEditorForSession(sessionId: string): vscode.TextEditor | undefined {
+			return options.consoleEditors?.[sessionId];
+		}
+	};
+
+	return new ExtHostMethods(
+		stubInterface<IMainPositronContext>({}),
+		editors,
+		new (mock<ExtHostDocuments>())(),
+		new (mock<ExtHostModalDialogs>())(),
+		options.runtime ?? new (mock<ExtHostLanguageRuntime>())(),
+		new (mock<ExtHostWorkspace>())(),
+		new (mock<ExtHostQuickOpen>())(),
+		new (mock<ExtHostCommands>())(),
+		new (mock<ExtHostContextKeyService>())(),
+		consoleService,
+		options.fileDialogs ?? new (mock<ExtHostDialogs>())(),
+	);
+}
+
+describe('ExtHostMethods', function () {
+
+	describe('lastActiveEditorContext', function () {
+
+		it('returns null when there is no editor pane and no console', async function () {
+			const methods = createMethods({});
+			expect(await methods.lastActiveEditorContext()).toBeNull();
+		});
+
+		it('returns the editor pane context when there is no caller session id', async function () {
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const methods = createMethods({
+				paneEditor,
+				consoleEditors: { 'session-r': createFakeEditor('inmemory://repl-r') },
+				consoleInputFocusedLastSessionId: 'session-r',
+			});
+
+			const context = await methods.lastActiveEditorContext();
+
+			expect(context?.document.path).toBe('/path/to/file.R');
+			expect(context?.id).toBeUndefined();
+		});
+
+		it('returns the console context when the caller session owns the last focused console input', async function () {
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const methods = createMethods({
+				paneEditor,
+				consoleEditors: { 'session-r': createFakeEditor('inmemory://repl-r', 'x <- 1') },
+				consoleInputFocusedLastSessionId: 'session-r',
+			});
+
+			const context = await methods.lastActiveEditorContext('session-r');
+
+			expect(context?.document.path).toBe('');
+			expect(context?.id).toBe('#console');
+			expect(context?.contents).toEqual(['x <- 1']);
+		});
+
+		it('falls back to the editor pane when another session owns the last focused console input', async function () {
+			// Regression test. Running code in the R console makes it the *active* console before
+			// the RPC arrives (`PositronConsoleService.executeCode` activates the instance even
+			// with `focus: false`), so the caller has to be compared against the console the user
+			// actually focused. Here the user clicked an editor and then the Python console, so an
+			// R-bound shortcut must report the editor, not either console.
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const methods = createMethods({
+				paneEditor,
+				consoleEditors: {
+					'session-r': createFakeEditor('inmemory://repl-r'),
+					'session-python': createFakeEditor('inmemory://repl-python'),
+				},
+				consoleInputFocusedLastSessionId: 'session-python',
+			});
+
+			const context = await methods.lastActiveEditorContext('session-r');
+
+			expect(context?.document.path).toBe('/path/to/file.R');
+			expect(context?.id).toBeUndefined();
+		});
+
+		it('falls back to the editor pane when a source editor was focused last', async function () {
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const methods = createMethods({
+				paneEditor,
+				consoleEditors: { 'session-r': createFakeEditor('inmemory://repl-r') },
+				consoleInputFocusedLastSessionId: undefined,
+			});
+
+			const context = await methods.lastActiveEditorContext('session-r');
+
+			expect(context?.document.path).toBe('/path/to/file.R');
+			expect(context?.id).toBeUndefined();
+		});
+
+		it('falls back to the editor pane when the caller console has no editor yet', async function () {
+			// The console instance exists but its input widget has not mounted.
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const methods = createMethods({
+				paneEditor,
+				consoleInputFocusedLastSessionId: 'session-r',
+			});
+
+			const context = await methods.lastActiveEditorContext('session-r');
+
+			expect(context?.document.path).toBe('/path/to/file.R');
+			expect(context?.id).toBeUndefined();
+		});
+	});
+
+	describe('call: last_active_editor_context', function () {
+
+		function createMethodsWithConsoleFocusedLast() {
+			return createMethods({
+				paneEditor: createFakeEditor('/path/to/file.R'),
+				consoleEditors: { 'session-r': createFakeEditor('inmemory://repl-r') },
+				consoleInputFocusedLastSessionId: 'session-r',
+			});
+		}
+
+		it('returns the editor pane when allow_console is false, even if the console was focused last', async function () {
+			// Regression test for https://github.com/posit-dev/positron/issues/16405.
+			// `rstudioapi::getSourceEditorContext()` must never report the console.
+			const methods = createMethodsWithConsoleFocusedLast();
+
+			const response = await methods.call('ext', UiFrontendRequest.LastActiveEditorContext, { allow_console: false }, 'session-r');
+
+			expect(response).toMatchObject({ result: { id: undefined, document: { path: '/path/to/file.R' } } });
+		});
+
+		it('returns the console when allow_console is null', async function () {
+			// Ark serializes an omitted optional param as `null`
+			const methods = createMethodsWithConsoleFocusedLast();
+
+			const response = await methods.call('ext', UiFrontendRequest.LastActiveEditorContext, { allow_console: null }, 'session-r');
+
+			expect(response).toMatchObject({ result: { id: '#console', document: { path: '' } } });
+		});
+
+		it('rejects unknown params', async function () {
+			const methods = createMethodsWithConsoleFocusedLast();
+
+			const response = await methods.call('ext', UiFrontendRequest.LastActiveEditorContext, { foo: true }, 'session-r');
+
+			expect(response).toHaveProperty('error');
+		});
+	});
+
+	describe('modifyEditorLocations', function () {
+
+		it('edits the editor pane when there is no caller session id', async function () {
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const consoleEditor = createFakeEditor('inmemory://repl-r');
+			const methods = createMethods({
+				paneEditor,
+				consoleEditors: { 'session-r': consoleEditor },
+				consoleInputFocusedLastSessionId: 'session-r',
+			});
+
+			await methods.modifyEditorLocations([new Range(0, 0, 0, 5)], ['x']);
+
+			expect(paneEditor.editedRanges).toHaveLength(1);
+			expect(consoleEditor.editedRanges).toHaveLength(0);
+		});
+
+		it('edits the console editor when the caller session owns the last focused console input', async function () {
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const consoleEditor = createFakeEditor('inmemory://repl-r');
+			const methods = createMethods({
+				paneEditor,
+				consoleEditors: { 'session-r': consoleEditor },
+				consoleInputFocusedLastSessionId: 'session-r',
+			});
+
+			await methods.modifyEditorLocations([new Range(0, 0, 0, 5)], ['x'], 'session-r');
+
+			expect(consoleEditor.editedRanges).toHaveLength(1);
+			expect(paneEditor.editedRanges).toHaveLength(0);
+		});
+
+		it('edits the editor pane when another session owns the last focused console input', async function () {
+			const paneEditor = createFakeEditor('/path/to/file.R');
+			const consoleEditor = createFakeEditor('inmemory://repl-r');
+			const methods = createMethods({
+				paneEditor,
+				consoleEditors: { 'session-r': consoleEditor },
+				consoleInputFocusedLastSessionId: 'session-python',
+			});
+
+			await methods.modifyEditorLocations([new Range(0, 0, 0, 5)], ['x'], 'session-r');
+
+			expect(paneEditor.editedRanges).toHaveLength(1);
+			expect(consoleEditor.editedRanges).toHaveLength(0);
+		});
+	});
+
+	describe('executeCode', function () {
+		it('sends the session of the kernel that sent the code along with it', async function () {
+			// A kernel's `execute_code` request reaches Positron through the Kernel
+			// Supervisor; the session ID keeps the supervisor from being credited.
+			const queueCode = vi.fn<ExtHostLanguageRuntime['queueCode']>(async () => { });
+			const methods = createMethods({ runtime: stubInterface<ExtHostLanguageRuntime>({ queueCode }) });
+
+			await methods.call('positron.positron-supervisor', UiFrontendRequest.ExecuteCode,
+				{ language_id: 'r', code: '1 + 1', focus: false, allow_incomplete: false }, 'r-notebook-1');
+
+			expect(queueCode.mock.calls).toEqual([['r', '1 + 1', 'positron.positron-supervisor', false, false, 'r-notebook-1']]);
+		});
+	});
+
+	describe('call: select_file', function () {
+		const uri = URI.file('/data/file.csv');
+		const defaultUri = URI.file('/data');
+
+		it('shows an open dialog for an existing file', async function () {
+			const showOpenDialog = vi.fn<ExtHostDialogs['showOpenDialog']>(async () => [uri]);
+			const methods = createMethods({ fileDialogs: stubInterface<ExtHostDialogs>({ showOpenDialog }) });
+
+			const response = await methods.call('ext', UiFrontendRequest.SelectFile, { title: 'Select File', existing: true, default_dir: '/data' });
+
+			expect(response).toEqual({ result: uri.fsPath });
+			expect(showOpenDialog.mock.calls).toEqual([[{ title: 'Select File', defaultUri, canSelectFiles: true, canSelectFolders: false, canSelectMany: false }]]);
+		});
+
+		it('shows a save dialog for a new file', async function () {
+			const showSaveDialog = vi.fn<ExtHostDialogs['showSaveDialog']>(async () => uri);
+			const methods = createMethods({ fileDialogs: stubInterface<ExtHostDialogs>({ showSaveDialog }) });
+
+			const response = await methods.call('ext', UiFrontendRequest.SelectFile, { title: 'Select File', existing: false, default_dir: '/data' });
+
+			expect(response).toEqual({ result: uri.fsPath });
+			expect(showSaveDialog.mock.calls).toEqual([[{ title: 'Select File', defaultUri }]]);
+		});
+
+		it('starts in the calling session\'s working directory when no directory is given', async function () {
+			const showOpenDialog = vi.fn<ExtHostDialogs['showOpenDialog']>(async () => [uri]);
+			const getSessionWorkingDirectory = vi.fn<ExtHostLanguageRuntime['getSessionWorkingDirectory']>(async () => '/data');
+			const methods = createMethods({
+				fileDialogs: stubInterface<ExtHostDialogs>({ showOpenDialog }),
+				runtime: stubInterface<ExtHostLanguageRuntime>({ getSessionWorkingDirectory }),
+			});
+
+			await methods.call('ext', UiFrontendRequest.SelectFile, { title: 'Select File', existing: true }, 'r-1');
+
+			expect(getSessionWorkingDirectory.mock.calls).toEqual([['r-1']]);
+			expect(showOpenDialog.mock.calls).toEqual([[{ title: 'Select File', defaultUri, canSelectFiles: true, canSelectFolders: false, canSelectMany: false }]]);
+		});
+
+		it('returns null when the user cancels', async function () {
+			const showOpenDialog = vi.fn<ExtHostDialogs['showOpenDialog']>(async () => undefined);
+			const methods = createMethods({ fileDialogs: stubInterface<ExtHostDialogs>({ showOpenDialog }) });
+
+			const response = await methods.call('ext', UiFrontendRequest.SelectFile, { title: 'Select File', existing: true, default_dir: '/data' });
+
+			expect(response).toEqual({ result: null });
+		});
+	});
+});

@@ -1,0 +1,272 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2023-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { IDisposable } from '../../../../base/common/lifecycle.js';
+import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
+import { ILanguageRuntimeMetadata, IRuntimeManager, RuntimeStartupPhase, RuntimeState } from '../../languageRuntime/common/languageRuntimeService.js';
+import { Event } from '../../../../base/common/event.js';
+import { IRuntimeSessionMetadata } from '../../runtimeSession/common/runtimeSessionService.js';
+
+export const IRuntimeStartupService =
+	createDecorator<IRuntimeStartupService>('runtimeStartupService');
+
+
+/**
+ * Which preference rule picked the preferred runtime for a language.
+ */
+export const enum PreferredRuntimeReason {
+	/** The runtime has a running console, whether or not it is the one in front. */
+	RunningConsole,
+	WorkspaceAffiliation,
+	RecentlyStarted,
+	Recommended,
+	Fallback,
+}
+
+/**
+ * A preferred runtime and the rule that picked it.
+ */
+export interface IPreferredRuntime {
+	readonly runtime: ILanguageRuntimeMetadata;
+	readonly reason: PreferredRuntimeReason;
+	/** Why the extension recommended the runtime, if the reason is Recommended and the extension said. */
+	readonly recommendationReason?: string;
+}
+
+/**
+ * An event that is emitted when a runtime is automatically started.
+ */
+export interface IRuntimeAutoStartEvent {
+	runtime: ILanguageRuntimeMetadata;
+	newSession: boolean;
+	activate: boolean;
+}
+
+/**
+ * An event that is emitted when a session that was meant to be restored fails
+ * to be restored.
+ */
+export interface ISessionRestoreFailedEvent {
+	/** The session ID that failed to restore */
+	sessionId: string;
+
+	/** The restoration error, if known */
+	error: Error;
+}
+
+/**
+ * Metadata for serialized runtime sessions.
+ */
+export interface SerializedSessionMetadata {
+	/// The user-facing name of the session.
+	sessionName: string;
+
+	/// The metadata for the runtime session itself.
+	metadata: IRuntimeSessionMetadata;
+
+	/// The state of the runtime, at the time it was serialized.
+	sessionState: RuntimeState;
+
+	/// The time at which the session was last used, in milliseconds since the epoch.
+	lastUsed: number;
+
+	/// Whether this was the last console the user focused when the session was
+	/// serialized. When a notebook is in front, this is the console that was in
+	/// front before it. Missing for sessions serialized before this was recorded.
+	isLastActiveConsole?: boolean;
+
+	/// The metadata of the runtime associated with the session.
+	runtimeMetadata: ILanguageRuntimeMetadata;
+
+	/// The working directory of the runtime session, at the time it was serialized.
+	workingDirectory: string;
+
+	/// Whether the session has a console. Console sessions always do,
+	/// background sessions never do, and notebook sessions sometimes do
+	/// (depending on whether the user has created one)
+	hasConsole: boolean;
+
+	/// The ID of the window in which the session was last used.
+	localWindowId: string;
+}
+
+/**
+ * The IRuntimeStartupService is responsible for coordinating the process by
+ * which runtimes are automatically started when a workspace is opened, and
+ * reconnected to when a workspace is reloaded or reopened.
+ */
+export interface IRuntimeStartupService {
+	// Needed for service branding in dependency injector.
+	readonly _serviceBrand: undefined;
+
+	/**
+	 * Resets the architecture mismatch warning dismissal for a specific language
+	 * or all languages.
+	 *
+	 * @param languageId Optional language ID. If not provided, resets for all languages.
+	 */
+	resetArchitectureMismatchWarning(languageId?: string): void;
+
+	/**
+	 * Get the preferred runtime for a language. This approximates "the runtime
+	 * the user probably wants to start for the given language" and takes a
+	 * number of variables into account, including the what's active now, what
+	 * they've used recently, etc.
+	 *
+	 * @param languageId The language identifier.
+	 * @returns The preferred runtime for the given language identifier, or
+	 *  undefined if no runtimes are registered for the given language identifier.
+	 */
+	getPreferredRuntime(languageId: string): ILanguageRuntimeMetadata | undefined;
+
+	/**
+	 * Like getPreferredRuntime, but also says which preference rule picked the runtime.
+	 *
+	 * @param languageId The language identifier.
+	 * @returns The preferred runtime and the reason, or undefined if no runtimes
+	 *  are registered for the given language identifier.
+	 */
+	getPreferredRuntimeWithReason(languageId: string): IPreferredRuntime | undefined;
+
+	/**
+	 * Asks the language's runtime manager to make the interpreter at a path
+	 * available, registering it with Positron.
+	 *
+	 * @param languageId The language identifier.
+	 * @param path The path to the interpreter.
+	 * @returns The registered runtime's metadata. Throws if no manager for the
+	 *  language is disabled, no manager for the language supports registering
+	 *  by path, or the manager rejects it.
+	 */
+	registerRuntimeFromPath(languageId: string, path: string): Promise<ILanguageRuntimeMetadata>;
+
+	/**
+	 * Whether any extension provides language runtimes for a language. This
+	 * mostly comes from the static `languageRuntimes` contribution, so it is
+	 * known as soon as extensions are scanned -- before they activate and before
+	 * any runtime has been discovered -- but a registered runtime counts too.
+	 *
+	 * @param languageId The language identifier.
+	 */
+	hasLanguageRuntimeProvider(languageId: string): boolean;
+
+	/**
+	 * The language IDs that have a runtime provider: every `languageRuntimes`
+	 * contribution plus any language with a registered runtime.
+	 */
+	readonly languageIds: readonly string[];
+
+	/** Fires when `languageIds` changes. */
+	readonly onDidChangeLanguageIds: Event<void>;
+
+	/**
+	 * Whether the workspace has affiliated runtimes.
+	 */
+	hasAffiliatedRuntime(): boolean;
+
+	/**
+	 * Gets metadata for the runtime affiliated with the workspace for the given
+	 * languageId, or undefined if no runtimes with the given languageId are
+	 * affiliated with the workspace.
+	 *
+	 * @param languageId The language identifier.
+	 */
+	getAffiliatedRuntimeMetadata(languageId: string): ILanguageRuntimeMetadata | undefined;
+
+	/**
+	 * Gets all the affiliated runtimes for the workspace.
+	 */
+	getAffiliatedRuntimes(): Array<ILanguageRuntimeMetadata>;
+
+	/**
+	 * Clears a specific runtime from the list of affiliated runtimes.
+	 */
+	clearAffiliatedRuntime(languageId: string): void;
+
+	/**
+	 * An event that is emitted when a runtime is about to be automatically
+	 * started or resumed in a new Positron window.
+	 *
+	 * This event is intended to help communicate startup information to the
+	 * UI; it is not reliable as a signal that a runtime will actually start.
+	 * It may fire for runtimes that ultimately do not start (due to e.g. stale
+	 * metadata), and may fire multiple times for the same runtime.
+	 *
+	 * Use `onWillStartSession` for a reliable start signal.
+	 */
+	onWillAutoStartRuntime: Event<IRuntimeAutoStartEvent>;
+
+	/**
+	 * Signal that discovery of language runtimes is completed for an extension host.
+	 *
+	 * @param id the id of the MainThreadLanguageRuntime instance for the extension host
+	 */
+	completeDiscovery(id: number): void;
+
+	/**
+	 * Signal that an extension host finished discovering the runtimes for one
+	 * language, before it finished discovering every language.
+	 *
+	 * @param id the id of the MainThreadLanguageRuntime instance for the extension host
+	 * @param languageId the language whose discovery finished
+	 */
+	completeLanguageDiscovery(id: number, languageId: string): void;
+
+	/**
+	 * Kick off a user-driven refresh of runtime discovery, after the initial discovery.
+	 *
+	 * @param quiet If true, suppress notification toasts about discovery results.
+	 */
+	rediscoverAllRuntimes(quiet?: boolean): Promise<void>;
+
+	/**
+	 * Get the sessions that were (or will be) restored into this window.
+	 */
+	getRestoredSessions(): Promise<SerializedSessionMetadata[]>;
+
+	/**
+	 * Fired when session restoration fails
+	 */
+	onSessionRestoreFailure: Event<ISessionRestoreFailedEvent>;
+
+	/**
+	 * Register a runtime reported by a runtime manager, and add it to the
+	 * discovery cache if a discovery pass is in progress.
+	 *
+	 * @param metadata The metadata of the discovered runtime
+	 */
+	registerDiscoveredRuntime(metadata: ILanguageRuntimeMetadata): void;
+
+	/**
+	 * Register a runtime manager with the service; returns a disposable that
+	 * can be used to unregister the manager.
+	 *
+	 * @param manager The runtime manager
+	 */
+	registerRuntimeManager(manager: IRuntimeManager): IDisposable;
+
+	/**
+	 * Current startup phase. Equivalent to ILanguageRuntimeService.startupPhase
+	 * but exposed here so diagnostics consumers don't need to plumb both
+	 * services. `Complete` can coexist with a background revalidation pass --
+	 * consult `backgroundDiscoveryInProgress` to disambiguate.
+	 */
+	readonly startupPhase: RuntimeStartupPhase;
+
+	/**
+	 * Whether a background full / revalidation pass is currently in flight.
+	 * Tracked separately from `startupPhase` because a background pass can
+	 * run after the phase has reached `Complete` (warm starts).
+	 */
+	readonly backgroundDiscoveryInProgress: boolean;
+
+	/**
+	 * Number of runtimes registered at the end of the last completed discovery
+	 * pass (persisted across sessions). Returns 0 if no prior discovery has
+	 * completed on this machine. UIs can use this as a hint for showing
+	 * determinate progress during a fresh discovery pass.
+	 */
+	readonly lastDiscoveryRuntimeCount: number;
+}

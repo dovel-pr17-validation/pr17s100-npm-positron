@@ -1,0 +1,71 @@
+name: 'Setup E2E Test Dependencies'
+description: 'Install TypeScript, Playwright, and test dependencies, then compile tests'
+
+inputs:
+  working-directory:
+    description: 'Working directory to run commands in (default: current directory)'
+    required: false
+    default: '.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup test dependencies and compile tests
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PLAYWRIGHT_BROWSERS_PATH: .playwright-browsers
+      run: |
+        # Pin these to the exact versions in the root package-lock.json, read
+        # while the root files are still here. Hardcoded copies drifted (this
+        # step once pinned @playwright/test ^1.53.1 long after the root moved
+        # to ^1.62.1), and package.json ranges let a fresh upstream release in
+        # before the root adopts it: @playwright/test 1.64.0 changed
+        # tracing.start() typings and broke compile here overnight. Aliases keep
+        # their alias, e.g. typescript -> @typescript/typescript6, whose bin is
+        # `tsc6`; test/e2e's compile script invokes it by that path.
+        lockedSpecs() {
+          node -e '
+            const lock = require("./package-lock.json").packages;
+            const missing = [];
+            const specs = process.argv.slice(1).map((n) => {
+              const entry = lock["node_modules/" + n];
+              if (!entry) {
+                missing.push(n);
+                return "";
+              }
+              return entry.name && entry.name !== n
+                ? n + "@npm:" + entry.name + "@" + entry.version
+                : n + "@" + entry.version;
+            });
+            if (missing.length) {
+              console.error("not in the root package-lock.json: " + missing.join(", "));
+              process.exit(1);
+            }
+            console.log(specs.join(" "));
+          ' "$@"
+        }
+        ROOT_DEPS=$(lockedSpecs \
+          @playwright/test \
+          @midleman/playwright-reporter \
+          @midleman/github-actions-reporter \
+          @vscode/v8-heap-parser)
+        TS_SPEC=$(lockedSpecs typescript)
+
+        # Must remove root package.json and provide simple stub to use root dir for test run but not build
+        rm package.json
+        echo '{"scripts":{"compile":"npx tsc"}}' > package.json
+
+        npm install "$TS_SPEC"
+
+        npm install $ROOT_DEPS
+        npx playwright install
+        npx playwright install-deps
+
+        # Declared nowhere else, so there is no version to inherit.
+        npm install @currents/playwright@^1.14.1
+        npm install fs-extra
+        npm install axe-core
+
+        npm --prefix test/e2e install
+        npm --prefix test/e2e run compile

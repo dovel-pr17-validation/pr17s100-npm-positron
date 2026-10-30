@@ -1,0 +1,336 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/// <reference types="vitest/globals" />
+
+import { Emitter } from '../../../../../base/common/event.js';
+import { DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { PositronDataExplorerInstance } from '../../browser/positronDataExplorerInstance.js';
+import { DataExplorerClientInstance } from '../../../languageRuntime/common/languageRuntimeDataExplorerClient.js';
+import { PositronDataExplorerDuckDBBackend } from '../../common/positronDataExplorerDuckDBBackend.js';
+import { PositronReactServices } from '../../../../../base/browser/positronReactServices.js';
+import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
+import { BackendState, ColumnDisplayType, DatasetImportOptions, ExportFormat, RowFilterCondition, RowFilterType, SchemaUpdateEvent, SetDatasetImportOptionsResult, SupportedFeatures, SupportStatus } from '../../../languageRuntime/common/positronDataExplorerComm.js';
+import { createTestContainer } from '../../../../../test/vitest/positronTestContainer.js';
+import { stubInterface } from '../../../../../test/vitest/stubInterface.js';
+
+/** Builds a typed mock of the DuckDB backend's setDatasetImportOptions; its return type also gives us the Mock type without importing from 'vitest'. */
+const createSetImportOptionsStub = () =>
+	vi.fn((_options: DatasetImportOptions): Promise<SetDatasetImportOptionsResult> => Promise.resolve({}));
+
+/** A SupportedFeatures with everything unsupported; the file-options tests don't exercise grid features. */
+const NO_FEATURES: SupportedFeatures = {
+	search_schema: { support_status: SupportStatus.Unsupported, supported_types: [] },
+	set_column_filters: { support_status: SupportStatus.Unsupported, supported_types: [] },
+	set_row_filters: { support_status: SupportStatus.Unsupported, supports_conditions: SupportStatus.Unsupported, supported_types: [] },
+	get_column_profiles: { support_status: SupportStatus.Unsupported, supported_types: [] },
+	set_sort_columns: { support_status: SupportStatus.Unsupported },
+	export_data_selection: { support_status: SupportStatus.Unsupported, supported_formats: [] },
+	convert_to_code: { support_status: SupportStatus.Unsupported },
+};
+
+describe('PositronDataExplorerInstance file options', () => {
+	const ctx = createTestContainer()
+		.withReactServices()
+		.stub(IConfigurationService, new TestConfigurationService())
+		.build();
+
+	let instance: PositronDataExplorerInstance;
+	let setDatasetImportOptions: ReturnType<typeof createSetImportOptionsStub>;
+	let backendState: BackendState;
+	let mockClient: Partial<DataExplorerClientInstance>;
+	let disposables: DisposableStore;
+
+	// A DuckDB-backed Excel workbook with two sheets.
+	const makeBackendState = (): BackendState => ({
+		display_name: 'book.xlsx',
+		table_shape: { num_rows: 2, num_columns: 2 },
+		table_unfiltered_shape: { num_rows: 2, num_columns: 2 },
+		has_row_labels: false,
+		available_sheets: ['Summary', 'People'],
+		column_filters: [],
+		row_filters: [],
+		sort_keys: [],
+		supported_features: NO_FEATURES,
+	});
+
+	beforeEach(() => {
+		// The instance reads PositronReactServices.services in its constructor;
+		// bridge the builder-configured container to the singleton.
+		PositronReactServices.services = ctx.reactServices;
+
+		backendState = makeBackendState();
+		setDatasetImportOptions = createSetImportOptionsStub();
+
+		const backendClient = stubInterface<PositronDataExplorerDuckDBBackend>({
+			clientId: 'duckdb:file:///book.xlsx',
+			setDatasetImportOptions,
+		});
+
+		mockClient = {
+			backendClient,
+			get cachedBackendState() { return backendState; },
+			onDidClose: new Emitter<void>().event,
+			onDidSchemaUpdate: new Emitter<SchemaUpdateEvent>().event,
+			onDidDataUpdate: new Emitter<void>().event,
+			onDidUpdateBackendState: new Emitter<BackendState>().event,
+			getBackendState: vi.fn().mockResolvedValue(backendState),
+			getSupportedFeatures: vi.fn().mockReturnValue(backendState.supported_features),
+			getSchema: vi.fn(async (indices: number[]) => ({ columns: [] })),
+			dispose: vi.fn(),
+		};
+
+		instance = new PositronDataExplorerInstance('R', mockClient as DataExplorerClientInstance);
+		disposables = new DisposableStore();
+	});
+
+	afterEach(() => {
+		disposables.dispose();
+		instance.dispose();
+	});
+
+	afterAll(() => {
+		PositronReactServices.services = undefined!;
+	});
+
+	it('exposes available sheets and defaults the selected sheet to the first', () => {
+		expect(instance.fileAvailableSheets).toEqual(['Summary', 'People']);
+		expect(instance.fileSelectedSheet).toBe('Summary');
+	});
+
+	it('applyFileOptions sends both options and updates state, firing the header event only on change', async () => {
+		const headerChanges: boolean[] = [];
+		disposables.add(instance.onDidChangeFileHasHeaderRow(value => headerChanges.push(value)));
+
+		await instance.applyFileOptions({ hasHeaderRow: false, sheetName: 'People' });
+
+		expect(setDatasetImportOptions).toHaveBeenCalledWith({ has_header_row: false, sheet_name: 'People' });
+		expect(instance.fileHasHeaderRow).toBe(false);
+		expect(instance.fileSelectedSheet).toBe('People');
+		expect(headerChanges).toEqual([false]);
+	});
+
+	it('does not fire the header event when only the sheet changes', async () => {
+		const headerChanges: boolean[] = [];
+		disposables.add(instance.onDidChangeFileHasHeaderRow(value => headerChanges.push(value)));
+
+		await instance.applyFileOptions({ hasHeaderRow: true, sheetName: 'People' });
+
+		expect(instance.fileSelectedSheet).toBe('People');
+		expect(headerChanges).toEqual([]);
+	});
+
+	it('leaves state unchanged and notifies on failure', async () => {
+		const errorSpy = vi.spyOn(ctx.reactServices.notificationService, 'error');
+		setDatasetImportOptions.mockResolvedValue({ error_message: 'Sheet "People" not found' });
+
+		await instance.applyFileOptions({ hasHeaderRow: false, sheetName: 'People' });
+
+		expect(errorSpy).toHaveBeenCalled();
+		// State must not advance when the backend rejected the options.
+		expect(instance.fileHasHeaderRow).toBe(true);
+		expect(instance.fileSelectedSheet).toBe('Summary');
+	});
+
+	it('toggleFileHasHeaderRow flips the header while preserving the selected sheet', async () => {
+		await instance.applyFileOptions({ hasHeaderRow: true, sheetName: 'People' });
+		setDatasetImportOptions.mockClear();
+
+		await instance.toggleFileHasHeaderRow();
+
+		expect(setDatasetImportOptions).toHaveBeenCalledWith({ has_header_row: false, sheet_name: 'People' });
+		expect(instance.fileHasHeaderRow).toBe(false);
+	});
+
+	it('getImportView returns undefined when the backend state holds no filters or sorts', async () => {
+		expect(await instance.getImportView()).toBeUndefined();
+	});
+
+	it('getImportView reads the state fresh, so a filter applied a moment earlier is in the view', async () => {
+		// The cached state (backendState) has no filters; the fresh one does. Reading the cache
+		// would offer no view at all, and the dialog would show no checkbox.
+		mockClient.getBackendState = vi.fn().mockResolvedValue({
+			...backendState,
+			row_filters: [{
+				filter_id: 'f1',
+				filter_type: RowFilterType.IsNull,
+				column_schema: {
+					column_name: 'carrier',
+					column_index: 0,
+					type_name: 'VARCHAR',
+					type_display: ColumnDisplayType.String,
+				},
+				condition: RowFilterCondition.And,
+			}],
+		});
+
+		const view = await instance.getImportView();
+
+		expect(view).toEqual({
+			rowFilters: [{
+				columnName: 'carrier',
+				columnType: 'string',
+				condition: 'and',
+				filterType: 'is_null',
+			}],
+			sortKeys: [],
+		});
+		// True is what makes it wait for a filter/sort task that is still in flight.
+		expect(mockClient.getBackendState).toHaveBeenCalledWith(true);
+	});
+
+	it('getViewContext describes the cursor and a small row selection with its values', async () => {
+		mockClient.exportDataSelection = vi.fn().mockResolvedValue({ data: 'a\tb', format: ExportFormat.Tsv });
+		instance.tableDataDataGridInstance.setCursorPosition(1, 0);
+		instance.tableDataDataGridInstance.selectRow(1);
+
+		const context = await instance.getViewContext();
+
+		// Column names and row labels fall back to indexes when they aren't cached.
+		expect(context).toEqual({
+			displayName: 'book.xlsx',
+			shape: { rows: 2, columns: 2 },
+			unfilteredShape: { rows: 2, columns: 2 },
+			rowFilters: [],
+			sortKeys: [],
+			cursor: { column: '1', row: '0' },
+			selection: { kind: 'rows', columnCount: 2, rowCount: 1, columns: ['0', '1'], rows: ['1'], values: 'a\tb' },
+		});
+	});
+
+	it('getViewContext omits the values and rows of a large column selection', async () => {
+		backendState.table_shape = { num_rows: 1000, num_columns: 2 };
+		mockClient.exportDataSelection = vi.fn();
+		instance.tableDataDataGridInstance.selectColumn(0);
+
+		const context = await instance.getViewContext();
+
+		expect(context.selection).toEqual({ kind: 'columns', columnCount: 1, rowCount: 1000, columns: ['0'], rows: undefined, values: undefined });
+		expect(mockClient.exportDataSelection).not.toHaveBeenCalled();
+	});
+
+	it('isFileBacked is true for a duckdb-backed instance', () => {
+		expect(instance.isFileBacked).toBe(true);
+	});
+
+	it('isFileBacked is false for a kernel-backed instance', () => {
+		const kernelClient: Partial<DataExplorerClientInstance> = {
+			backendClient: stubInterface<PositronDataExplorerDuckDBBackend>({ clientId: 'client-abc123' }),
+			get cachedBackendState() { return backendState; },
+			onDidClose: new Emitter<void>().event,
+			onDidSchemaUpdate: new Emitter<SchemaUpdateEvent>().event,
+			onDidDataUpdate: new Emitter<void>().event,
+			onDidUpdateBackendState: new Emitter<BackendState>().event,
+			getBackendState: vi.fn().mockResolvedValue(backendState),
+			getSupportedFeatures: vi.fn().mockReturnValue(backendState.supported_features),
+			dispose: vi.fn(),
+		};
+		const kernelInstance = new PositronDataExplorerInstance('Python', kernelClient as DataExplorerClientInstance);
+		expect(kernelInstance.isFileBacked).toBe(false);
+		kernelInstance.dispose();
+	});
+});
+
+describe('PositronDataExplorerInstance refresh', () => {
+	const ctx = createTestContainer()
+		.withReactServices()
+		.stub(IConfigurationService, new TestConfigurationService())
+		.build();
+
+	const backendState: BackendState = {
+		display_name: 'people',
+		table_shape: { num_rows: 2, num_columns: 2 },
+		table_unfiltered_shape: { num_rows: 2, num_columns: 2 },
+		has_row_labels: false,
+		column_filters: [],
+		row_filters: [],
+		sort_keys: [],
+		supported_features: NO_FEATURES,
+	};
+
+	let instance: PositronDataExplorerInstance;
+	let refresh: ReturnType<typeof vi.fn<() => Promise<void>>>;
+	let disposables: DisposableStore;
+
+	beforeEach(() => {
+		PositronReactServices.services = ctx.reactServices;
+		refresh = vi.fn<() => Promise<void>>();
+		const client: Partial<DataExplorerClientInstance> = {
+			backendClient: stubInterface<PositronDataExplorerDuckDBBackend>({ clientId: 'duckdbconn:1:table:main.people' }),
+			get cachedBackendState() { return backendState; },
+			supportsRefresh: true,
+			refresh,
+			onDidClose: new Emitter<void>().event,
+			onDidSchemaUpdate: new Emitter<SchemaUpdateEvent>().event,
+			onDidDataUpdate: new Emitter<void>().event,
+			onDidUpdateBackendState: new Emitter<BackendState>().event,
+			getBackendState: vi.fn().mockResolvedValue(backendState),
+			getSupportedFeatures: vi.fn().mockReturnValue(backendState.supported_features),
+			dispose: vi.fn(),
+		};
+		instance = new PositronDataExplorerInstance('people', client as DataExplorerClientInstance);
+		disposables = new DisposableStore();
+	});
+
+	afterEach(() => {
+		disposables.dispose();
+		instance.dispose();
+	});
+
+	afterAll(() => {
+		PositronReactServices.services = undefined!;
+	});
+
+	it('joins a refresh that is already in progress, and reports progress while it runs', async () => {
+		let finishRefresh!: () => void;
+		refresh.mockReturnValue(new Promise<void>(resolve => finishRefresh = resolve));
+		const refreshing: boolean[] = [];
+		disposables.add(instance.onDidChangeRefreshing(isRefreshing => refreshing.push(isRefreshing)));
+
+		const first = instance.refresh();
+		const second = instance.refresh();
+		const isRefreshingWhileRunning = instance.isRefreshing;
+		finishRefresh();
+		await Promise.all([first, second]);
+
+		expect({
+			refreshCalls: refresh.mock.calls.length,
+			isRefreshingWhileRunning,
+			isRefreshingAfter: instance.isRefreshing,
+			refreshing,
+		}).toEqual({ refreshCalls: 1, isRefreshingWhileRunning: true, isRefreshingAfter: false, refreshing: [true, false] });
+	});
+
+	it('reports a failed refresh to the user and can refresh again', async () => {
+		const errorSpy = vi.spyOn(ctx.reactServices.notificationService, 'error');
+		refresh.mockRejectedValueOnce(new Error('table was dropped'));
+
+		await instance.refresh();
+		refresh.mockResolvedValueOnce();
+		await instance.refresh();
+
+		expect({
+			notified: errorSpy.mock.calls.map(([message]) => String(message)),
+			refreshCalls: refresh.mock.calls.length,
+		}).toEqual({
+			notified: ['Unable to refresh the data: table was dropped'],
+			refreshCalls: 2,
+		});
+	});
+
+	it('does not report a refresh that fails after the explorer closed', async () => {
+		const errorSpy = vi.spyOn(ctx.reactServices.notificationService, 'error');
+		let failRefresh!: (error: Error) => void;
+		refresh.mockReturnValue(new Promise<void>((_resolve, reject) => failRefresh = reject));
+
+		const refreshed = instance.refresh();
+		instance.dispose();
+		failRefresh(new Error('The data explorer backend was closed.'));
+		await refreshed;
+
+		expect(errorSpy).not.toHaveBeenCalled();
+	});
+});

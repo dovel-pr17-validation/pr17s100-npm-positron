@@ -1,0 +1,335 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2025-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { expect, chromium, Browser, BrowserContext, Locator, Page } from '@playwright/test';
+import { Code } from '../infra/code';
+import { completeDatabricksOktaSignIn } from '../utils/databricksOAuth.js';
+import { armExternalUrlCapture, waitForExternalUrl } from '../utils/externalUrl.js';
+
+// Helpers for authenticating against model providers, kept free of any particular
+// UI's selectors so provider metadata and the OAuth device-code flow stay out of
+// the provider manager page object.
+
+/**
+ * Fills an input element's value using evaluate() instead of Playwright's
+ * fill() to prevent the value from being recorded in Playwright trace files.
+ * Use this for sensitive values like API keys and passwords.
+ */
+export async function fillSecretValue(locator: Locator, value: string): Promise<void> {
+	await locator.evaluate((el: HTMLInputElement, val) => {
+		// Take the value setter from the element's OWN realm (its document's window)
+		// rather than the top-level window, so React's value tracker is bypassed
+		// correctly even when the workbench renders in a different browsing context
+		// (as it can on the web build). Falls back to the top window, then a direct
+		// assignment.
+		const view = el.ownerDocument.defaultView ?? window;
+		const nativeSetter = Object.getOwnPropertyDescriptor(
+			view.HTMLInputElement.prototype, 'value'
+		)?.set;
+		if (nativeSetter) {
+			nativeSetter.call(el, val);
+		} else {
+			el.value = val;
+		}
+		// Dispatch both input and change. React's onChange for a controlled input
+		// keys off the input event; change is dispatched too for any listener that
+		// relies on it and to more closely match a real user edit.
+		el.dispatchEvent(new Event('input', { bubbles: true }));
+		el.dispatchEvent(new Event('change', { bubbles: true }));
+	}, value);
+}
+
+const POSIT_EMAIL_FIELD = 'input[name="email"]';
+const POSIT_PASSWORD_FIELD = 'input[name="password"]';
+const POSIT_CONTINUE_BUTTON = 'button[type="submit"]:has-text("Continue")';
+const POSIT_LOGIN_BUTTON = 'button[type="submit"]:has-text("Log in")';
+
+/**
+ * Supported model providers for authentication.
+ */
+export type ModelProvider =
+	| 'anthropic'
+	| 'bedrock'
+	| 'databricks'
+	| 'echo'
+	| 'error'
+	| 'ms-foundry'
+	| 'openai'
+	| 'positai'
+	| 'snowflake-cortex';
+
+/**
+ * Authentication types for model providers.
+ */
+export type ProviderAuthType = 'none' | 'apiKey' | 'aws' | 'oauth' | 'oauthLoopback';
+
+/**
+ * Supported OAuth providers for device code flow.
+ */
+export type OAuthProvider = 'posit';
+
+/**
+ * Configuration for OAuth device code flow authentication.
+ */
+export interface OAuthDeviceCodeConfig {
+	/** The OAuth provider (e.g., 'posit') */
+	provider: OAuthProvider;
+	/** URL to navigate to for device code entry (empty if constructed from env var) */
+	verificationUrl: string;
+	/** Environment variable name for the auth host base URL (used to construct verification URL) */
+	authHostEnvVar?: string;
+	/** Environment variable names for credentials */
+	envVars: {
+		username: string;
+		password: string;
+		otp?: string;
+	};
+}
+
+/**
+ * Options for the loginModelProvider method.
+ */
+export interface LoginModelProviderOptions {
+	/** API key for providers that support API key authentication */
+	apiKey?: string;
+	/** Base URL for providers that require one (e.g. ms-foundry); falls back to *_BASE_URL env var */
+	baseUrl?: string;
+	/** Timeout for verifying sign-in success (default: 15000ms) */
+	timeout?: number;
+	/** Whether to run the OAuth browser in headless mode (default: false) */
+	headless?: boolean;
+	/**
+	 * Which authentication method to pick when the provider offers a choice
+	 * (currently Databricks: OAuth or API Key). Defaults to the provider's own
+	 * default, which is whatever the provider screen preselects.
+	 */
+	authMethod?: 'oauth' | 'apiKey';
+}
+
+export function getProviderAuthType(provider: ModelProvider): ProviderAuthType {
+	switch (provider.toLowerCase()) {
+		case 'echo':
+		case 'error':
+			return 'none';
+		case 'anthropic':
+		case 'openai':
+		case 'ms-foundry':
+		case 'snowflake-cortex':
+			return 'apiKey';
+		case 'bedrock':
+			return 'aws';
+		case 'positai':
+			return 'oauth';
+		case 'databricks':
+			// Authorization code + PKCE against a loopback server, not a device code
+			// flow, and only offered on desktop (see completeDatabricksLoopbackOAuth).
+			return 'oauthLoopback';
+		default:
+			throw new Error(`Unknown provider: ${provider}`);
+	}
+}
+
+/**
+ * Whether the provider requires a Base URL alongside its API key (e.g.
+ * Microsoft Foundry's Azure endpoint). These providers expose a "Base URL"
+ * field on Posit Assistant's provider screen in addition to the API key field.
+ *
+ * Databricks labels the same field "Workspace URL" and needs it under both auth
+ * methods -- OAuth discovers the workspace's OIDC endpoints from it. Snowflake
+ * labels it "Account Identifier" and stores the bare account rather than a URL,
+ * deriving the Cortex endpoint from it (see getBaseUrlLabel in
+ * src/vs/workbench/contrib/positronAssistant/browser/providerFieldLabels.ts).
+ */
+export function providerRequiresBaseUrl(provider: ModelProvider): boolean {
+	const id = provider.toLowerCase();
+	return id === 'ms-foundry' || id === 'databricks' || id === 'snowflake-cortex';
+}
+
+export function getProviderBaseUrlEnvVarName(provider: ModelProvider): string {
+	// Databricks reuses the workspace URL the posit-assistant Databricks API-key test
+	// already runs against, rather than introducing a DATABRICKS_BASE_URL alias for it.
+	if (provider.toLowerCase() === 'databricks') {
+		return 'DATABRICKS_WORKSPACE';
+	}
+	// Snowflake's "base URL" is the bare account identifier, so it reuses the
+	// SNOWFLAKE_ACCOUNT the data-connections suite already runs against rather
+	// than a SNOWFLAKE_CORTEX_BASE_URL alias for it.
+	if (provider.toLowerCase() === 'snowflake-cortex') {
+		return 'SNOWFLAKE_ACCOUNT';
+	}
+	return `${provider.toUpperCase().replace(/-/g, '_')}_BASE_URL`;
+}
+
+export function getOAuthConfig(provider: ModelProvider): OAuthDeviceCodeConfig {
+	switch (provider.toLowerCase()) {
+		case 'positai':
+			return {
+				provider: 'posit',
+				verificationUrl: '',
+				authHostEnvVar: 'POSIT_AUTH_HOST',
+				envVars: {
+					username: 'POSIT_EMAIL',
+					password: 'POSIT_PASSWORD'
+				}
+			};
+		default:
+			throw new Error(`No OAuth configuration for provider: ${provider}`);
+	}
+}
+
+export function getProviderEnvVarName(provider: ModelProvider): string {
+	switch (provider.toLowerCase()) {
+		case 'anthropic':
+			return 'ANTHROPIC_KEY';
+		case 'openai':
+			return 'OPENAI_KEY';
+		case 'databricks':
+			// Databricks calls its API key a personal access token.
+			return 'DATABRICKS_PAT';
+		case 'snowflake-cortex':
+			// The default derivation would ask for SNOWFLAKE_CORTEX_KEY; the account's
+			// programmatic access token is stored under the platform's own name.
+			return 'SNOWFLAKE_API_KEY';
+		default:
+			return `${provider.toUpperCase().replace(/-/g, '_')}_KEY`;
+	}
+}
+
+export function getProviderEnvKey(provider: ModelProvider): string | undefined {
+	return process.env[getProviderEnvVarName(provider)];
+}
+
+async function completePositLogin(page: Page, config: OAuthDeviceCodeConfig, verificationUrl: string): Promise<void> {
+	const email = process.env[config.envVars.username];
+	const password = process.env[config.envVars.password];
+
+	if (!email || !password) {
+		throw new Error(
+			`Posit OAuth credentials not found. Please set ${config.envVars.username} and ${config.envVars.password} environment variables.`
+		);
+	}
+
+	await page.goto(verificationUrl);
+
+	await expect(page.locator(POSIT_EMAIL_FIELD)).toBeVisible({ timeout: 15000 });
+	await page.locator(POSIT_EMAIL_FIELD).fill(email);
+	await page.locator(POSIT_CONTINUE_BUTTON).click();
+
+	await expect(page.locator(POSIT_PASSWORD_FIELD)).toBeVisible({ timeout: 15000 });
+	await fillSecretValue(page.locator(POSIT_PASSWORD_FIELD), password);
+	await page.locator(POSIT_LOGIN_BUTTON).click();
+
+	const continueButton = page.locator('button[type="submit"]:has-text("Continue")');
+	await expect(continueButton).toBeVisible({ timeout: 15000 });
+	await continueButton.click();
+
+	const authorizeButton = page.locator('button[type="submit"]:has-text("Authorize")');
+	await expect(authorizeButton).toBeVisible({ timeout: 15000 });
+	await authorizeButton.click();
+
+	await expect(page.locator('body')).toContainText(/success|authorized|complete|congratulations/i, { timeout: 30000 });
+
+	await page.close();
+}
+
+/**
+ * Drives the external Posit login for a device code the caller already has,
+ * e.g. one read from the Posit Assistant provider manager webview.
+ * Pass `verificationUrl` when the auth server supplied one; otherwise it's built from the auth host.
+ */
+export async function completeOAuthDeviceCodeLoginWithCode(config: OAuthDeviceCodeConfig, verificationCode: string, options: LoginModelProviderOptions = {}, verificationUrl?: string): Promise<void> {
+	const { headless = false } = options;
+
+	let finalVerificationUrl = verificationUrl || config.verificationUrl;
+	if (!finalVerificationUrl && config.authHostEnvVar) {
+		const authHost = process.env[config.authHostEnvVar];
+		if (!authHost) {
+			throw new Error(`OAuth auth host not configured. Please set ${config.authHostEnvVar} environment variable.`);
+		}
+		const redirectPath = encodeURIComponent(`/oauth/device?user_code=${verificationCode}`);
+		finalVerificationUrl = `${authHost.replace(/\/+$/, '')}/login?redirect=${redirectPath}`;
+	}
+	if (!finalVerificationUrl) {
+		throw new Error('No verification URL available for OAuth flow');
+	}
+
+	let browser: Browser | undefined;
+	let context: BrowserContext | undefined;
+	let page: Page | undefined;
+	try {
+		browser = await chromium.launch({ headless });
+		context = await browser.newContext();
+		page = await context.newPage();
+		await completePositLogin(page, config, finalVerificationUrl);
+	} finally {
+		if (context) { await context.close(); }
+		if (browser) { await browser.close(); }
+	}
+}
+
+/**
+ * Completes Databricks' OAuth sign-in, which is authorization code + PKCE against a
+ * loopback server on the machine running Positron -- not a device code flow, and so
+ * desktop only.
+ *
+ * The extension hands the authorize URL to the system browser via
+ * `vscode.env.openExternal`, and the URL carries a one-time state and PKCE challenge
+ * the test cannot reconstruct. So the URL is intercepted in the Electron main process
+ * and replayed in a browser Playwright controls; the extension's loopback server
+ * receives the redirect and finishes the token exchange on its own.
+ *
+ * @param code The running app, used for its Electron handle and logger.
+ * @param trigger Starts the sign-in (clicks Connect). Called after interception is armed.
+ */
+export async function completeDatabricksLoopbackOAuth(
+	code: Code,
+	trigger: () => Promise<void>,
+	options: LoginModelProviderOptions = {}
+): Promise<void> {
+	// Headed by default, matching the Posit device-code flow: these IdP pages are not
+	// reliably renderable headless.
+	const { headless = false } = options;
+
+	const electronApp = code.electronApp;
+	if (!electronApp) {
+		throw new Error(
+			'Databricks OAuth sign-in requires the Electron build: the flow redirects to a loopback '
+			+ 'server on the machine running the extension host, and the provider only advertises '
+			+ 'OAuth on desktop. Use the API key (PAT) method on web and remote.'
+		);
+	}
+
+	await armExternalUrlCapture(electronApp);
+	await trigger();
+
+	// The workspace's OIDC authorize endpoint. Databricks serves it under /oidc on the
+	// workspace host itself, whether discovered or fallen back to.
+	const authorizeUrl = await waitForExternalUrl(electronApp, /\/oidc\/.*authorize/);
+
+	// The redirect the loopback server is listening on (ports 8020-8040). Waiting for the
+	// browser to land there is what tells us Databricks completed the handoff.
+	const redirectUri = new URL(authorizeUrl).searchParams.get('redirect_uri');
+	if (!redirectUri) {
+		throw new Error('Databricks authorize URL carried no redirect_uri');
+	}
+	const loopbackHost = new URL(redirectUri).host;
+
+	let browser: Browser | undefined;
+	let context: BrowserContext | undefined;
+	try {
+		browser = await chromium.launch({ headless });
+		context = await browser.newContext();
+		const page = await context.newPage();
+		await page.goto(authorizeUrl);
+		await completeDatabricksOktaSignIn(page, {
+			completionUrl: new RegExp(loopbackHost.replace(/\./g, '\\.')),
+			logger: code.logger,
+			label: 'Desktop',
+		});
+	} finally {
+		if (context) { await context.close(); }
+		if (browser) { await browser.close(); }
+	}
+}

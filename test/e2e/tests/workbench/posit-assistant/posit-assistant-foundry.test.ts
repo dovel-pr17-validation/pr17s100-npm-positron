@@ -1,0 +1,74 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { expect, test, tags } from '../../_test.setup';
+
+test.use({
+	suiteId: __filename,
+	// The settings fixture can't write to the container, so checkForDevBuildUpdate can't turn this on itself.
+	extraSettings: { 'assistant.autoDevBuildUpdateCheck': true },
+	managedCredentials: 'azure',
+	enableFoundryAssistant: true,
+});
+
+test.describe('Posit Assistant - Microsoft Foundry (Azure managed credentials)', {
+	tag: [tags.WORKBENCH_AZURE, tags.ASSISTANT],
+}, () => {
+	test.beforeAll(async function ({ app, settings }) {
+		// The fixture just reloaded the window, and a check run before Posit Assistant starts is dropped.
+		await app.workbench.positAssistant.open();
+		await app.workbench.positAssistant.waitForReady();
+		// This shard skips the startup-messaging gate (see app-workbench.fixtures.ts),
+		// so the update must not wait on it either.
+		await app.workbench.positAssistant.checkForDevBuildUpdate(settings, app.workbench.quickaccess, { waitForReady: false, writeSetting: false });
+	});
+
+	test('Foundry shows as managed by Posit Workbench in the provider manager', async function ({ app }) {
+		await app.workbench.providerManager.expectManagedBy('ms-foundry', 'Posit Workbench');
+	});
+
+	test('Foundry model responds when authenticated via Azure managed credentials', async function ({ app }) {
+		// No interactive sign-in: Posit Assistant reads the Foundry token from the
+		// `posit-workbench` session (scope `msfoundry`) once the fixture has signed
+		// into PWB via Azure OIDC. The `posit.workbench.foundry.endpoint` setting
+		// (pushed by the fixture via `enableFoundryAssistant`) turns that on.
+		await app.workbench.positAssistant.open();
+		await app.workbench.positAssistant.waitForReady();
+		await app.workbench.positAssistant.startNewConversation();
+
+		// Other base-fixture providers stay enabled but unauthenticated on this
+		// shard, so select the Foundry model explicitly rather than relying on an
+		// auto-selected default. `newConversation: false` keeps the model we just
+		// picked instead of resetting to a fresh chat.
+		await app.workbench.positAssistant.selectModel('model-router');
+		await app.workbench.positAssistant.sendMessage('Say hello', true, { newConversation: false });
+		await app.workbench.positAssistant.expectResponseVisible();
+
+		const responseText = await app.workbench.positAssistant.getLastResponseText();
+		expect(responseText.length).toBeGreaterThan(0);
+	});
+
+	test('Foundry model from the models-overrides setting responds (Azure managed credentials)', async function ({ app }) {
+		// The msFoundry provider exposes the models declared in
+		// `positron.assistant.models.overrides.msFoundry` (pushed by the fixture
+		// via `enableFoundryAssistant`). Alongside `model-router`, that override
+		// declares the concrete `claude-sonnet-4-6` model. Selecting it confirms a
+		// specific overridden model -- not just the router -- resolves and responds
+		// through the managed credential, covering the model-overrides auth path.
+		await app.workbench.positAssistant.open();
+		await app.workbench.positAssistant.waitForReady();
+		await app.workbench.positAssistant.startNewConversation();
+
+		// The concrete model is collapsed under the "More models" disclosure in the
+		// picker; selectModel expands it automatically. `newConversation: false`
+		// keeps the model we just picked instead of resetting to a fresh chat.
+		await app.workbench.positAssistant.selectModel('claude-sonnet-4-6');
+		await app.workbench.positAssistant.sendMessage('Say hello', true, { newConversation: false });
+		await app.workbench.positAssistant.expectResponseVisible();
+
+		const responseText = await app.workbench.positAssistant.getLastResponseText();
+		expect(responseText.length).toBeGreaterThan(0);
+	});
+});

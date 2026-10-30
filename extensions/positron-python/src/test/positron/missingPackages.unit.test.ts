@@ -1,0 +1,311 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { expect } from 'chai';
+import * as path from 'path';
+import * as sinon from 'sinon';
+import { anything, when } from 'ts-mockito';
+import * as positron from 'positron';
+import * as vscode from 'vscode';
+import {
+    listMissingPythonPackages,
+    parsePythonImports,
+    pythonMissingPackageProbe,
+} from '../../client/positron/missingPackages';
+import { IPackageManager, PackageSession } from '../../client/positron/packages/types';
+import { mockedVSCodeNamespaces } from '../vscode-mock';
+
+suite('parsePythonImports', () => {
+    test('extracts top-level modules from import and from statements, ignoring aliases and relatives', () => {
+        const code = [
+            'import requests',
+            'import os.path',
+            'import numpy as np',
+            'import pandas, sklearn',
+            'from flask import Flask',
+            'from foo.bar import baz',
+            'from . import sibling',
+            'from .relative import thing',
+            '    import indented_within_block',
+        ].join('\n');
+
+        // Deduped, top-level only, no aliases, no relative imports.
+        expect(parsePythonImports(code).sort()).to.deep.equal(
+            ['flask', 'foo', 'indented_within_block', 'numpy', 'os', 'pandas', 'requests', 'sklearn'].sort(),
+        );
+    });
+
+    test('extracts modules from multiple statements separated by semicolons on one line', () => {
+        const code = ['import pandas; import numpy', 'x = 1; import requests; from flask import Flask'].join('\n');
+
+        expect(parsePythonImports(code).sort()).to.deep.equal(['flask', 'numpy', 'pandas', 'requests'].sort());
+    });
+});
+
+suite('pythonMissingPackageProbe', () => {
+    test('returns an import snippet for a ModuleNotFoundError', () => {
+        expect(pythonMissingPackageProbe(`No module named 'requests'`)).to.equal('import requests');
+    });
+
+    test('returns undefined for an unrelated error', () => {
+        expect(pythonMissingPackageProbe('SyntaxError: invalid syntax')).to.equal(undefined);
+    });
+});
+
+suite('listMissingPythonPackages', () => {
+    function makePackage(name: string): positron.LanguageRuntimePackage {
+        return { id: name, name, displayName: name, version: '0' };
+    }
+
+    function makeManager(searchResults: Record<string, string[]>): IPackageManager {
+        return {
+            searchPackages: sinon
+                .stub()
+                .callsFake((query: string) => Promise.resolve((searchResults[query] ?? []).map(makePackage))),
+        } as unknown as IPackageManager;
+    }
+
+    function makeSession(missing: string[]): PackageSession {
+        return {
+            metadata: { sessionId: 'python-1' },
+            callMethod: sinon.stub().resolves(missing),
+        };
+    }
+
+    function makeResolvingManager(existing: string[]): IPackageManager {
+        return {
+            resolvePackageName: sinon
+                .stub()
+                .callsFake((name: string) => Promise.resolve(existing.includes(name) ? name : undefined)),
+            searchPackages: sinon.stub().rejects(new Error('fuzzy search must not be used')),
+        } as unknown as IPackageManager;
+    }
+
+    test('offers only missing imports that resolve to an installable distribution', async () => {
+        const session = makeSession(['requests', 'garfblatz']);
+        // requests resolves on PyPI; garfblatz does not (so it is never offered).
+        const manager = makeManager({ requests: ['requests'], garfblatz: [] });
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'import requests' });
+
+        expect(result).to.deep.equal([{ name: 'requests', referencedName: undefined }]);
+    });
+
+    test('resolves an import whose distribution name differs via the alias map', async () => {
+        const session = makeSession(['cv2']);
+        // There is no PyPI package named `cv2`; only the alias `opencv-python` resolves.
+        const manager = makeManager({ cv2: [], 'opencv-python': ['opencv-python'] });
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'import cv2' });
+
+        // The install name is the distribution; the import is kept for display.
+        expect(result).to.deep.equal([{ name: 'opencv-python', referencedName: 'cv2' }]);
+    });
+
+    test('does not offer an aliased import when its distribution is not in the repository', async () => {
+        const session = makeSession(['cv2']);
+        // Neither the import name nor its alias resolves (e.g. offline / restricted index).
+        const manager = makeManager({ cv2: [], 'opencv-python': [] });
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'import cv2' });
+
+        expect(result).to.deep.equal([]);
+    });
+
+    test('passes the file directory as an import root so local modules resolve', async () => {
+        const callMethod = sinon.stub().resolves([]);
+        const session: PackageSession = { metadata: { sessionId: 'python-1' }, callMethod };
+        const manager = makeManager({});
+
+        // Build the URI from a real path so the expected root is derived with the
+        // same (platform-specific) filesystem semantics as the code under test.
+        const fileUri = vscode.Uri.file(path.join(path.resolve('project'), 'app.py'));
+        const expectedRoot = path.dirname(fileUri.fsPath);
+
+        await listMissingPythonPackages(session, manager, {
+            uri: fileUri.toString(),
+            code: 'from helper.helper_functions import say_hello',
+        });
+
+        // The kernel is asked about `helper` with the file's directory as a root
+        // so a sibling `helper` package is recognized instead of flagged missing.
+        expect(callMethod.calledOnceWith('getMissingImports', ['helper'], [expectedRoot])).to.be.true;
+    });
+
+    test('passes the file directory as an import root for vscode-remote URIs (web/remote)', async () => {
+        const callMethod = sinon.stub().resolves([]);
+        const session: PackageSession = { metadata: { sessionId: 'python-1' }, callMethod };
+        const manager = makeManager({});
+
+        // In web/remote windows the workbench sends a `vscode-remote` URI rather
+        // than `file`. Its path still maps to the kernel's filesystem, so the
+        // file's directory must be forwarded as an import root just like `file`.
+        const uri = vscode.Uri.from({
+            scheme: 'vscode-remote',
+            authority: 'server',
+            path: '/home/user/project/app.py',
+        });
+        const expectedRoot = path.dirname(uri.fsPath);
+
+        await listMissingPythonPackages(session, manager, {
+            uri: uri.toString(),
+            code: 'from helper.helper_functions import say_hello',
+        });
+
+        expect(callMethod.calledOnceWith('getMissingImports', ['helper'], [expectedRoot])).to.be.true;
+    });
+
+    suite('with workspace folders', () => {
+        teardown(() => {
+            when(mockedVSCodeNamespaces.workspace!.getWorkspaceFolder(anything())).thenReturn(undefined);
+        });
+
+        function workspaceFolderAt(fsPath: string): vscode.WorkspaceFolder {
+            return { uri: vscode.Uri.file(fsPath), name: path.basename(fsPath), index: 0 };
+        }
+
+        test('passes every directory up to the workspace folder as an import root', async () => {
+            const callMethod = sinon.stub().resolves([]);
+            const session: PackageSession = { metadata: { sessionId: 'python-1' }, callMethod };
+            const manager = makeManager({});
+
+            const project = vscode.Uri.file(path.resolve('project')).fsPath;
+            const notebooks = path.join(project, 'notebooks');
+            const fileUri = vscode.Uri.file(path.join(notebooks, 'analysis.qmd'));
+            when(mockedVSCodeNamespaces.workspace!.getWorkspaceFolder(anything())).thenReturn(
+                workspaceFolderAt(project),
+            );
+
+            await listMissingPythonPackages(session, manager, {
+                uri: fileUri.toString(),
+                code: 'from utils import run',
+            });
+
+            // A `utils` module at the project root must count as local even though the
+            // document is one level down.
+            expect(callMethod.calledOnceWith('getMissingImports', ['utils'], [notebooks, project])).to.be.true;
+        });
+
+        test('walks up to the workspace folder for vscode-remote URIs (web/remote)', async () => {
+            const callMethod = sinon.stub().resolves([]);
+            const session: PackageSession = { metadata: { sessionId: 'python-1' }, callMethod };
+            const manager = makeManager({});
+
+            // The remote extension host sees its workspace folders as `file` URIs,
+            // while the document URI arrives as `vscode-remote`, so the folder only
+            // matches when looked up by its on-disk path.
+            const folder = workspaceFolderAt('/home/user/project');
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-remote',
+                authority: 'server',
+                path: '/home/user/project/notebooks/analysis.qmd',
+            });
+            when(mockedVSCodeNamespaces.workspace!.getWorkspaceFolder(anything())).thenCall((u: vscode.Uri) =>
+                u.scheme === 'file' ? folder : undefined,
+            );
+
+            await listMissingPythonPackages(session, manager, { uri: uri.toString(), code: 'from utils import run' });
+
+            expect(
+                callMethod.calledOnceWith(
+                    'getMissingImports',
+                    ['utils'],
+                    [path.dirname(uri.fsPath), folder.uri.fsPath],
+                ),
+            ).to.be.true;
+        });
+
+        test('uses only the file directory when the file is outside every workspace folder', async () => {
+            const callMethod = sinon.stub().resolves([]);
+            const session: PackageSession = { metadata: { sessionId: 'python-1' }, callMethod };
+            const manager = makeManager({});
+
+            const fileUri = vscode.Uri.file(path.join(path.resolve('elsewhere'), 'app.py'));
+            when(mockedVSCodeNamespaces.workspace!.getWorkspaceFolder(anything())).thenReturn(undefined);
+
+            await listMissingPythonPackages(session, manager, { uri: fileUri.toString(), code: 'import utils' });
+
+            expect(callMethod.calledOnceWith('getMissingImports', ['utils'], [path.dirname(fileUri.fsPath)])).to.be
+                .true;
+        });
+
+        test('passes no import roots for an untitled document', async () => {
+            const callMethod = sinon.stub().resolves([]);
+            const session: PackageSession = { metadata: { sessionId: 'python-1' }, callMethod };
+            const manager = makeManager({});
+
+            const uri = vscode.Uri.from({ scheme: 'untitled', path: 'Untitled-1.qmd' });
+
+            await listMissingPythonPackages(session, manager, { uri: uri.toString(), code: 'import utils' });
+
+            expect(callMethod.calledOnceWith('getMissingImports', ['utils'], [])).to.be.true;
+        });
+    });
+
+    test('resolves through resolvePackageName and never runs a fuzzy search', async () => {
+        const session = makeSession(['requests', 'garfblatz']);
+        const manager = makeResolvingManager(['requests']);
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'import requests' });
+
+        expect(result).to.deep.equal([{ name: 'requests', referencedName: undefined }]);
+        expect((manager.searchPackages as sinon.SinonStub).called).to.be.false;
+    });
+
+    test('tries the curated alias first through resolvePackageName and keeps its casing', async () => {
+        const session = makeSession(['PIL']);
+        const manager = makeResolvingManager(['Pillow']);
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'from PIL import Image' });
+
+        expect(result).to.deep.equal([{ name: 'Pillow', referencedName: 'PIL' }]);
+        expect((manager.resolvePackageName as sinon.SinonStub).firstCall.args[0]).to.equal('Pillow');
+    });
+
+    test('offers an unaliased import under its normalized project name', async () => {
+        const session = makeSession(['flask_cors']);
+        const manager = makeResolvingManager(['flask-cors']);
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'import flask_cors' });
+
+        expect(result).to.deep.equal([{ name: 'flask-cors', referencedName: undefined }]);
+    });
+
+    test('does not offer a package when resolvePackageName fails', async () => {
+        const session = makeSession(['requests']);
+        const manager = {
+            resolvePackageName: sinon.stub().rejects(new Error('HTTP 503')),
+            searchPackages: sinon.stub().rejects(new Error('fuzzy search must not be used')),
+        } as unknown as IPackageManager;
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'import requests' });
+
+        expect(result).to.deep.equal([]);
+        expect((manager.searchPackages as sinon.SinonStub).called).to.be.false;
+    });
+
+    test('does not fall back to the import name when the alias lookup fails', async () => {
+        const session = makeSession(['serial']);
+        const resolvePackageName = sinon.stub();
+        resolvePackageName.withArgs('pyserial').rejects(new Error('HTTP 503'));
+        resolvePackageName.withArgs('serial').resolves('serial');
+        const manager = { resolvePackageName } as unknown as IPackageManager;
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'import serial' });
+
+        expect(result).to.deep.equal([]);
+        expect(resolvePackageName.calledWith('serial')).to.be.false;
+    });
+
+    test('returns empty when there are no imports', async () => {
+        const session = makeSession([]);
+        const manager = makeManager({});
+
+        const result = await listMissingPythonPackages(session, manager, { code: 'x = 1\n' });
+
+        expect(result).to.deep.equal([]);
+        expect((session.callMethod as sinon.SinonStub).called).to.be.false;
+    });
+});

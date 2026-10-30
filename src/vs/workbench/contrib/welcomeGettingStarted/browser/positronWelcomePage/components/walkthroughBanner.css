@@ -1,0 +1,70 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
+ * No fill, no border, no radius. A filled rounded box with an icon is the shape
+ * of a workbench notification, and a notification has a close button, so the eye
+ * looks for one that is not there. Recent is a plain titled list, and this is the
+ * same kind of thing.
+ *
+ * Both `anywhere` and `break-word` break a word too long for the column, but only
+ * `anywhere` also lets the column itself be narrower than one word. With
+ * `break-word` the column stays as wide as its longest word and the text spills
+ * out of the banner in a narrow editor. `min-width: 0`, which the column needs
+ * before it can shrink that far, is set with the rest of its sizing in
+ * positronWelcomePage.css.
+ */
+.positron-welcome-page-walkthrough-banner {
+	display: flex;
+	flex-direction: column;
+	overflow-wrap: anywhere;
+}
+
+/*
+ * .gettingStartedContainer sets line-height: 16px for the whole page, which on
+ * 13px text is tight enough that three wrapped lines run together. This is the
+ * only real paragraph on the page -- everything else is a row or a label -- so it
+ * is the only place that shows. 20px matches the environment setup card's body
+ * text, so the two blocks beside each other set text the same way.
+ *
+ * No container chain needed: 16px arrives here by inheritance, and a rule that
+ * targets the element beats an inherited value whatever its specificity.
+ */
+.positron-welcome-page-walkthrough-banner .walkthrough-banner-description {
+	line-height: 20px;
+	margin: 0;
+}
+
+/*
+ * Makes the button look like a link. gettingStarted.css gives every button in
+ * the container a background, padding, and in high contrast themes a border, so
+ * this selector repeats the container chain to win on specificity. Upstream
+ * clears that border for its own link-style buttons through a `.button-link`
+ * class this one does not use.
+ */
+.monaco-workbench .part.editor > .content .gettingStartedContainer
+.positron-welcome-page-walkthrough-banner .walkthrough-banner-link,
+.monaco-workbench .part.editor > .content .gettingStartedContainer
+.positron-welcome-page-walkthrough-banner .walkthrough-banner-link:hover {
+	align-self: flex-start;
+	background: none;
+	border: none;
+	font-size: inherit;
+	margin: 4px 0 0;
+	padding: 0;
+}
+
+/*
+ * Matches the arrow to the link text. gettingStarted.css sets arrow codicons to
+ * 18px and recolors them only when the pointer is on the arrow itself, so this
+ * selector repeats the container chain to win on specificity.
+ */
+.monaco-workbench .part.editor > .content .gettingStartedContainer
+.positron-welcome-page-walkthrough-banner .walkthrough-banner-arrow.codicon {
+	color: inherit;
+	font-size: inherit;
+	margin-left: 4px;
+	vertical-align: middle;
+}

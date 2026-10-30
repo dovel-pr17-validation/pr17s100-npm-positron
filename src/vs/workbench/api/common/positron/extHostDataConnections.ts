@@ -1,0 +1,716 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import * as positron from 'positron';
+import * as extHostProtocol from './extHost.positron.protocol.js';
+import { IDataConnectionCodeVariantDTO, IDataConnectionDriverMetadataDTO, IDataConnectionParameterValidationDTO, IDataConnectionDriverSummaryDTO, IDataConnectionLineageDTO, IDataConnectionLineageEdgeDTO, IDataConnectionLineageObjectDTO, IDataConnectionLineageRequestDTO, IDataConnectionNodeDetailsDTO, IDataConnectionNodeDetailsSectionDTO, IDataConnectionNodeDTO, IDataConnectionParameterDTO, IDataConnectionSummaryDTO, IDiscoveredDataConnectionDTO } from '../../../services/positronDataConnections/common/interfaces/dataConnectionDTOs.js';
+import { Emitter } from '../../../../base/common/event.js';
+import { Disposable } from '../extHostTypes.js';
+
+/**
+ * Coerces a value from a driver to a string. A driver can easily hand back a number or a null
+ * straight from a query result.
+ */
+function detailsText(value: unknown): string {
+	return value === null || value === undefined ? '' : String(value);
+}
+
+/**
+ * Coerces an optional value from a driver to a string, keeping it absent when the driver left it out
+ * (or sent a null).
+ */
+function optionalDetailsText(value: unknown): string | undefined {
+	return value === null || value === undefined ? undefined : String(value);
+}
+
+/**
+ * Converts a section of a driver's node details into a DTO, recursing into groups. Only the known
+ * fields are copied, and every value is coerced to the type the wire promises, so a driver can't put
+ * an unexpected shape on the wire for the editor to trip over.
+ */
+function detailsSectionToDTO(section: positron.DataConnectionNodeDetailsSection): IDataConnectionNodeDetailsSectionDTO | undefined {
+	switch (section.kind) {
+		case 'properties':
+			return {
+				kind: 'properties',
+				title: optionalDetailsText(section.title),
+				properties: section.properties.map(property => ({ name: detailsText(property.name), value: detailsText(property.value) })),
+			};
+		case 'code':
+			return { kind: 'code', title: optionalDetailsText(section.title), languageId: optionalDetailsText(section.languageId), code: detailsText(section.code) };
+		case 'table':
+			return {
+				kind: 'table',
+				title: optionalDetailsText(section.title),
+				columns: section.columns.map(detailsText),
+				rows: section.rows.map(row => row.map(detailsText)),
+			};
+		case 'group':
+			return {
+				kind: 'group',
+				title: detailsText(section.title),
+				count: typeof section.count === 'number' ? section.count : undefined,
+				collapsible: section.collapsible === true,
+				treePath: section.treePath?.map(node => ({ kind: detailsText(node.kind), name: detailsText(node.name) })),
+				sections: detailsSectionsToDTO(section.sections),
+			};
+		case 'items':
+			return {
+				kind: 'items',
+				title: optionalDetailsText(section.title),
+				emptyText: optionalDetailsText(section.emptyText),
+				items: section.items.map(item => ({
+					name: detailsText(item.name),
+					kind: optionalDetailsText(item.kind),
+					dataType: optionalDetailsText(item.dataType),
+					description: optionalDetailsText(item.description),
+					code: optionalDetailsText(item.code),
+				})),
+			};
+		default:
+			// A kind this version of Positron doesn't know; see detailsSectionsToDTO.
+			return undefined;
+	}
+}
+
+/**
+ * Converts a driver's list of sections into DTOs, dropping any section of a kind this version of
+ * Positron doesn't know -- a JavaScript driver, a newer API, or a cast -- rather than putting an
+ * unknown shape on the wire for the editor to trip over.
+ */
+function detailsSectionsToDTO(sections: positron.DataConnectionNodeDetailsSection[]): IDataConnectionNodeDetailsSectionDTO[] {
+	return sections
+		.map(detailsSectionToDTO)
+		.filter((section): section is IDataConnectionNodeDetailsSectionDTO => section !== undefined);
+}
+
+/**
+ * Converts a driver's node details into a DTO. See detailsSectionToDTO.
+ */
+function detailsToDTO(details: positron.DataConnectionNodeDetails): IDataConnectionNodeDetailsDTO {
+	return {
+		description: optionalDetailsText(details.description),
+		sections: detailsSectionsToDTO(details.sections),
+		tabs: details.tabs?.map(tab => ({ title: detailsText(tab.title), sections: detailsSectionsToDTO(tab.sections) })),
+	};
+}
+
+/**
+ * Converts one end of a driver's lineage edge into a DTO, coercing every value to the type the wire
+ * promises. Returns undefined for an end that identifies nothing -- no name and not masked -- since
+ * an edge to an unnamed, unmasked object says nothing a caller can use.
+ */
+function lineageObjectToDTO(object: positron.DataConnectionLineageObject | undefined): IDataConnectionLineageObjectDTO | undefined {
+	if (!object) {
+		return undefined;
+	}
+	const name = optionalDetailsText(object.name);
+	const masked = object.masked === true;
+	if (!name && !masked) {
+		return undefined;
+	}
+	return {
+		database: optionalDetailsText(object.database),
+		schema: optionalDetailsText(object.schema),
+		name,
+		column: optionalDetailsText(object.column),
+		domain: detailsText(object.domain),
+		masked: masked || undefined,
+	};
+}
+
+/**
+ * Converts a driver's lineage into a DTO. Edges are kept in the driver's order (nearest first); an
+ * edge with an end that identifies nothing, or a distance that isn't a positive number, is dropped
+ * rather than put on the wire for the main thread to trip over.
+ */
+function lineageToDTO(lineage: positron.DataConnectionLineage): IDataConnectionLineageDTO {
+	if (lineage.available === false) {
+		return { available: false, message: detailsText(lineage.message) };
+	}
+	const edges: IDataConnectionLineageEdgeDTO[] = [];
+	for (const edge of Array.isArray(lineage.edges) ? lineage.edges : []) {
+		const source = lineageObjectToDTO(edge?.source);
+		const target = lineageObjectToDTO(edge?.target);
+		const distance = Number(edge?.distance);
+		if (source && target && Number.isFinite(distance) && distance > 0) {
+			edges.push({ source, target, distance });
+		}
+	}
+	return { available: true, edges, truncated: lineage.truncated === true };
+}
+
+/**
+ * Extension host implementation for the `positron.dataConnections` API namespace.
+ *
+ * DataConnection and DataConnectionNode objects live in the extension process and
+ * expose methods (getChildren, preview, disconnect, etc.). Since these objects
+ * cannot cross the RPC boundary directly, we use a handle-based approach:
+ *
+ * - Each live DataConnection gets an integer connection handle.
+ * - Each DataConnectionNode gets an integer node handle, scoped to its connection.
+ * - The main thread references these handles when it needs to call back into the
+ *   extension (e.g. to expand a tree node or disconnect).
+ *
+ * Handle lifecycle:
+ * - Connection handles are created in $driverConnect and freed only by $releaseConnection. Every
+ *   handle is held by the main thread, which owns the connection's lifecycle; unregistering a
+ *   driver tells the main thread, which disconnects and releases that driver's connections.
+ * - Node handles are created each time getChildren returns and are stored per-connection.
+ *   They are bulk-cleared when $connectionGetChildren is called (top-level refresh) or
+ *   when $releaseConnection frees the entire connection.
+ */
+export class ExtHostDataConnections implements extHostProtocol.ExtHostDataConnectionsShape {
+
+	private readonly _proxy: extHostProtocol.MainThreadDataConnectionsShape;
+
+	/** Registered drivers keyed by driver id. */
+	private readonly _drivers = new Map<string, positron.DataConnectionDriver>();
+
+	/** Monotonically increasing handle counters. */
+	private _nextConnectionHandle = 1;
+	private _nextNodeHandle = 1;
+
+	/** Connection handle -> live DataConnection object in the extension process. */
+	private readonly _connections = new Map<number, positron.DataConnection>();
+
+	/**
+	 * Per-connection node handle map: connectionHandle -> (nodeHandle -> DataConnectionNode).
+	 * Node handles allow the main thread to reference specific nodes for getChildren/preview
+	 * without serializing the node objects themselves.
+	 */
+	private readonly _nodes = new Map<number, Map<number, positron.DataConnectionNode>>();
+
+	/** Fires when the user's connections change; see {@link onDidChangeConnections}. */
+	private readonly _onDidChangeConnections = new Emitter<void>();
+
+	constructor(
+		mainContext: extHostProtocol.IMainPositronContext,
+	) {
+		this._proxy = mainContext.getProxy(extHostProtocol.MainPositronContext.MainThreadDataConnections);
+	}
+
+	// --- Reading the user's own connections ---
+
+	/**
+	 * The connections the user has configured, live or not.
+	 *
+	 * These are the user's connections, not ones this extension opened. What comes back is a
+	 * summary rather than a live object: an extension has no business disconnecting a connection
+	 * it does not own, so there is nothing here to do that with.
+	 */
+	public async getConnections(): Promise<positron.DataConnectionSummary[]> {
+		const dtos: IDataConnectionSummaryDTO[] = await this._proxy.$getDataConnections();
+		return dtos;
+	}
+
+	/**
+	 * Opens the user's connection for a profile, if it is not already open.
+	 *
+	 * Still no live object comes back, only whether it is now open: an extension may ask for a
+	 * connection the user configured to be opened, but has no business closing one.
+	 */
+	public async openConnection(profileId: string): Promise<boolean> {
+		return this._proxy.$openDataConnection(profileId);
+	}
+
+	/**
+	 * Reads a live connection's tables and columns, bounded so a large database cannot produce an
+	 * unbounded reply.
+	 *
+	 * One call rather than a tree to walk, because walking costs a round trip per node. Resolves
+	 * to `undefined` when the profile has no live connection.
+	 */
+	public async getSchema(
+		profileId: string,
+		options: positron.DataConnectionSchemaOptions = {},
+	): Promise<positron.DataConnectionSchema | undefined> {
+		const walk = await this._proxy.$getDataConnectionSchema(profileId, options);
+		if (!walk) {
+			return undefined;
+		}
+		// The walk carries no connection identity of its own, so the profile id is added here:
+		// callers hold that, it is what they asked with, and it stays the same across a reconnect.
+		// The kinds are cast rather than checked, as for a browsed node (see _dtoToNode): they are
+		// the driver's word, and a driver reporting a kind the enum does not list still gets its
+		// node through.
+		return { profileId, nodes: walk.nodes as positron.DataConnectionSchemaNode[], truncated: walk.truncated };
+	}
+
+	/** Fires when a connection is opened or closed, or a profile is added, renamed or removed. */
+	public readonly onDidChangeConnections = this._onDidChangeConnections.event;
+
+	/** Called by the main thread when the user's connections change. */
+	public $onDidChangeDataConnections(): void {
+		this._onDidChangeConnections.fire();
+	}
+
+	// --- Public API (called by extension via positron.dataConnections.registerDriver) ---
+
+	/**
+	 * Registers a data connection driver. Sends serializable metadata to the main thread and
+	 * returns a Disposable that unregisters the driver.
+	 */
+	public registerDriver(driver: positron.DataConnectionDriver): Disposable {
+		this._drivers.set(driver.id, driver);
+
+		this._proxy.$registerDataConnectionDriver(driver.id, this._driverMetadata(driver));
+
+		// A driver that changes in place has its metadata re-sent under the same id. The main
+		// thread replaces the driver without touching its open connections, and re-reads its
+		// discoveries.
+		const changeListener = driver.onDidChange?.(() => {
+			if (this._drivers.get(driver.id) === driver) {
+				this._proxy.$registerDataConnectionDriver(driver.id, this._driverMetadata(driver));
+			}
+		});
+
+		return new Disposable(() => {
+			changeListener?.dispose();
+
+			// A stale registration must not remove a replacement registered under the same id.
+			if (this._drivers.get(driver.id) !== driver) {
+				return;
+			}
+			this._drivers.delete(driver.id);
+
+			// Connections are left open; the main thread closes them so the pane stays accurate.
+			this._proxy.$removeDataConnectionDriver(driver.id);
+		});
+	}
+
+	/**
+	 * Returns summaries of all registered drivers by calling the main thread service. This
+	 * exercises the full RPC round trip.
+	 */
+	public async getDrivers(): Promise<positron.DataConnectionDriverSummary[]> {
+		const dtos: IDataConnectionDriverSummaryDTO[] = await this._proxy.$getDataConnectionDrivers();
+		return dtos.map(dto => ({
+			id: dto.id,
+			name: dto.name,
+			description: dto.description,
+			mechanisms: dto.mechanisms.map(m => ({
+				id: m.id,
+				label: m.label,
+				description: m.description,
+				parameters: m.parameters as positron.DataConnectionParameter[],
+			})),
+			supportedLanguageIds: dto.supportedLanguageIds,
+		}));
+	}
+
+	/**
+	 * Connects to a driver by calling through the main thread service, which calls back into the
+	 * ext host via $driverConnect (full round trip). Returns a DataConnection proxy that routes
+	 * all operations through the main thread.
+	 */
+	public async connect(driverId: string, mechanismId: string, params: positron.DataConnectionParameterValues): Promise<positron.DataConnection> {
+		const connectionHandle = await this._proxy.$connectToDataConnectionDriver(driverId, mechanismId, params);
+		return new ExtHostDataConnectionProxy(connectionHandle, this._proxy);
+	}
+
+	// --- ExtHostDataConnectionsShape (called by main thread via RPC) ---
+
+	/**
+	 * Calls the extension's driver.connect(), stores the resulting DataConnection, and returns a
+	 * handle the main thread can use to operate on it.
+	 * @param driverId The unique identifier of the driver to connect with.
+	 * @param mechanismId The id of the mechanism the user selected.
+	 * @param params User-supplied parameter values from the connection dialog.
+	 */
+	async $driverConnect(driverId: string, mechanismId: string, params: Record<string, string | number | boolean>): Promise<number> {
+		const driver = this._drivers.get(driverId);
+		if (!driver) {
+			throw new Error(`Data connection driver '${driverId}' not found`);
+		}
+
+		const connection = await driver.connect(mechanismId, params);
+		const handle = this._nextConnectionHandle++;
+		this._connections.set(handle, connection);
+		this._nodes.set(handle, new Map());
+
+		return handle;
+	}
+
+	/**
+	 * Calls the extension's driver.generateConnectionCode() and maps its variants into DTOs for the
+	 * main thread.
+	 * @param driverId The unique identifier of the driver to generate code with.
+	 * @param mechanismId The id of the mechanism the user selected.
+	 * @param languageId One of the driver's supported language ids.
+	 * @param params User-supplied parameter values from the connection dialog.
+	 */
+	async $generateConnectionCode(driverId: string, mechanismId: string, languageId: string, params: Record<string, string | number | boolean>): Promise<IDataConnectionCodeVariantDTO[]> {
+		const driver = this._drivers.get(driverId);
+		if (!driver) {
+			throw new Error(`Data connection driver '${driverId}' not found`);
+		}
+		if (!driver.generateConnectionCode) {
+			throw new Error(`Data connection driver '${driverId}' does not support generating connection code`);
+		}
+
+		const variants = await driver.generateConnectionCode(mechanismId, languageId, params);
+		return variants.map(variant => ({ id: variant.id, label: variant.label, code: variant.code }));
+	}
+
+	/**
+	 * Calls the extension's driver.redactParameterValue() to produce a display-safe form of a stored
+	 * secret value. The cleartext value stays in the ext host; only the redacted result is returned to
+	 * the main thread. Returns undefined when the driver does not implement redaction.
+	 * @param driverId The unique identifier of the driver.
+	 * @param mechanismId The id of the mechanism the connection was configured with.
+	 * @param parameterId The id of the parameter to redact.
+	 * @param value The stored cleartext parameter value.
+	 */
+	async $redactParameterValue(driverId: string, mechanismId: string, parameterId: string, value: string): Promise<string | undefined> {
+		const driver = this._drivers.get(driverId);
+		if (!driver || !driver.redactParameterValue) {
+			return undefined;
+		}
+
+		return (await driver.redactParameterValue(mechanismId, parameterId, value)) ?? undefined;
+	}
+
+	/**
+	 * Calls the extension's driver.validateParameters() to validate and normalize the parameter
+	 * values entered in the configuration dialog. Returns an empty result when the driver does not
+	 * implement validation.
+	 * @param driverId The unique identifier of the driver.
+	 * @param mechanismId The id of the mechanism the user selected.
+	 * @param params The parameter values the user entered.
+	 */
+	async $validateParameters(driverId: string, mechanismId: string, params: Record<string, string | number | boolean>): Promise<IDataConnectionParameterValidationDTO> {
+		const driver = this._drivers.get(driverId);
+		if (!driver || !driver.validateParameters) {
+			return {};
+		}
+
+		const { normalizedValues, errors } = await driver.validateParameters(mechanismId, params);
+		return { normalizedValues, errors };
+	}
+
+	/**
+	 * Calls the extension's driver.discoverConnections() to list the connections already configured
+	 * on this machine. Returns an empty array for a driver that does not implement discovery, which
+	 * is most of them -- the main thread asks every driver rather than tracking which ones opted in.
+	 * @param driverId The unique identifier of the driver.
+	 */
+	async $discoverConnections(driverId: string): Promise<IDiscoveredDataConnectionDTO[]> {
+		const driver = this._drivers.get(driverId);
+		if (!driver?.discoverConnections) {
+			return [];
+		}
+
+		const discovered = await driver.discoverConnections();
+		return discovered.map(connection => ({
+			id: connection.id,
+			name: connection.name,
+			description: connection.description,
+			mechanismId: connection.mechanismId,
+			parameters: connection.parameters,
+		}));
+	}
+
+	/**
+	 * Returns whether the connection was opened in read-only mode.
+	 */
+	async $connectionIsReadOnly(connectionHandle: number): Promise<boolean> {
+		const connection = this._connections.get(connectionHandle);
+		if (!connection) {
+			throw new Error(`Connection handle ${connectionHandle} not found`);
+		}
+		return connection.isReadOnly();
+	}
+
+	/**
+	 * Gets the top-level children of a connection. Clears any previously cached node handles for
+	 * this connection since a top-level call implies a full tree refresh.
+	 */
+	async $connectionGetChildren(connectionHandle: number): Promise<IDataConnectionNodeDTO[]> {
+		const connection = this._connections.get(connectionHandle);
+		if (!connection) {
+			throw new Error(`Connection handle ${connectionHandle} not found`);
+		}
+
+		// Clear existing node handles to prevent unbounded growth on refresh.
+		this._nodes.set(connectionHandle, new Map());
+
+		const children = await connection.getChildren();
+		return this._serializeNodes(connectionHandle, children);
+	}
+
+	/** Disconnects but does not release the handle (the UI may still reference it). */
+	async $connectionDisconnect(connectionHandle: number): Promise<void> {
+		const connection = this._connections.get(connectionHandle);
+		if (!connection) {
+			throw new Error(`Connection handle ${connectionHandle} not found`);
+		}
+		await connection.disconnect();
+	}
+
+	/** Returns false for unknown handles rather than throwing. */
+	async $connectionIsConnected(connectionHandle: number): Promise<boolean> {
+		const connection = this._connections.get(connectionHandle);
+		if (!connection) {
+			return false;
+		}
+		return connection.isConnected();
+	}
+
+	/**
+	 * Reads an object's lineage from the connection. Resolves to undefined when the connection does
+	 * not implement getLineage -- most drivers don't -- so the main thread can tell "not supported"
+	 * from a failure without tracking which drivers opted in. A failure in the driver propagates.
+	 */
+	async $connectionGetLineage(connectionHandle: number, request: IDataConnectionLineageRequestDTO): Promise<IDataConnectionLineageDTO | undefined> {
+		const connection = this._connections.get(connectionHandle);
+		if (!connection) {
+			throw new Error(`Connection handle ${connectionHandle} not found`);
+		}
+		if (!connection.getLineage) {
+			return undefined;
+		}
+		return lineageToDTO(await connection.getLineage(request));
+	}
+
+	/** Expands a node in the tree by calling its getChildren method. */
+	async $nodeGetChildren(connectionHandle: number, nodeHandle: number): Promise<IDataConnectionNodeDTO[]> {
+		const nodeMap = this._nodes.get(connectionHandle);
+		if (!nodeMap) {
+			throw new Error(`Connection handle ${connectionHandle} not found`);
+		}
+		const node = nodeMap.get(nodeHandle);
+		if (!node || !node.getChildren) {
+			throw new Error(`Node handle ${nodeHandle} does not support getChildren`);
+		}
+
+		const children = await node.getChildren();
+		return this._serializeNodes(connectionHandle, children);
+	}
+
+	/**
+	 * Triggers a data preview for a node (e.g. SELECT * FROM table LIMIT 100). Returns the dataset
+	 * id the driver opened the preview under, so core can relate the resulting Data Explorer back to
+	 * this connection. Drivers may return nothing, in which case there is nothing to relate.
+	 */
+	async $nodePreview(connectionHandle: number, nodeHandle: number): Promise<string | undefined> {
+		const nodeMap = this._nodes.get(connectionHandle);
+		if (!nodeMap) {
+			throw new Error(`Connection handle ${connectionHandle} not found`);
+		}
+		const node = nodeMap.get(nodeHandle);
+		if (!node || !node.preview) {
+			throw new Error(`Node handle ${nodeHandle} does not support preview`);
+		}
+		const datasetId = await node.preview();
+		return typeof datasetId === 'string' ? datasetId : undefined;
+	}
+
+	/** Gets a node's details, for the details editor. */
+	async $nodeGetDetails(connectionHandle: number, nodeHandle: number): Promise<IDataConnectionNodeDetailsDTO> {
+		const nodeMap = this._nodes.get(connectionHandle);
+		if (!nodeMap) {
+			throw new Error(`Connection handle ${connectionHandle} not found`);
+		}
+		const node = nodeMap.get(nodeHandle);
+		if (!node || !node.getDetails) {
+			throw new Error(`Node handle ${nodeHandle} does not support getDetails`);
+		}
+		return detailsToDTO(await node.getDetails());
+	}
+
+	/** Frees a connection handle and all its associated node handles. */
+	$releaseConnection(connectionHandle: number): void {
+		this._connections.delete(connectionHandle);
+		this._nodes.delete(connectionHandle);
+	}
+
+	// --- Private helpers ---
+
+	/**
+	 * Converts the driver's public API shape into a serializable DTO. Base64-encodes the SVG so the
+	 * UI can use it directly in <img> src attributes.
+	 */
+	private _driverMetadata(driver: positron.DataConnectionDriver): IDataConnectionDriverMetadataDTO {
+		return {
+			id: driver.id,
+			name: driver.name,
+			description: driver.description,
+			iconSvg: btoa(driver.iconSvg),
+			mechanisms: driver.mechanisms.map(m => ({
+				id: m.id,
+				label: m.label,
+				description: m.description,
+				parameters: m.parameters.map(p => this._convertParameter(p)),
+			})),
+			supportedLanguageIds: driver.supportedLanguageIds,
+			validatesParameters: typeof driver.validateParameters === 'function',
+		};
+	}
+
+	/**
+	 * Converts an array of extension-side DataConnectionNode objects into serializable DTOs,
+	 * assigning each node a handle for future callbacks.
+	 */
+	private _serializeNodes(connectionHandle: number, nodes: positron.DataConnectionNode[]): IDataConnectionNodeDTO[] {
+		const nodeMap = this._nodes.get(connectionHandle)!;
+		return nodes.map(node => {
+			const handle = this._nextNodeHandle++;
+			nodeMap.set(handle, node);
+			return {
+				nodeHandle: handle,
+				name: node.name,
+				kind: node.kind,
+				dataType: node.dataType,
+				isPrimaryKey: node.isPrimaryKey,
+				path: typeof node.path === 'string' && node.path.length > 0 ? node.path : undefined,
+				defaultAction: node.defaultAction === 'details' || node.defaultAction === 'preview' ? node.defaultAction : undefined,
+				// A count is shown to the user as is, so anything that isn't one is dropped rather than
+				// shown as "NaN" or "-1".
+				childCount: typeof node.childCount === 'number' && Number.isSafeInteger(node.childCount) && node.childCount >= 0 ? node.childCount : undefined,
+				hasGetChildren: !!node.getChildren,
+				hasPreview: !!node.preview,
+				hasDetails: !!node.getDetails,
+			};
+		});
+	}
+
+	/**
+	 * Converts a typed DataConnectionParameter from the public API into a flat DTO that can be
+	 * serialized across the RPC boundary. Uses the `type` discriminant to extract variant-specific
+	 * fields.
+	 */
+	private _convertParameter(p: positron.DataConnectionParameter): IDataConnectionParameterDTO {
+		const dto: IDataConnectionParameterDTO = {
+			id: p.id,
+			label: p.label,
+			description: p.description,
+			required: p.required,
+			type: p.type,
+		};
+		switch (p.type) {
+			case 'string':
+				dto.placeholder = p.placeholder;
+				if (p.secret) {
+					dto.secret = true;
+					dto.masked = p.masked;
+				} else {
+					dto.defaultValue = p.defaultValue;
+				}
+				break;
+			case 'number':
+				dto.defaultValue = p.defaultValue;
+				dto.placeholder = p.placeholder;
+				break;
+			case 'file':
+				dto.defaultValue = p.defaultValue;
+				dto.placeholder = p.placeholder;
+				dto.filters = p.filters;
+				break;
+			case 'boolean':
+				dto.defaultValue = p.defaultValue;
+				break;
+			case 'option':
+				dto.defaultValue = p.defaultValue;
+				dto.placeholder = p.placeholder;
+				dto.options = p.options;
+				break;
+			case 'password':
+				dto.secret = p.secret;
+				dto.placeholder = p.placeholder;
+				break;
+		}
+		return dto;
+	}
+}
+
+/**
+ * A DataConnection proxy that routes all operations through the main thread via the "ViaService"
+ * RPC methods. This ensures that calls from the ext host API (e.g. in integration tests)
+ * exercise the full main-thread service layer.
+ */
+class ExtHostDataConnectionProxy implements positron.DataConnection {
+
+	/**
+	 * Constructor.
+	 * @param _connectionHandle The integer connection handle assigned by the ext host.
+	 * @param _proxy RPC proxy for calling through the main thread service.
+	 */
+	constructor(
+		private readonly _connectionHandle: number,
+		private readonly _proxy: extHostProtocol.MainThreadDataConnectionsShape,
+	) { }
+
+	/**
+	 * Returns whether this connection was opened in read-only mode.
+	 */
+	async isReadOnly(): Promise<boolean> {
+		return this._proxy.$connectionIsReadOnlyViaService(this._connectionHandle);
+	}
+
+	/**
+	 * Returns top-level schema objects (tables, views, etc.) for this connection.
+	 */
+	async getChildren(): Promise<positron.DataConnectionNode[]> {
+		const dtos = await this._proxy.$connectionGetChildrenViaService(this._connectionHandle);
+		return dtos.map(dto => this._dtoToNode(dto));
+	}
+
+	/**
+	 * Disconnects this connection.
+	 */
+	async disconnect(): Promise<void> {
+		return this._proxy.$connectionDisconnectViaService(this._connectionHandle);
+	}
+
+	/**
+	 * Returns whether this connection is still connected.
+	 */
+	async isConnected(): Promise<boolean> {
+		return this._proxy.$connectionIsConnectedViaService(this._connectionHandle);
+	}
+
+	/**
+	 * Converts a serializable node DTO into a DataConnectionNode, wiring up getChildren and
+	 * preview callbacks that route through the main thread.
+	 * @param dto The serializable node DTO from the RPC layer.
+	 * @returns A DataConnectionNode with live callbacks.
+	 */
+	private _dtoToNode(dto: IDataConnectionNodeDTO): positron.DataConnectionNode {
+		const node: positron.DataConnectionNode = {
+			name: dto.name,
+			kind: dto.kind as positron.DataConnectionNodeKind,
+			dataType: dto.dataType,
+			path: dto.path,
+			defaultAction: dto.defaultAction,
+			childCount: dto.childCount,
+		};
+
+		if (dto.hasGetChildren) {
+			node.getChildren = async () => {
+				const childDtos = await this._proxy.$nodeGetChildrenViaService(this._connectionHandle, dto.nodeHandle);
+				return childDtos.map(child => this._dtoToNode(child));
+			};
+		}
+
+		if (dto.hasPreview) {
+			node.preview = async () => {
+				return this._proxy.$nodePreviewViaService(this._connectionHandle, dto.nodeHandle);
+			};
+		}
+
+		if (dto.hasDetails) {
+			node.getDetails = async () => {
+				// The DTO is the API shape except that item kinds cross the wire as plain strings;
+				// they are DataConnectionNodeKind values, as the node's own kind above is.
+				const details = await this._proxy.$nodeGetDetailsViaService(this._connectionHandle, dto.nodeHandle);
+				return details as positron.DataConnectionNodeDetails;
+			};
+		}
+
+		return node;
+	}
+}
+

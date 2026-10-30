@@ -1,0 +1,47 @@
+name: 'E2E Tag Listing Setup'
+description: >
+  Install just enough for `playwright test --list` so pr-tags-parse.sh can
+  count each lane's tests (to pick a shard count) and
+  derive-test-change-tags.mjs can discover e2e test tags. Shared by the
+  pr-tags job (test-pull-request.yml) and the comment job
+  (pr-e2e-comment.yml) so their derivation environments can't drift.
+  Costs about a minute on a bare runner.
+
+runs:
+  using: 'composite'
+  steps:
+    # Pinned via .nvmrc rather than relying on whatever the runner ships with.
+    - name: Set up Node
+      uses: actions/setup-node@v6
+      with:
+        node-version-file: ".nvmrc"
+
+    # Install just enough for `playwright test --list` to import every test file
+    # and discover its tags. `--list` must import the whole test suite, whose
+    # import graph reaches the full root + test/e2e dependency trees -- so both
+    # installs are required. `--ignore-scripts` is the key: it places every
+    # (pure-JS) dependency without running the native build scripts (kerberos,
+    # windows-foreground-love, etc.) that need system dev headers this bare
+    # runner lacks and that listing doesn't need. No browser binaries, no
+    # install-deps, no tsc compile.
+    - name: Install e2e test deps for test listing
+      shell: bash
+      env:
+        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      run: |
+        npm ci --ignore-scripts --no-audit --no-fund --prefer-offline
+        npm --prefix test/e2e ci --ignore-scripts --no-audit --no-fund --prefer-offline
+        # One test file (plots.test.ts) eagerly imports resemblejs -> canvas,
+        # a native addon left unbuilt by --ignore-scripts. Playwright aborts
+        # the entire listing if any single file fails to import, so replace
+        # each installed canvas package with a no-op stub: resemblejs only
+        # references canvas's API at load time (never calls it during a
+        # listing), so the stub satisfies the import cleanly. If a future
+        # test file adds another eager native import, the listing degrades
+        # gracefully: tags fall back to the source map and lanes run unsharded.
+        STUB='module.exports = { Image: class {}, Canvas: class {}, createCanvas: () => ({}), loadImage: async () => ({}), registerFont: () => {} };'
+        find node_modules test/e2e/node_modules -type d -name canvas -path '*node_modules/canvas' 2>/dev/null | while IFS= read -r dir; do
+          printf '%s\n' "$STUB" > "$dir/__stub_index.js"
+          node -e "const fs=require('fs'); const f=process.argv[1]; const p=JSON.parse(fs.readFileSync(f)); p.main='__stub_index.js'; delete p.browser; delete p.exports; fs.writeFileSync(f, JSON.stringify(p));" "$dir/package.json"
+          echo "Stubbed native canvas at $dir for test listing."
+        done

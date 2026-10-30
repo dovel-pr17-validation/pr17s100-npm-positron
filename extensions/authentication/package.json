@@ -1,0 +1,123 @@
+{
+	"name": "authentication",
+	"displayName": "Authentication",
+	"description": "Centralized credential management",
+	"version": "0.0.1",
+	"publisher": "positron",
+	"private": true,
+	"engines": {
+		"vscode": "^1.108.0"
+	},
+	"activationEvents": [
+		"onStartupFinished",
+		"onAuthenticationRequest:bedrock",
+		"onAuthenticationRequest:snowflake-cortex",
+		"onAuthenticationRequest:databricks",
+		"onCommand:authentication.migrateSettingsToProvidersJson"
+	],
+	"main": "./out/extension.js",
+	"dependencies": {
+		"@aws-sdk/credential-providers": "^3.734.0",
+		"@aws-sdk/types": "^3.734.0",
+		"ai-config": "file:../../ai-lib/packages/ai-config"
+	},
+	"devDependencies": {
+		"@types/node": "22.x"
+	},
+	"contributes": {
+		"authentication": [
+			{
+				"id": "bedrock",
+				"label": "AWS"
+			}
+		],
+		"commands": [
+			{
+				"command": "authentication.migrateSettingsToProvidersJson",
+				"title": "%commands.migrateSettingsToProvidersJson.title%",
+				"category": "%commands.category%"
+			}
+		],
+		"configuration": {
+			"title": "Authentication",
+			"properties": {
+				"authentication.aws.credentials": {
+					"markdownDeprecationMessage": "%configuration.deprecation.providersJson%",
+					"type": "object",
+					"default": {},
+					"markdownDescription": "%configuration.aws.credentials.description%",
+					"properties": {
+						"AWS_PROFILE": {
+							"type": "string",
+							"default": null
+						},
+						"AWS_REGION": {
+							"type": "string",
+							"default": null
+						}
+					},
+					"additionalProperties": false
+				},
+				"authentication.snowflake.credentials": {
+					"markdownDeprecationMessage": "%configuration.deprecation.providersJson%",
+					"type": "object",
+					"default": {},
+					"markdownDescription": "%configuration.snowflake.credentials.description%",
+					"properties": {
+						"SNOWFLAKE_ACCOUNT": {
+							"type": "string",
+							"default": null
+						},
+						"SNOWFLAKE_HOME": {
+							"type": "string",
+							"default": null
+						}
+					},
+					"additionalProperties": false
+				},
+				"positron.assistant.aiExcludes": {
+					"type": "array",
+					"default": [
+						"**/.env",
+						"**/.env.*",
+						"**/*.pem",
+						"**/*.key",
+						"**/*.p12",
+						"**/*.pfx",
+						"**/*.jks",
+						"**/*.keystore",
+						"**/id_rsa",
+						"**/id_dsa",
+						"**/id_ecdsa",
+						"**/id_ecdsa_sk",
+						"**/id_ed25519",
+						"**/id_ed25519_sk",
+						"**/.git-credentials",
+						"**/.npmrc",
+						"**/.pypirc",
+						"**/.netrc",
+						"**/.Renviron",
+						"**/.aws/config",
+						"**/.aws/credentials",
+						"**/.docker/config.json",
+						"**/.kube/config",
+						"**/application_default_credentials.json",
+						"**/.azure/accessTokens.json",
+						"**/.azure/accessToken.json",
+						"**/.azure/msal_token_cache.json",
+						"**/.azure/msal_token_cache.bin",
+						"**/secrets.*",
+						"**/.git/**",
+						"**/.svn/**",
+						"**/.hg/**",
+						"**/.DS_Store"
+					],
+					"markdownDescription": "%configuration.aiExcludes.description%",
+					"items": {
+						"type": "string"
+					}
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,678 @@
+#!/usr/bin/env bash
+# Launches Positron from source in an isolated profile for UI automation.
+#
+# This is a maintained fork of .agents/skills/launch/scripts/launch.sh. Compare
+# it with the upstream script when that file changes; fixes are not inherited
+# automatically.
+#
+# Positron-specific behavior:
+#   1. Uses a short run directory to keep macOS IPC socket paths below 104 bytes.
+#   2. Seeds the profile from $POSITRON_DEV_USER_DATA_DIR or ~/.positron-dev.
+#   3. Provides an isolated shared-data directory and unique debug ports.
+#   4. Rechecks process liveness after CDP starts, catching late startup crashes.
+#   5. Runs on Windows (Git Bash) as well as macOS and Linux: falls back to tar
+#      where rsync is absent, and converts paths for the native Electron binary.
+#
+# Usage:
+#   launch.sh [--agents] [--source-user-data-dir <path>] [--repo <vscode-repo-root>]
+#             [--reuse-profile <run dir>]
+#             [--clone-extensions] [--full] [--no-default-app-args]
+#             [--keep-first-run-prompts] [--no-pyrefly] [-- <extra code.sh args>]
+#   launch.sh -- --folder-uri file:///private/tmp/ws --log debug
+#
+# Everything before the `--` configures the launcher; everything after it goes
+# to the app. A launcher flag after the `--` is not reported: the app ignores
+# it and the launcher keeps its default, so a misplaced --source-user-data-dir
+# copies the real ~/.positron-dev.
+#
+# App arguments worth passing (after the `--`):
+#   --folder-uri file:///private/tmp/ws
+#                       Open a workspace; a bare positional folder may be
+#                       discarded. Use /private/tmp, not /tmp, on macOS. On
+#                       Windows build it with cygpath -m:
+#                       --folder-uri "file:///$(cygpath -m /tmp/ws)"
+#                       It reaches the app as --folder-uri=URL (--file-uri
+#                       too): Electron on Windows exits silently when any
+#                       argument follows a separate URL-like one.
+#   --log debug         Without it the "[Runtime startup] Phase changed" lines
+#                       are missing, and code.log has no logsPath: line.
+#
+# App arguments the launcher supplies (repeat one after `--` to override it):
+#   --disable-workspace-trust  without it a fresh profile starts in restricted
+#                       mode with extensions off, and an empty interpreter
+#                       picker looks like a product bug
+#   --use-mock-keychain keeps the OS keychain out (a GitHubLoginFailed log line
+#                       is expected)
+#   --password-store=basic  (Linux) keeps the "An OS keyring couldn't be
+#                       identified" dialog from blocking the window where no
+#                       keyring runs, as in CI
+#   --skip-welcome      keeps the Welcome editor from taking focus
+#   --disable-backgrounding-occluded-windows, --disable-renderer-backgrounding
+#                       keep a covered window painting; otherwise every click
+#                       and element screenshot times out on Playwright's
+#                       stability check while keys and eval still work
+#   --shared-data-dir, --logsPath (<runDir>/logs), and the CDP and inspect ports
+# --no-default-app-args drops all but the last line, only for testing what they suppress
+# (the workspace trust prompt, say).
+#
+# It reads the source profile one way (no --delete) and writes only to the
+# copy. In the copy, it also sets files.simpleDialog.enable and
+# window.dialogStyle "custom" (in-app dialogs CDP can see and click, in place of
+# native ones), and, unless --keep-first-run-prompts, turns off the two
+# first-run prompts. It excludes locks, caches, logs and workspace storage, so
+# it can run beside a normal development instance.
+#
+# Stdout: one JSON line: pid, cdpPort, runDir, logFile, userDataDir and the
+# other ports. Diagnostics go to stderr. Each start adds a line to
+# instances.log beside the run directories (/tmp/positron-dev-launch/).
+#
+# Before starting the app it runs build/lib/preLaunch.ts against the checkout
+# (see SKILL.md, "Know what this changes in your checkout"). --help prints this
+# header.
+#
+# Flags:
+#   --agents            Open the Agents window instead of the workbench: the
+#                       app's own --agents, put first among its arguments. The
+#                       JSON line then says "agents": true. Drive its chat
+#                       input with monaco-paste.sh.
+#   --source-user-data-dir <path>
+#                       The profile to copy, such as a minimal seed made with
+#                       mkdir -p /tmp/seed/User and a settings.json, or one
+#                       reseed.sh wrote.
+#   --clone-extensions  Copy the source extensions/ into the new profile (~10s).
+#                       Default: start with an EMPTY extensions/ dir - fastest
+#                       and conflict-free, but no third-party extensions.
+#   --full              Copy the entire profile (incl. extensions). Use if the
+#                       slim copy is missing something you need.
+#   --keep-first-run-prompts
+#                       Show the prompts a fresh profile raises on startup (import
+#                       settings from VS Code; let a coding agent on PATH run code).
+#                       Default: suppress them in the disposable profile, since
+#                       every run would otherwise dismiss them by hand.
+#   --no-pyrefly        Disable the Pyrefly extension (meta.pyrefly), which gives
+#                       Python files hover, completions, outline and diagnostics,
+#                       through the same `extensions.allowed` entry the e2e tests
+#                       use. Default: leave it on, as users have it.
+#   --reuse-profile <run dir>
+#                       Start on a stopped run's own profile, everything it
+#                       wrote kept (workspace storage, extensions installed,
+#                       recent files), copied into this run's directory, for
+#                       a relaunch of the same instance. Stop that run first
+#                       without deleting it: palette-run.sh 'Close Window' (it
+#                       saves the window's state; macOS has no Quit in the
+#                       palette, and Cmd+Q cannot be sent through CDP), then
+#                       stop.sh --cdp-port PORT with no --run-dir. Then
+#                       launch.sh --reuse-profile <its runDir> -- --folder-uri
+#                       ... (the same folder, or a file to open). Refused while
+#                       that run's CDP port (from instances.log) answers.
+#                       reseed.sh is the lighter way: a seed of the global state
+#                       only, for a warm start rather than the same profile.
+#
+# Defaults:
+#   --source-user-data-dir  $POSITRON_DEV_USER_DATA_DIR (else ~/.positron-dev)
+#   --repo                  $PWD if it looks like a Positron checkout
+
+set -euo pipefail
+umask 077
+DIR="$(dirname "${BASH_SOURCE[0]}")"
+# A usage error: the error on stderr, a FAILED line in the action log, exit 2.
+ARGV=("$@")
+usage_error() { exec node "$DIR/dp.ts" usage-error --text "${0##*/}" "$1" ${ARGV[@]+"${ARGV[@]}"}; }
+
+# Platform and tool detection. Git Bash on Windows (MSYS) ships neither rsync
+# nor pgrep, and Electron there cannot read MSYS-style paths such as /tmp/x.
+case "$(uname -s)" in
+	MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+	*) IS_WINDOWS=0 ;;
+esac
+if command -v rsync >/dev/null 2>&1; then
+	HAVE_RSYNC=1
+else
+	HAVE_RSYNC=0
+fi
+
+# Convert a path for the Electron binary. On Windows the app is a native
+# executable that cannot read MSYS paths, and MSYS argument translation does not
+# reliably rewrite them inside --flag=value pairs. Elsewhere this is a no-op.
+to_native_path() {
+	if [[ "$IS_WINDOWS" == "1" ]]; then
+		cygpath -m "$1"
+	else
+		printf '%s\n' "$1"
+	fi
+}
+
+# Whether a process is still running. On Windows the launch PID is a native
+# Windows PID (see the launch block below), which MSYS `kill` does not
+# reliably address, so ask Windows instead. Elsewhere this is `kill -0`.
+#
+# CSV output is matched on the quoted PID field so the digits cannot also match
+# the memory column: plain output for PID 268 would match "4,268 K".
+is_process_alive() {
+	if [[ "$IS_WINDOWS" == "1" ]]; then
+		tasklist //FI "PID eq $1" //FO CSV //NH 2>/dev/null | grep -q "\"$1\""
+	else
+		kill -0 "$1" 2>/dev/null
+	fi
+}
+
+# Escape a value for literal use inside a generated batch file. cmd.exe expands
+# `%` when it runs the wrapper, and `%1`-`%9` are positional parameters, so a
+# percent-encoded path silently loses characters: `file:///c%3A/my%20dir` would
+# reach the app as `file:///cA/my0dir`. Doubling `%` makes cmd emit one.
+#
+# This assumes exactly one expansion pass, which holds only because the wrapper
+# invokes code.bat without `call`. See the note at the write site.
+cmd_escape() {
+	printf '%s' "${1//%/%%}"
+}
+
+# Sets EXTRA_ARGS to the app arguments given, each URI flag joined to its value.
+#
+# Electron on Windows exits with -1, before it logs anything, when an argument
+# that looks like a URL (a scheme and a colon, as file:///C:/ws is) has any
+# other argument after it, short of a `--`: its guard against a URL protocol
+# handler smuggling in switches (CVE-2018-1000006). So `--folder-uri URL --log
+# debug` never opens a window. Pass --folder-uri and --file-uri with their
+# values as one argument, --folder-uri=URL, which the app reads the same way,
+# and on Windows refuse any other URL that has arguments after it. A flag in
+# the value's place (--folder-uri --log) is no value: it is left for the app to
+# report. Nothing after a `--` is touched; the app reads it all as file names.
+# test/launch-args.test.ts runs this function alone.
+join_uri_args() {
+	local args=("$@") arg i
+	EXTRA_ARGS=()
+	for (( i = 0; i < ${#args[@]}; i++ )); do
+		arg="${args[i]}"
+		if [[ "$arg" == --folder-uri || "$arg" == --file-uri ]] && (( i + 1 < ${#args[@]} )) && [[ "${args[i + 1]}" != -* ]]; then
+			EXTRA_ARGS+=("$arg=${args[i + 1]}")
+			i=$(( i + 1 ))
+			continue
+		fi
+		if [[ "$IS_WINDOWS" == "1" && "$arg" =~ ^[A-Za-z][^:[:space:]]+: ]] && (( i + 1 < ${#args[@]} )); then
+			usage_error "$arg looks like a URL to Electron, which exits on Windows when arguments follow one; put it last, or join it to its flag as --flag=URL"
+		fi
+		if [[ "$arg" == -- ]]; then
+			EXTRA_ARGS+=("${args[@]:i}")
+			return
+		fi
+		EXTRA_ARGS+=("$arg")
+	done
+}
+
+# Copy a directory tree, honoring rsync-style exclude patterns.
+#
+# Prefers rsync where it exists so the established macOS and Linux behavior is
+# unchanged, and falls back to a streaming tar pipe on Windows. The tar path
+# skips excluded directories rather than copying and then deleting them, which
+# matters because the caches being excluded can run to gigabytes.
+#
+# Exclude patterns use rsync semantics: a leading slash anchors the pattern at
+# the transfer root, anything else matches at any depth. GNU tar's default
+# non-anchored matching produces the same result once a leading slash has been
+# rewritten to './'.
+copy_tree() {
+	local src="$1" dst="$2"
+	shift 2
+	mkdir -p "$dst"
+
+	local excl=()
+	local pattern
+	if [[ "$HAVE_RSYNC" == "1" ]]; then
+		for pattern in "$@"; do
+			excl+=("--exclude=$pattern")
+		done
+		rsync -a ${excl[@]+"${excl[@]}"} "$src/" "$dst/"
+		return
+	fi
+
+	for pattern in "$@"; do
+		if [[ "$pattern" == /* ]]; then
+			excl+=("--exclude=.$pattern")
+		else
+			excl+=("--exclude=$pattern")
+		fi
+	done
+	( cd "$src" && tar -cf - ${excl[@]+"${excl[@]}"} . ) | ( cd "$dst" && tar -xf - )
+}
+
+AGENTS=0
+SOURCE_UDD="${POSITRON_DEV_USER_DATA_DIR:-$HOME/.positron-dev}"
+REPO=""
+EXTRA_ARGS=()
+CLONE_EXTENSIONS=0
+FULL=0
+DEFAULT_APP_ARGS=1
+FIRST_RUN_PROMPTS=0
+NO_PYREFLY=0
+REUSE=""
+
+# Supplied by the launcher, not the caller: without --disable-workspace-trust a
+# fresh profile starts in restricted mode with extensions disabled, which reads
+# as missing functionality rather than as a launch problem. The two Chromium
+# switches keep the renderer painting when the window is fully covered; without
+# them Playwright's actionability checks wait for a frame that never comes.
+AUTOMATION_ARGS=(--use-mock-keychain --disable-workspace-trust --skip-welcome
+	--disable-backgrounding-occluded-windows --disable-renderer-backgrounding)
+if [[ "$(uname -s)" == Linux ]]; then
+	AUTOMATION_ARGS+=(--password-store=basic)
+fi
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--source-user-data-dir=*|--repo=*|--reuse-profile=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;  # --flag=value is --flag value, as in the dp.ts helpers
+		--agents) AGENTS=1; shift ;;
+		--source-user-data-dir) SOURCE_UDD="${2-}"; shift 2 || usage_error "$1 needs a value" ;;
+		--repo) REPO="${2-}"; shift 2 || usage_error "$1 needs a value" ;;
+		--clone-extensions|--copy-extensions) CLONE_EXTENSIONS=1; shift ;;
+		--full) FULL=1; shift ;;
+		--no-default-app-args) DEFAULT_APP_ARGS=0; shift ;;
+		--keep-first-run-prompts) FIRST_RUN_PROMPTS=1; shift ;;
+		--no-pyrefly) NO_PYREFLY=1; shift ;;
+		--reuse-profile) REUSE="${2-}"; shift 2 || usage_error "$1 needs a value" ;;
+		-h|--help) exec node "$DIR/dp.ts" help "$0" ;;
+		--) shift; EXTRA_ARGS=("$@"); break ;;
+		*) usage_error "unknown argument $1" ;;
+	esac
+done
+join_uri_args ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+
+if [[ -z "$REPO" ]]; then
+	if [[ -x "$PWD/scripts/code.sh" ]]; then
+		REPO="$PWD"
+	else
+		echo "Could not find a Positron checkout in $PWD. Pass --repo <path>." >&2
+		exit 2
+	fi
+fi
+
+if [[ -n "$REUSE" ]]; then
+	if [[ ! -d "$REUSE/user-data" ]]; then
+		echo "--reuse-profile: no user-data in $REUSE; pass the runDir launch.sh printed" >&2
+		exit 2
+	fi
+	# A profile the app still has open copies torn: the run must be stopped.
+	OLD_PORT=$(sed -n "s|.* start cdp=\([0-9]*\) pid=[^ ]* ${REUSE%/}\$|\1|p" "$(dirname "$REUSE")/instances.log" 2>/dev/null | tail -1)
+	if [[ -n "$OLD_PORT" ]] && curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$OLD_PORT/json/version" 2>/dev/null; then
+		echo "--reuse-profile: the run in $REUSE is still running (CDP port $OLD_PORT); close its window and stop it first: stop.sh --cdp-port $OLD_PORT (no --run-dir, which deletes it)" >&2
+		exit 2
+	fi
+	SOURCE_UDD="$REUSE/user-data"
+fi
+
+if [[ ! -d "$SOURCE_UDD" ]]; then
+	echo "Source user-data-dir does not exist: $SOURCE_UDD" >&2
+	echo "Pass --source-user-data-dir <path> or set POSITRON_DEV_USER_DATA_DIR." >&2
+	exit 2
+fi
+
+# Hold every socket open until all four are bound. Picking them one at a time
+# can return the same freed port twice, and a shared CDP/inspect port breaks attach.
+read -r CDP_PORT EXTHOST_PORT MAIN_PORT AGENTHOST_PORT < <(node -e '
+	const net = require("net");
+	const servers = [0, 1, 2, 3].map(() => net.createServer());
+	Promise.all(servers.map(s => new Promise(r => s.listen(0, "127.0.0.1", r)))).then(() => {
+		console.log(servers.map(s => s.address().port).join(" "));
+		servers.forEach(s => s.close());
+	});
+') || true
+if [[ -z "$AGENTHOST_PORT" ]]; then
+	echo "[launch.sh] could not pick free debug ports" >&2
+	exit 1
+fi
+
+STAMP=$(date +%Y%m%d-%H%M%S)-$$
+# Keep the run directory short enough for the main-process Unix socket. Windows
+# uses named pipes instead, so the length limit does not apply there.
+RUN_DIR="${POSITRON_LAUNCH_TMP:-/tmp}/positron-dev-launch/$STAMP"
+DEST_UDD="$RUN_DIR/user-data"
+SHARED_DATA_DIR="$RUN_DIR/shared-data"
+mkdir -p "$DEST_UDD" "$SHARED_DATA_DIR"
+
+# Use a deny-list so newly introduced profile data is copied by default.
+# Leading-slash patterns match only at the profile root.
+EXCLUDES=(
+	'/extensions'                                       # handled separately below
+	'/workspaceStorage' 'User/workspaceStorage'         # per-workspace state, incl. chat sessions
+	'User/History'                                      # local file edit history
+	'/CachedExtensionVSIXs'                             # backup VSIXs
+	'/logs'
+	'/Cache' '/Code Cache' '/CachedData' '/component_crx_cache'
+	'/GPUCache' '/ShaderCache' '/Dawn*Cache'
+	'/Backups' '/blob_storage' '/BrowserMetrics' '/Crashpad'
+	'/Session Storage'
+	'/Singleton*'
+	'*.lock' '*.sock'
+)
+
+COPY_TOOL=$([[ "$HAVE_RSYNC" == "1" ]] && echo rsync || echo tar)
+if [[ -n "$REUSE" ]]; then
+	# Everything the run wrote, extensions and workspace storage too; not its
+	# logs, caches, or the locks and sockets of the stopped app.
+	echo "[launch.sh] reusing the profile of $REUSE ($COPY_TOOL): $SOURCE_UDD -> $DEST_UDD" >&2
+	copy_tree "$SOURCE_UDD" "$DEST_UDD" '/logs' '/Cache' '/Code Cache' '/CachedData' '/GPUCache' '/ShaderCache' '/Dawn*Cache' '/Crashpad' '/Singleton*' '*.lock' '*.sock'
+elif [[ "$FULL" == "1" ]]; then
+	echo "[launch.sh] full copy ($COPY_TOOL): $SOURCE_UDD -> $DEST_UDD" >&2
+	copy_tree "$SOURCE_UDD" "$DEST_UDD"
+else
+	echo "[launch.sh] slim copy ($COPY_TOOL): $SOURCE_UDD -> $DEST_UDD" >&2
+	copy_tree "$SOURCE_UDD" "$DEST_UDD" "${EXCLUDES[@]}"
+fi
+
+# Prepare extensions according to the selected profile-copy mode.
+EXT_DIR="$DEST_UDD/extensions"
+mkdir -p "$EXT_DIR"
+if [[ "$FULL" != "1" && "$CLONE_EXTENSIONS" == "1" ]]; then
+	echo "[launch.sh] copying extensions: $SOURCE_UDD/extensions -> $EXT_DIR" >&2
+	copy_tree "$SOURCE_UDD/extensions" "$EXT_DIR"
+fi
+
+# Force the in-app dialogs because CDP cannot control native ones: the quick-input
+# file dialog, and the DOM message box used for modal confirmations. This modifies
+# only the disposable profile.
+SETTINGS_FILE="$DEST_UDD/User/settings.json"
+mkdir -p "$(dirname "$SETTINGS_FILE")"
+# Update the keys without parsing and rewriting the entire JSONC document,
+# preserving comments and strings that contain `//`.
+if ! node - "$SETTINGS_FILE" "$FIRST_RUN_PROMPTS" "$NO_PYREFLY" <<'NODE'
+const fs = require('fs');
+const f = process.argv[2];
+// Keys forced into the disposable profile, with the JSON text of each value.
+const FORCED = [
+	['files.simpleDialog.enable', 'true'],
+	['window.dialogStyle', '"custom"'],
+	// A fresh profile offers to import VS Code settings on startup.
+	...(process.argv[3] === '1' ? [] : [['workbench.settings.importFromVSCode.enabled', 'false']]),
+	// --no-pyrefly: an extension that is not allowed is disabled even when installed.
+	...(process.argv[4] === '1' ? [['extensions.allowed', '{ "meta.pyrefly": false, "*": true }']] : []),
+];
+
+let text;
+try { text = fs.readFileSync(f, 'utf8'); }
+catch (e) {
+	if (e.code === 'ENOENT') text = '';
+	else { console.error('[launch.sh] cannot read ' + f + ': ' + e.message); process.exit(1); }
+}
+
+// Write a new object when the file is empty.
+if (text.trim() === '') {
+	const body = FORCED.map(([k, v]) => '  "' + k + '": ' + v).join(',\n');
+	fs.writeFileSync(f, '{\n' + body + '\n}\n');
+	process.exit(0);
+}
+
+// Update the keys that are already present; collect the rest for one insertion,
+// so a multi-key update cannot strand a comma on a line of its own.
+const missing = [];
+for (const [KEY, VALUE] of FORCED) {
+	const keyValueRe = new RegExp('("' + KEY.replace(/\./g, '\\.') + '"\\s*:\\s*)(true|false|null|"[^"\\n]*"|-?\\d+(?:\\.\\d+)?)', 'g');
+	if (keyValueRe.test(text)) {
+		text = text.replace(keyValueRe, '$1' + VALUE);
+	} else if (text.includes('"' + KEY + '"')) {
+		console.error('[launch.sh] ' + KEY + ' is already set to an object in ' + f + '; left as it is');
+	} else {
+		missing.push([KEY, VALUE]);
+	}
+}
+
+if (missing.length > 0) {
+	// Insert before the final closing brace. Avoid parsing JSONC so comments and
+	// formatting remain intact.
+	const lastBrace = text.lastIndexOf('}');
+	if (lastBrace === -1) {
+		console.error('[launch.sh] settings.json has no closing brace - refusing to clobber it: ' + f);
+		process.exit(1);
+	}
+
+	const firstBrace = text.indexOf('{');
+	if (firstBrace === -1 || firstBrace >= lastBrace) {
+		console.error('[launch.sh] settings.json has no opening brace - refusing to clobber it: ' + f);
+		process.exit(1);
+	}
+
+	// Add a leading comma only when the object already contains non-comment content.
+	const between = text.slice(firstBrace + 1, lastBrace)
+		.replace(/\/\*[\s\S]*?\*\//g, '')
+		.replace(/\/\/[^\n]*/g, '')
+		.trim();
+	const entries = missing.map(([k, v]) => '  "' + k + '": ' + v).join(',\n');
+	const insertion = (between.length === 0 ? '\n' : ',\n') + entries + '\n';
+
+	// Drop the whitespace that preceded the brace so the comma stays on the last entry.
+	const head = text.slice(0, lastBrace).replace(/\s+$/, '');
+	text = head + insertion + text.slice(lastBrace);
+}
+
+// Sanity-check the result. Only whole-line comments are stripped, so a trailing
+// `// comment` after a value fails this check on a file that is perfectly valid
+// JSONC. That makes it a warning rather than a reason to refuse the launch.
+try {
+	JSON.parse(text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/[^\n]*$/gm, ''));
+} catch (e) {
+	console.error('[launch.sh] note: patched settings.json did not parse as plain JSON (' + e.message + '). Expected when it holds trailing comments; check it if dialogs behave oddly.');
+}
+
+fs.writeFileSync(f, text);
+NODE
+then
+	echo "[launch.sh] failed to force the in-app dialog settings in $SETTINGS_FILE - automation may need to fall back to per-key input, and a modal confirmation may not be clickable" >&2
+	exit 1
+fi
+echo "[launch.sh] ensured files.simpleDialog.enable=true and window.dialogStyle=custom in $SETTINGS_FILE" >&2
+[[ "$NO_PYREFLY" == "1" ]] && echo "[launch.sh] disabled Pyrefly (meta.pyrefly) through extensions.allowed" >&2
+
+# positron-supervisor offers, once per profile, to let a coding agent it finds on
+# PATH run code in the window's sessions. There is no setting that only hides it:
+# it records that it asked in its global state, so mark it asked here. The key
+# is positron-supervisor's ENABLE_PROMPT_SHOWN_KEY (McpAgentConfig.ts).
+if [[ "$FIRST_RUN_PROMPTS" == "0" ]]; then
+	STATE_DB="$DEST_UDD/User/globalStorage/state.vscdb"
+	if command -v sqlite3 >/dev/null 2>&1; then
+		mkdir -p "$(dirname "$STATE_DB")"
+		EXT_KEY='positron.positron-supervisor'
+		sqlite3 "$STATE_DB" 'CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);'
+		CURRENT=$(sqlite3 "$STATE_DB" "SELECT value FROM ItemTable WHERE key = '$EXT_KEY';")
+		MERGED=$(node -e '
+			let state = {};
+			try { state = JSON.parse(process.argv[1] || "{}"); } catch {}
+			state["positron-supervisor.mcp.enablePromptShown"] = true;
+			process.stdout.write(JSON.stringify(state).replace(/\x27/g, "\x27\x27"));
+		' "$CURRENT")
+		if sqlite3 "$STATE_DB" "INSERT INTO ItemTable (key, value) VALUES ('$EXT_KEY', '$MERGED');"; then
+			echo "[launch.sh] suppressed the coding-agent prompt and the VS Code settings import prompt (pass --keep-first-run-prompts to see them)" >&2
+		else
+			echo "[launch.sh] could not mark the coding-agent prompt as shown; it may appear once" >&2
+		fi
+	else
+		echo "[launch.sh] sqlite3 not on PATH; the coding-agent prompt may appear once" >&2
+	fi
+fi
+
+# Integrated terminals may inherit ELECTRON_RUN_AS_NODE, which breaks code.sh.
+unset ELECTRON_RUN_AS_NODE
+
+CODE_SH="$REPO/scripts/code.sh"
+if [[ ! -x "$CODE_SH" ]]; then
+	echo "Could not find an executable Code OSS launcher at $CODE_SH. Pass --repo <vscode-repo-root>." >&2
+	exit 2
+fi
+
+ARGS=(
+	"--user-data-dir=$(to_native_path "$DEST_UDD")"
+	"--extensions-dir=$(to_native_path "$EXT_DIR")"
+	"--shared-data-dir=$(to_native_path "$SHARED_DATA_DIR")"
+	"--remote-debugging-port=$CDP_PORT"
+	"--inspect-extensions=$EXTHOST_PORT"
+	"--inspect=$MAIN_PORT"
+	"--inspect-agenthost=$AGENTHOST_PORT"
+)
+if [[ "$AGENTS" == "1" ]]; then
+	ARGS=("--agents" "${ARGS[@]}")
+fi
+if [[ "$DEFAULT_APP_ARGS" == "1" ]]; then
+	for automation_arg in "${AUTOMATION_ARGS[@]}"; do
+		supplied=0
+		for extra_arg in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+			if [[ "$extra_arg" == "${automation_arg%%=*}" || "$extra_arg" == "${automation_arg%%=*}="* ]]; then
+				supplied=1
+				break
+			fi
+		done
+		if (( supplied == 0 )); then
+			ARGS+=("$automation_arg")
+		fi
+	done
+fi
+# Positron keeps logs under ~/.local/state/positron/logs/<launch second>, not
+# in the profile, so two instances started in the same second share one folder
+# and write into the same renderer.log. Give each its own, in its run directory.
+logs_supplied=0
+for extra_arg in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+	[[ "$extra_arg" == --logsPath || "$extra_arg" == --logsPath=* ]] && logs_supplied=1
+done
+if (( logs_supplied == 0 )); then
+	ARGS+=("--logsPath=$(to_native_path "$RUN_DIR/logs")")
+fi
+if (( ${#EXTRA_ARGS[@]} )); then
+	ARGS+=("${EXTRA_ARGS[@]}")
+fi
+
+LOG_FILE="$RUN_DIR/code.log"
+echo "[launch.sh] launching: $CODE_SH ${ARGS[*]}" >&2
+echo "[launch.sh] logs: $LOG_FILE" >&2
+
+# Run pre-launch synchronously so download or compilation errors are visible
+# before code.sh starts.
+#
+# Pre-launch is the one step that writes outside the disposable profile. It can
+# delete and re-download $REPO/.build/builtInExtensions/<name> and
+# $REPO/.build/electron, and it compiles into $REPO/out when that directory is
+# absent. An interrupted run can leave a built-in extension half-written, which
+# breaks the normal development build until it is re-downloaded. See SKILL.md.
+echo "[launch.sh] running pre-launch (ensures electron + compiled output + built-ins)..." >&2
+echo "[launch.sh] WARNING: pre-launch writes to the shared .build/ and out/ directories in $REPO." >&2
+echo "[launch.sh] WARNING: interrupting it can leave a built-in extension half-written; repair with 'npm run download-builtin-extensions'." >&2
+if ! ( cd "$REPO" && node build/lib/preLaunch.ts ) >>"$LOG_FILE" 2>&1; then
+	echo "[launch.sh] pre-launch FAILED. Log tail:" >&2
+	tail -n 80 "$LOG_FILE" >&2
+	exit 1
+fi
+
+# Detach the app after pre-launch. Once CDP responds, Electron has established
+# its independent process tree.
+#
+# On Windows the app must not be a descendant of this script's process tree.
+# Ark (the R kernel) statically links a ZeroMQ built with the `wepoll` poller,
+# which opens \Device\Afd directly; that call fails for any process inside an
+# agent session's process tree, so every R session dies at startup with
+# "not a socket (...epoll.cpp:73)" and exit code 1073741845. Handing the launch
+# to WMI reparents the app to WmiPrvSE, still in the interactive session, which
+# clears it. Python is unaffected (its ZeroMQ uses the `select` poller), so the
+# symptom reads as an R-specific bug. Do not "simplify" this back to a direct
+# spawn. macOS and Linux use kqueue and kernel epoll, need no device handle,
+# and keep the plain background spawn below.
+if [[ "$IS_WINDOWS" == "1" ]]; then
+	# Route through generated wrapper scripts rather than inline quoting: the
+	# command line crosses bash -> PowerShell -> cmd, and each layer would
+	# otherwise need its own escaping. Both files stay in $RUN_DIR for
+	# debugging.
+	APP_CMD="$RUN_DIR/launch-app.cmd"
+	{
+		echo "@echo off"
+		echo "set VSCODE_SKIP_PRELAUNCH=1"
+		printf 'cd /d "%s"\n' "$(cmd_escape "$(to_native_path "$REPO")")"
+		# Deliberately not `call`: `call` performs an extra round of percent
+		# expansion, which would consume the escaping applied below (an
+		# argument containing %20 would arrive as "0"). Nothing follows this
+		# line, so there is no need to return to the wrapper.
+		printf 'scripts\\code.bat'
+		for arg in "${ARGS[@]}"; do
+			printf ' "%s"' "$(cmd_escape "$arg")"
+		done
+		printf ' >> "%s" 2>&1\n' "$(cmd_escape "$(to_native_path "$LOG_FILE")")"
+	} >"$APP_CMD"
+
+	# The wrapper path lands inside a single-quoted PowerShell string, where a
+	# literal quote is escaped by doubling it.
+	APP_CMD_NATIVE="$(to_native_path "$APP_CMD")"
+	APP_CMD_NATIVE="${APP_CMD_NATIVE//\'/\'\'}"
+
+	APP_PS1="$RUN_DIR/launch-app.ps1"
+	cat >"$APP_PS1" <<-PSEOF
+		\$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create \`
+			-Arguments @{ CommandLine = 'cmd.exe /c "$APP_CMD_NATIVE"' }
+		if (\$result.ReturnValue -ne 0) {
+			Write-Error "Win32_Process.Create failed with ReturnValue \$(\$result.ReturnValue)."
+			exit 1
+		}
+		\$result.ProcessId
+	PSEOF
+
+	PID=$(powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+		-File "$(to_native_path "$APP_PS1")" 2>>"$LOG_FILE" | tr -d '\r' | tail -n 1)
+	if [[ ! "$PID" =~ ^[0-9]+$ ]]; then
+		echo "[launch.sh] WMI launch did not return a PID. Log tail:" >&2
+		tail -n 80 "$LOG_FILE" >&2
+		exit 1
+	fi
+	echo "[launch.sh] launched out-of-tree via WMI (wrapper PID $PID)" >&2
+else
+	nohup env VSCODE_SKIP_PRELAUNCH=1 "$CODE_SH" "${ARGS[@]}" \
+		</dev/null >>"$LOG_FILE" 2>&1 &
+	PID=$!
+	disown $PID 2>/dev/null || true
+fi
+
+# Wait until CDP responds, reporting an early exit or timeout with the log tail.
+echo "[launch.sh] waiting for CDP on port $CDP_PORT (timeout 90s)..." >&2
+READY=0
+for i in $(seq 1 90); do
+	if ! is_process_alive "$PID"; then
+		echo "[launch.sh] launcher (PID $PID) exited before CDP came up. Log tail:" >&2
+		tail -n 80 "$LOG_FILE" >&2
+		exit 1
+	fi
+	# Node's inspector also answers /json/version, but without a browser websocket URL.
+	VERSION=$(curl -sf --max-time 1 "http://127.0.0.1:$CDP_PORT/json/version" 2>/dev/null || true)
+	if [[ "$VERSION" == *webSocketDebuggerUrl* ]]; then
+		READY=1
+		echo "[launch.sh] CDP ready after ${i}s" >&2
+		break
+	fi
+	sleep 1
+done
+if [[ "$READY" != "1" ]]; then
+	echo "[launch.sh] timed out waiting for CDP on port $CDP_PORT. Log tail:" >&2
+	tail -n 80 "$LOG_FILE" >&2
+	exit 1
+fi
+
+# CDP can become available immediately before a main-process socket failure.
+# Recheck liveness after a short delay before reporting success.
+sleep 2
+if ! is_process_alive "$PID"; then
+	echo "[launch.sh] app exited immediately after CDP came up. Log tail:" >&2
+	tail -n 80 "$LOG_FILE" >&2
+	exit 1
+fi
+
+node -e '
+	console.log(JSON.stringify({
+		pid: '"$PID"',
+		cdpPort: '"$CDP_PORT"',
+		extHostPort: '"$EXTHOST_PORT"',
+		mainPort: '"$MAIN_PORT"',
+		agentHostPort: '"$AGENTHOST_PORT"',
+		userDataDir: process.argv[1],
+		extensionsDir: process.argv[2],
+		sharedDataDir: process.argv[3],
+		runDir: process.argv[4],
+		logFile: process.argv[5],
+		repo: process.argv[6],
+		agents: '"$AGENTS"' === 1,
+	}));
+' "$DEST_UDD" "$EXT_DIR" "$SHARED_DATA_DIR" "$RUN_DIR" "$LOG_FILE" "$REPO"
+
+# One line per start and stop, beside every run directory, so how many
+# instances ran at once can be read without trusting whoever launched them.
+{ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) start cdp=$CDP_PORT pid=$PID $RUN_DIR" >> "$(dirname "$RUN_DIR")/instances.log"; } 2>/dev/null || true

@@ -1,0 +1,218 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2025-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import * as path from 'path';
+import { CancellationToken, QuickPickItem, WorkspaceFolder } from 'vscode';
+import { CreateEnv } from '../../../common/utils/localize';
+import { traceError } from '../../../logging';
+import { CreateEnvironmentProgress } from '../types';
+import { ensureUvInstalledWithProgress } from '../../common/environmentManagers/uvPythonInstaller';
+import { isUvInstalled } from '../../common/environmentManagers/uv';
+import { executeCommand } from '../../../common/vscodeApis/commandApis';
+import { getConfiguration } from '../../../common/vscodeApis/workspaceApis';
+import { showQuickPickWithBack } from '../../../common/vscodeApis/windowApis';
+import { Commands } from '../../../common/constants';
+import { getPipRequirementsFiles } from './venvUtils';
+import { UV_PROVIDER_ID } from './uvCreationProvider';
+import { hasPyprojectToml } from '../common/createEnvTriggerUtils';
+import { getVenvExecutable } from '../common/commonUtils';
+import { runUvCommand, syncUvEnv } from './autoCreateLockFileEnv';
+import { IPythonRuntimeManager } from '../../../positron/manager';
+
+export interface AutoCreateVenvContext {
+    hasRequirements: boolean;
+    hasPyprojectToml: boolean;
+    /** Create the venv with uv, installing uv first (with consent) if it is missing. */
+    useUv: boolean;
+}
+
+export async function detectAutoCreateContext(workspace: WorkspaceFolder): Promise<AutoCreateVenvContext> {
+    const [reqFiles, tomlExists] = await Promise.all([getPipRequirementsFiles(workspace), hasPyprojectToml(workspace)]);
+
+    // Use uv when it is already installed. Otherwise only when python.allowUvPythonInstall
+    // is on, since autoCreateVenvWithDeps would have to install it. Read live so that
+    // turning the setting off takes effect without a reload.
+    const allowUvPythonInstall = getConfiguration('python').get<boolean>('allowUvPythonInstall') ?? true;
+
+    return {
+        hasRequirements: (reqFiles?.length ?? 0) > 0,
+        hasPyprojectToml: tomlExists,
+        useUv: allowUvPythonInstall || (await isUvInstalled()),
+    };
+}
+
+export function describeDepFiles(ctx: AutoCreateVenvContext): string {
+    if (ctx.hasRequirements && ctx.hasPyprojectToml) {
+        return CreateEnv.Venv.requirementsAndPyprojectToml;
+    }
+    if (ctx.hasPyprojectToml) {
+        return 'pyproject.toml';
+    }
+    return 'requirements.txt';
+}
+
+export function describeTool(ctx: AutoCreateVenvContext): string {
+    return ctx.useUv ? 'uv' : 'venv';
+}
+
+interface DepSource {
+    label: string;
+    args: string[];
+}
+
+function reqFileArgs(files: string[]): string[] {
+    const args = ['pip', 'install'];
+    for (const f of files) {
+        args.push('-r', f);
+    }
+    return args;
+}
+
+async function collectDepSources(workspace: WorkspaceFolder): Promise<DepSource[]> {
+    const sources: DepSource[] = [];
+
+    const reqFiles = await getPipRequirementsFiles(workspace);
+    if (reqFiles && reqFiles.length > 0) {
+        for (const f of reqFiles) {
+            const relPath = path.relative(workspace.uri.fsPath, f);
+            sources.push({
+                label: relPath,
+                args: reqFileArgs([f]),
+            });
+        }
+    }
+
+    if (await hasPyprojectToml(workspace)) {
+        sources.push({
+            label: 'pyproject.toml',
+            args: ['pip', 'install', '-e', '.'],
+        });
+    }
+
+    return sources;
+}
+
+async function pickDepInstallArgs(sources: DepSource[]): Promise<string[][]> {
+    if (sources.length === 0) {
+        return [];
+    }
+
+    if (sources.length === 1) {
+        return [sources[0].args];
+    }
+
+    const items: QuickPickItem[] = sources.map((s) => ({ label: s.label, picked: true }));
+    const selection = await showQuickPickWithBack(items, {
+        placeHolder: CreateEnv.Trigger.selectDepSource,
+        ignoreFocusOut: true,
+        canPickMany: true,
+    });
+    if (!selection || (Array.isArray(selection) && selection.length === 0)) {
+        return [];
+    }
+    const selected = Array.isArray(selection) ? selection : [selection];
+    const selectedLabels = new Set(selected.map((s) => s.label));
+    const chosen = sources.filter((s) => selectedLabels.has(s.label));
+    return chosen.map((s) => s.args);
+}
+
+/**
+ * Install dependencies into an existing uv-managed venv using `uv pip install`.
+ * If `depInstallArgs` is provided, uses those directly (pre-resolved by the
+ * auto-create flow). Otherwise, resolves which deps to install interactively.
+ * Each source is installed independently so a failure in one does not block the others.
+ */
+export async function uvInstallDeps(
+    workspace: WorkspaceFolder,
+    progress: CreateEnvironmentProgress,
+    token?: CancellationToken,
+    depInstallArgs?: string[][],
+): Promise<void> {
+    progress.report({ message: CreateEnv.Trigger.installingDeps });
+
+    const allArgs = depInstallArgs ?? (await pickDepInstallArgs(await collectDepSources(workspace)));
+    if (allArgs.length === 0) {
+        return;
+    }
+
+    const errors: string[] = [];
+    for (const args of allArgs) {
+        try {
+            await runUvCommand(args, workspace.uri.fsPath, token);
+        } catch (err) {
+            traceError('Failed to install dep source: ', err);
+            errors.push(String(err));
+        }
+    }
+
+    if (errors.length > 0) {
+        throw errors.join('\n\n');
+    }
+}
+
+/**
+ * Auto-create a venv and install dependencies for a workspace.
+ *
+ * Routes through the existing Create Environment command so that creation
+ * events fire, the runtime is auto-selected, and dependencies are installed.
+ * Both that command and the `uv sync` shortcut hold the creation flag until
+ * the console has started, which suppresses the "new venv" notification.
+ *
+ * When the caller already knows which provider to use, it passes
+ * `providerOptions` and those are used as-is. Otherwise:
+ *
+ * - uv used: installs uv first if it is missing (with consent), and creates
+ *   nothing if the user declines or the install fails.
+ * - uv used and pyproject.toml is the only dep source: runs `uv sync`,
+ *   falling through to the next case if it fails.
+ * - uv used: uses the uv provider with auto-selected Python version
+ *   and dep installation.
+ * - uv not used: opens the standard Create Environment wizard so the
+ *   user can pick an interpreter.
+ *
+ * @param providerOptions Provider selection to use instead of choosing one here,
+ * for example `{ providerId, interpreterPath }` from a prompt that already asked.
+ */
+export async function autoCreateVenvWithDeps(
+    workspace: WorkspaceFolder,
+    ctx: AutoCreateVenvContext,
+    providerOptions?: Record<string, unknown>,
+    pythonRuntimeManager?: IPythonRuntimeManager,
+): Promise<string | undefined> {
+    // Resolve which deps to install BEFORE creating the venv,
+    // so the user can cancel without a venv being created.
+    const sources = await collectDepSources(workspace);
+    const depArgs = await pickDepInstallArgs(sources);
+
+    const options: Record<string, unknown> = {
+        workspaceFolder: workspace,
+        installPackages: depArgs.length > 0,
+        ignoreSourceControl: true,
+        selectEnvironment: true,
+    };
+
+    if (depArgs.length > 0) {
+        options.depInstallArgs = depArgs;
+    }
+
+    if (providerOptions) {
+        Object.assign(options, providerOptions);
+    } else if (ctx.useUv) {
+        // ensureUvInstalledWithProgress shows any install error itself.
+        if (!(await ensureUvInstalledWithProgress()).ok) {
+            return undefined;
+        }
+        // Let uv pick the interpreter so the user's uv config (e.g. python-preference) is honored.
+        const pyprojectOnly = sources.length === 1 && sources[0].label === 'pyproject.toml';
+        if (pythonRuntimeManager && pyprojectOnly && (await syncUvEnv(workspace, pythonRuntimeManager))) {
+            return getVenvExecutable(workspace);
+        }
+        options.providerId = UV_PROVIDER_ID;
+        options.uvPythonVersion = 'auto';
+    }
+
+    const result = await executeCommand(Commands.Create_Environment, options);
+    return (result as { path?: string })?.path;
+}

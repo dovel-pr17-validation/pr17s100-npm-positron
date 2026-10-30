@@ -1,0 +1,364 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2025-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { assert } from 'chai';
+import * as path from 'path';
+import * as sinon from 'sinon';
+import { Uri } from 'vscode';
+import * as windowApis from '../../../../client/common/vscodeApis/windowApis';
+import * as commandApis from '../../../../client/common/vscodeApis/commandApis';
+import * as rawProcessApis from '../../../../client/common/process/rawProcessApis';
+import * as venvUtils from '../../../../client/pythonEnvironments/creation/provider/venvUtils';
+import * as triggerUtils from '../../../../client/pythonEnvironments/creation/common/createEnvTriggerUtils';
+import * as workspaceApis from '../../../../client/common/vscodeApis/workspaceApis';
+import * as uvApis from '../../../../client/pythonEnvironments/common/environmentManagers/uv';
+import * as uvPythonInstaller from '../../../../client/pythonEnvironments/common/environmentManagers/uvPythonInstaller';
+import {
+    AutoCreateVenvContext,
+    autoCreateVenvWithDeps,
+    detectAutoCreateContext,
+    uvInstallDeps,
+} from '../../../../client/pythonEnvironments/creation/provider/autoCreateVenv';
+import { UV_PROVIDER_ID } from '../../../../client/pythonEnvironments/creation/provider/uvCreationProvider';
+import { VenvCreationProviderId } from '../../../../client/pythonEnvironments/creation/provider/venvCreationProvider';
+import { EXTENSION_ROOT_DIR_FOR_TESTS } from '../../../constants';
+import { CreateEnvironmentProgress } from '../../../../client/pythonEnvironments/creation/types';
+import { Observable } from 'rxjs';
+import { Output } from '../../../../client/common/process/types';
+import { getVenvExecutable } from '../../../../client/pythonEnvironments/creation/common/commonUtils';
+import { IPythonRuntimeManager } from '../../../../client/positron/manager';
+
+suite('Auto Create Venv', () => {
+    const workspace = {
+        uri: Uri.file(path.join(EXTENSION_ROOT_DIR_FOR_TESTS, 'src', 'testMultiRootWkspc', 'workspace1')),
+        name: 'workspace1',
+        index: 0,
+    };
+
+    let getPipRequirementsFilesStub: sinon.SinonStub;
+    let hasPyprojectTomlStub: sinon.SinonStub;
+    let showQuickPickWithBackStub: sinon.SinonStub;
+    let executeCommandStub: sinon.SinonStub;
+    let execObservableStub: sinon.SinonStub;
+    let ensureUvInstalledStub: sinon.SinonStub;
+
+    setup(() => {
+        getPipRequirementsFilesStub = sinon.stub(venvUtils, 'getPipRequirementsFiles');
+        hasPyprojectTomlStub = sinon.stub(triggerUtils, 'hasPyprojectToml');
+        showQuickPickWithBackStub = sinon.stub(windowApis, 'showQuickPickWithBack');
+        executeCommandStub = sinon.stub(commandApis, 'executeCommand');
+        execObservableStub = sinon.stub(rawProcessApis, 'execObservable');
+        ensureUvInstalledStub = sinon.stub(uvPythonInstaller, 'ensureUvInstalledWithProgress').resolves({ ok: true });
+        sinon
+            .stub(uvApis, 'execObservableLocatedUv')
+            .callsFake(async (args, options) => rawProcessApis.execObservable('uv', args, options));
+    });
+
+    teardown(() => {
+        sinon.restore();
+    });
+
+    suite('autoCreateVenvWithDeps', () => {
+        test('Single requirements.txt: routes to uv provider, no quickpick', async () => {
+            const reqPath = path.join(workspace.uri.fsPath, 'requirements.txt');
+            getPipRequirementsFilesStub.resolves([reqPath]);
+            hasPyprojectTomlStub.resolves(false);
+            executeCommandStub.resolves({ path: '/some/.venv/bin/python' });
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: true, hasPyprojectToml: false, useUv: true };
+            await autoCreateVenvWithDeps(workspace, ctx);
+
+            sinon.assert.notCalled(showQuickPickWithBackStub);
+            const options = executeCommandStub.firstCall.args[1];
+            assert.deepStrictEqual(
+                {
+                    providerId: options.providerId,
+                    uvPythonVersion: options.uvPythonVersion,
+                    installPackages: options.installPackages,
+                },
+                { providerId: UV_PROVIDER_ID, uvPythonVersion: 'auto', installPackages: true },
+            );
+        });
+
+        test('Single pyproject.toml: uses pip install -e .', async () => {
+            getPipRequirementsFilesStub.resolves([]);
+            hasPyprojectTomlStub.resolves(true);
+            executeCommandStub.resolves({ path: '/some/.venv/bin/python' });
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: false, hasPyprojectToml: true, useUv: true };
+            await autoCreateVenvWithDeps(workspace, ctx);
+
+            sinon.assert.notCalled(showQuickPickWithBackStub);
+            assert.deepStrictEqual(executeCommandStub.firstCall.args[1].depInstallArgs, [
+                ['pip', 'install', '-e', '.'],
+            ]);
+        });
+
+        test('Multiple sources: shows quickpick with all items', async () => {
+            const reqPath = path.join(workspace.uri.fsPath, 'requirements.txt');
+            getPipRequirementsFilesStub.resolves([reqPath]);
+            hasPyprojectTomlStub.resolves(true);
+            showQuickPickWithBackStub.resolves([
+                { label: 'requirements.txt', picked: true },
+                { label: 'pyproject.toml', picked: true },
+            ]);
+            executeCommandStub.resolves(undefined);
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: true, hasPyprojectToml: true, useUv: true };
+            await autoCreateVenvWithDeps(workspace, ctx);
+
+            sinon.assert.calledOnce(showQuickPickWithBackStub);
+            assert.strictEqual(executeCommandStub.firstCall.args[1].depInstallArgs.length, 2);
+        });
+
+        test('User cancels quickpick: skips dep installation', async () => {
+            getPipRequirementsFilesStub.resolves([path.join(workspace.uri.fsPath, 'requirements.txt')]);
+            hasPyprojectTomlStub.resolves(true);
+            showQuickPickWithBackStub.resolves(undefined);
+            executeCommandStub.resolves(undefined);
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: true, hasPyprojectToml: true, useUv: true };
+            await autoCreateVenvWithDeps(workspace, ctx);
+
+            assert.isFalse(executeCommandStub.firstCall.args[1].installPackages);
+        });
+
+        test('uv not used: omits providerId (falls to standard wizard)', async () => {
+            getPipRequirementsFilesStub.resolves([path.join(workspace.uri.fsPath, 'requirements.txt')]);
+            hasPyprojectTomlStub.resolves(false);
+            executeCommandStub.resolves(undefined);
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: true, hasPyprojectToml: false, useUv: false };
+            await autoCreateVenvWithDeps(workspace, ctx);
+
+            sinon.assert.notCalled(ensureUvInstalledStub);
+            const options = executeCommandStub.firstCall.args[1];
+            assert.isUndefined(options.providerId);
+            assert.isUndefined(options.uvPythonVersion);
+        });
+
+        test('uv used: makes sure uv is installed before creating the venv', async () => {
+            getPipRequirementsFilesStub.resolves([path.join(workspace.uri.fsPath, 'requirements.txt')]);
+            hasPyprojectTomlStub.resolves(false);
+            executeCommandStub.resolves(undefined);
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: true, hasPyprojectToml: false, useUv: true };
+            await autoCreateVenvWithDeps(workspace, ctx);
+
+            sinon.assert.callOrder(ensureUvInstalledStub, executeCommandStub);
+        });
+
+        test('uv install declined or failed: creates nothing', async () => {
+            getPipRequirementsFilesStub.resolves([path.join(workspace.uri.fsPath, 'requirements.txt')]);
+            hasPyprojectTomlStub.resolves(false);
+            ensureUvInstalledStub.resolves({ ok: false });
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: true, hasPyprojectToml: false, useUv: true };
+            assert.isUndefined(await autoCreateVenvWithDeps(workspace, ctx));
+
+            sinon.assert.notCalled(executeCommandStub);
+            sinon.assert.notCalled(execObservableStub);
+        });
+
+        test('Caller passes provider options: uses them instead of uv', async () => {
+            getPipRequirementsFilesStub.resolves([path.join(workspace.uri.fsPath, 'requirements.txt')]);
+            hasPyprojectTomlStub.resolves(false);
+            executeCommandStub.resolves(undefined);
+
+            const ctx: AutoCreateVenvContext = { hasRequirements: true, hasPyprojectToml: false, useUv: true };
+            await autoCreateVenvWithDeps(workspace, ctx, {
+                providerId: VenvCreationProviderId,
+                interpreterPath: '/usr/bin/python3',
+            });
+
+            const options = executeCommandStub.firstCall.args[1];
+            assert.deepStrictEqual(
+                {
+                    providerId: options.providerId,
+                    interpreterPath: options.interpreterPath,
+                    uvPythonVersion: options.uvPythonVersion,
+                    installPackages: options.installPackages,
+                },
+                {
+                    providerId: VenvCreationProviderId,
+                    interpreterPath: '/usr/bin/python3',
+                    uvPythonVersion: undefined,
+                    installPackages: true,
+                },
+            );
+            sinon.assert.notCalled(ensureUvInstalledStub);
+        });
+
+        suite('uv sync fast path', () => {
+            const ctx: AutoCreateVenvContext = { hasRequirements: false, hasPyprojectToml: true, useUv: true };
+            let selectLanguageRuntimeFromPathStub: sinon.SinonStub;
+            let runtimeManager: IPythonRuntimeManager;
+
+            function execResult(exitCode: number) {
+                const out = new Observable<Output<string>>((subscriber) => {
+                    subscriber.next({ source: 'stdout', out: 'output\n' });
+                    subscriber.complete();
+                });
+                return { proc: { exitCode }, out, dispose: sinon.stub() };
+            }
+
+            setup(() => {
+                sinon
+                    .stub(windowApis, 'withProgress')
+                    .callsFake(async (_options, task) => task({ report: sinon.stub() }, undefined as never));
+                selectLanguageRuntimeFromPathStub = sinon.stub().resolves('runtime-id');
+                runtimeManager = {
+                    selectLanguageRuntimeFromPath: selectLanguageRuntimeFromPathStub,
+                } as unknown as IPythonRuntimeManager;
+            });
+
+            test('pyproject.toml only, uv sync succeeds: selects the synced venv without the create command', async () => {
+                getPipRequirementsFilesStub.resolves([]);
+                hasPyprojectTomlStub.resolves(true);
+                execObservableStub.returns(execResult(0));
+
+                const result = await autoCreateVenvWithDeps(workspace, ctx, undefined, runtimeManager);
+
+                assert.deepStrictEqual(
+                    execObservableStub.args.map((a) => [a[0], a[1], a[2].cwd]),
+                    [['uv', ['sync'], workspace.uri.fsPath]],
+                );
+                sinon.assert.calledOnceWithExactly(
+                    selectLanguageRuntimeFromPathStub,
+                    getVenvExecutable(workspace),
+                    true,
+                );
+                sinon.assert.notCalled(executeCommandStub);
+                assert.strictEqual(result, getVenvExecutable(workspace));
+            });
+
+            test('uv sync fails: falls back to the uv venv + uv pip install create command', async () => {
+                getPipRequirementsFilesStub.resolves([]);
+                hasPyprojectTomlStub.resolves(true);
+                execObservableStub.returns(execResult(2));
+                executeCommandStub.resolves({ path: '/some/.venv/bin/python' });
+
+                const result = await autoCreateVenvWithDeps(workspace, ctx, undefined, runtimeManager);
+
+                sinon.assert.notCalled(selectLanguageRuntimeFromPathStub);
+                const options = executeCommandStub.firstCall.args[1];
+                assert.deepStrictEqual(
+                    {
+                        providerId: options.providerId,
+                        uvPythonVersion: options.uvPythonVersion,
+                        depInstallArgs: options.depInstallArgs,
+                    },
+                    {
+                        providerId: UV_PROVIDER_ID,
+                        uvPythonVersion: 'auto',
+                        depInstallArgs: [['pip', 'install', '-e', '.']],
+                    },
+                );
+                assert.strictEqual(result, '/some/.venv/bin/python');
+            });
+        });
+    });
+
+    suite('detectAutoCreateContext', () => {
+        let isUvInstalledStub: sinon.SinonStub;
+        let getConfigurationStub: sinon.SinonStub;
+
+        setup(() => {
+            isUvInstalledStub = sinon.stub(uvApis, 'isUvInstalled').resolves(true);
+            getConfigurationStub = sinon.stub(workspaceApis, 'getConfiguration');
+            getPipRequirementsFilesStub.resolves([]);
+            hasPyprojectTomlStub.resolves(true);
+        });
+
+        function stubAllowUvPythonInstall(value: boolean | undefined): void {
+            getConfigurationStub.returns({ get: () => value });
+        }
+
+        test('Install allowed: uses uv', async () => {
+            stubAllowUvPythonInstall(true);
+
+            assert.isTrue((await detectAutoCreateContext(workspace)).useUv);
+        });
+
+        test('Setting unset: defaults to using uv', async () => {
+            stubAllowUvPythonInstall(undefined);
+
+            assert.isTrue((await detectAutoCreateContext(workspace)).useUv);
+        });
+
+        test('allowUvPythonInstall off: still uses uv when it is already installed', async () => {
+            stubAllowUvPythonInstall(false);
+
+            assert.isTrue((await detectAutoCreateContext(workspace)).useUv);
+        });
+
+        test('allowUvPythonInstall off and uv not installed: does not use uv', async () => {
+            stubAllowUvPythonInstall(false);
+            isUvInstalledStub.resolves(false);
+
+            assert.isFalse((await detectAutoCreateContext(workspace)).useUv);
+        });
+
+        test('uv not installed: still uses uv, which is installed once the user agrees', async () => {
+            stubAllowUvPythonInstall(true);
+            isUvInstalledStub.resolves(false);
+
+            assert.isTrue((await detectAutoCreateContext(workspace)).useUv);
+        });
+    });
+
+    suite('uvInstallDeps', () => {
+        let progressMock: CreateEnvironmentProgress;
+
+        setup(() => {
+            progressMock = { report: sinon.stub() };
+        });
+
+        test('Runs uv pip install for each source', async () => {
+            const proc = { exitCode: 0 };
+            const out = new Observable<Output<string>>((subscriber) => {
+                subscriber.next({ source: 'stdout', out: 'ok\n' });
+                subscriber.complete();
+            });
+            execObservableStub.returns({ proc, out, dispose: sinon.stub() });
+
+            await uvInstallDeps(workspace, progressMock, undefined, [
+                ['pip', 'install', '-r', 'requirements.txt'],
+                ['pip', 'install', '-e', '.'],
+            ]);
+
+            sinon.assert.calledTwice(execObservableStub);
+        });
+
+        test('Partial failure: continues remaining installs, throws aggregated error', async () => {
+            const fail = new Observable<Output<string>>((subscriber) => {
+                subscriber.next({ source: 'stdout', out: 'error: not found\n' });
+                subscriber.complete();
+            });
+            const pass = new Observable<Output<string>>((subscriber) => {
+                subscriber.next({ source: 'stdout', out: 'ok\n' });
+                subscriber.complete();
+            });
+            execObservableStub.onFirstCall().returns({ proc: { exitCode: 1 }, out: fail, dispose: sinon.stub() });
+            execObservableStub.onSecondCall().returns({ proc: { exitCode: 0 }, out: pass, dispose: sinon.stub() });
+
+            try {
+                await uvInstallDeps(workspace, progressMock, undefined, [
+                    ['pip', 'install', '-r', 'a.txt'],
+                    ['pip', 'install', '-r', 'b.txt'],
+                ]);
+                assert.fail('Should have thrown');
+            } catch (err) {
+                assert.include(String(err), 'exitCode: 1');
+            }
+            sinon.assert.calledTwice(execObservableStub);
+        });
+
+        test('Empty args: no-ops', async () => {
+            await uvInstallDeps(workspace, progressMock, undefined, []);
+            sinon.assert.notCalled(execObservableStub);
+        });
+    });
+});

@@ -1,0 +1,826 @@
+#!/usr/bin/env node
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+// Drives the Claude Agent SDK to synthesize an e2e test failure report from
+// pre-extracted evidence (failures.json, screenshots, traces, error contexts).
+// All data extraction has already happened in earlier action steps -- this
+// script reads the structured outputs and asks the model for analysis.
+
+import { query } from '@anthropic-ai/claude-agent-sdk';
+import { readFileSync, existsSync, appendFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { decorateReport } from './report-format.mjs';
+
+const WORK_DIR = mustEnv('WORK_DIR');
+const MODEL = process.env.MODEL || 'opus';
+const STEP_SUMMARY = process.env.GITHUB_STEP_SUMMARY;
+const MAX_TURNS = parsePosIntEnv('MAX_TURNS', 40);
+// Repo workspace (sparse-checkout root). Optional: when present, the agent
+// reads failing tests' source from $REPO_ROOT/test/e2e/{tests,pages,fixtures}.
+const REPO_ROOT = process.env.REPO_ROOT || '';
+// Defensive bounds against pathological runs (many failures x long traces).
+// Per-attempt cap is ~50x the old 12-line truncation -- never trips on typical
+// tests, prevents 500-action timelines from ballooning the prompt.
+const MAX_TIMELINE_CHARS = parsePosIntEnv('MAX_TIMELINE_CHARS', 30000);
+// Aggregate soft cap. Sonnet 4.5 has ~600KB of input context; we warn well
+// before that. Exceeding it doesn't fail -- the model handles oversized
+// prompts by failing the request, which we'd see in the action logs anyway.
+const PROMPT_WARN_CHARS = parsePosIntEnv('PROMPT_WARN_CHARS', 400000);
+// Workaround for claude-agent-sdk-typescript#296 (resolver picks musl over
+// glibc on Linux): action.yml installs @anthropic-ai/claude-code globally
+// and passes the resolved path here.
+const CLAUDE_CODE_PATH = process.env.CLAUDE_CODE_PATH || undefined;
+
+function mustEnv(name) {
+	const v = process.env[name];
+	if (!v) {
+		console.error(`Missing required env var: ${name}`);
+		process.exit(2);
+	}
+	return v;
+}
+
+/**
+ * Parse a positive-integer env var. Falls back to `fallback` (with a logged
+ * warning) for unset, empty, NaN, non-integer, or non-positive values. We
+ * silently accept the fallback rather than crashing because misconfiguring a
+ * defensive bound shouldn't kill the analyzer -- but the user should know.
+ */
+function parsePosIntEnv(name, fallback) {
+	const raw = process.env[name];
+	if (raw === undefined || raw === '') { return fallback; }
+	const n = Number(raw);
+	if (!Number.isInteger(n) || n <= 0) {
+		console.warn(`[analyzer] WARN: invalid ${name}=${raw}, falling back to default ${fallback}`);
+		return fallback;
+	}
+	return n;
+}
+
+function readJsonIfExists(path) {
+	if (!existsSync(path)) { return null; }
+	try {
+		return JSON.parse(readFileSync(path, 'utf8'));
+	} catch (err) {
+		console.error(`Failed to parse ${path}: ${err.message}`);
+		return null;
+	}
+}
+
+function discoverProjectDirs(workDir) {
+	const out = [];
+	for (const name of readdirSync(workDir)) {
+		const full = join(workDir, name);
+		if (!statSync(full).isDirectory()) { continue; }
+		if (!name.startsWith('e2e-')) { continue; }
+		const result = readJsonIfExists(join(full, 'result.json'));
+		// job.json is written by the s3 path, which processes one GH job per
+		// directory and so can name the job exactly. The blob path shards one
+		// project across several jobs and writes none -- matchJobsToProject()
+		// falls back to name matching there.
+		if (result) { out.push({ project: name, dir: full, result, job: readJsonIfExists(join(full, 'job.json')) }); }
+	}
+	return out;
+}
+
+/**
+ * Sanitize a job name the way action.yml's s3 path names its output directory,
+ * so a project directory can be matched back to the job that produced it.
+ */
+function sanitizeJobName(name) {
+	const slug = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+	return slug.startsWith('e2e-') ? slug : `e2e-${slug}`;
+}
+
+/**
+ * Find the failed job(s) behind a project directory, best-effort.
+ *
+ * Exact when the directory carries a job.json (s3 path). Otherwise falls back to
+ * the directory-naming rule, then to a shard-suffix match -- the blob path
+ * shards a project across jobs named like "e2e-electron-1".
+ *
+ * The fallbacks stay deliberately strict. A loose substring match would happily
+ * tie the blob path's `e2e-windows` project to the unrelated `e2e / electron-win`
+ * job and then assert that project's tests ran on a broken setup, which is worse
+ * than not matching: an unmatched project is still fully covered by the
+ * run-level "Job setup step failures" section, which names every affected job.
+ */
+function matchJobsToProject({ project, job }, runInfo) {
+	const jobs = runInfo?.failedJobs || [];
+	if (job?.id) {
+		const exact = jobs.filter(j => String(j.id) === String(job.id));
+		if (exact.length) { return exact; }
+	}
+	return jobs.filter(j => {
+		const slug = sanitizeJobName(j.name);
+		return slug === project || slug.startsWith(`${project}-`);
+	});
+}
+
+function renderRunHeader(runInfo) {
+	const r = runInfo?.run || {};
+	const c = runInfo?.commit || {};
+	return [
+		`Run: ${r.html_url || runInfo?.runId || '?'}`,
+		`Workflow: ${r.name || '?'}`,
+		`Branch: ${r.branch || r.head_branch || '?'}`,
+		`Commit: ${(r.head_sha || '').slice(0, 12)} -- ${(c.message || '').split('\n')[0]}`,
+		`Author: ${c.author || '?'}`,
+		`Files changed (${(c.files || []).length}): ${(c.files || []).slice(0, 30).join(', ')}${(c.files || []).length > 30 ? ', ...' : ''}`,
+		...(c.submodules || []).map(renderSubmoduleBump),
+	].join('\n');
+}
+
+/**
+ * Render a submodule bump in the head commit as the commits and files it pulled
+ * in, and those it took out when it moved the pointer back. When a range could
+ * not be fetched, say so outright: an unexpanded bump is one opaque path, and
+ * the model otherwise guesses at what it touched.
+ */
+function renderSubmoduleBump(s) {
+	const range = `${(s.from || '').slice(0, 10)}..${(s.to || '').slice(0, 10)}`;
+	const head = `Submodule bump: ${s.path}${s.repo ? ` (${s.repo})` : ''} ${range}`;
+	if (!Array.isArray(s.commits)) {
+		return `${head} -- the range could not be expanded, so what it changed is UNKNOWN. Do not guess whether it touched the failing feature; say it is unknown.`;
+	}
+	const lines = [`${head}${s.status && s.status !== 'ahead' ? ` -- compare status "${s.status}"` : ''}. These commits, not the head commit's gitlink, are the code changes under test:`];
+	lines.push(...renderCommitSet('ADDED', s.totalCommits ?? s.commits.length, s.commits, s.files));
+	if (s.behindBy > 0) {
+		lines.push(s.removed
+			? renderCommitSet('REMOVED (the bump moved the pointer back past them; removed code is as much a change under test as added code)', s.removed.totalCommits ?? s.removed.commits.length, s.removed.commits, s.removed.files).join('\n')
+			: `  ${s.behindBy} commit(s) REMOVED (the bump moved the pointer back), but they could not be listed, so what they changed is UNKNOWN.`);
+	}
+	return lines.join('\n');
+}
+
+/** One side of a submodule bump: a commit list and the files it changed. */
+function renderCommitSet(label, total, commits, files) {
+	if (total === 0) { return [`  0 commits ${label.split(' ')[0]}.`]; }
+	const lines = [`  ${total} commit(s) ${label}:`];
+	if (total > commits.length) { lines.push(`    (oldest ${total - commits.length} not listed)`); }
+	for (const cm of commits) { lines.push(`    - ${cm.sha} ${cm.title}`); }
+	const changed = files || [];
+	lines.push(`    Files (${changed.length}${changed.length >= 300 ? '+' : ''}): ${changed.slice(0, 80).join(', ')}${changed.length > 80 ? ', ...' : ''}`);
+	return lines;
+}
+
+function renderNonE2eFailures(runInfo) {
+	const failed = (runInfo?.failedJobs || []).filter(j => !j.isE2e);
+	if (failed.length === 0) { return '(none)'; }
+	const logs = runInfo?.nonE2eJobLogs || {};
+	return failed.map(j => {
+		// All three buckets: a non-e2e job's steps are only positioned relative to
+		// a test step when it happens to have one (e.g. "Run unit tests"), so most
+		// of these land in failedUnpositioned.
+		const steps = [
+			...(j.steps?.failedBeforeTest || []),
+			...(j.steps?.failedUnpositioned || []),
+			...(j.steps?.failedAfterTest || []),
+		]
+			.map(st => `#${st.number} "${st.name}"`)
+			.join(', ');
+		const stepLine = steps ? `\n  Failed steps: ${steps}` : '';
+		const excerpt = logs[j.id] ? `\n  Excerpt:\n${indent(String(logs[j.id]).slice(0, 2000), '    ')}` : '';
+		return `- Job ${j.id}: ${j.name}${stepLine}${excerpt}`;
+	}).join('\n');
+}
+
+/**
+ * Render the workflow-step evidence: which failed jobs ran their tests anyway
+ * after a SETUP step failed.
+ *
+ * GitHub keeps a job going past a failed step whenever the later steps carry
+ * their own `if:` conditions, so a job can install R, fail, and still run the
+ * whole R suite against a broken runtime. Neither the job conclusion nor the
+ * Playwright report distinguishes that from a product regression -- the step
+ * conclusions are the only place it shows up, which is why this section is
+ * rendered before any test evidence.
+ */
+function renderJobSetupFailures(runInfo, projects) {
+	// e2e jobs only: a non-e2e job has no test step to position failures against,
+	// and its own log digest is rendered in the next section.
+	const jobs = (runInfo?.failedJobs || []).filter(j => j.isE2e && j.steps);
+	if (jobs.length === 0) { return '(no step data available for this run)'; }
+
+	// project dir -> the job(s) that produced it, so the model can tie a broken
+	// setup step to the exact evidence bundle below.
+	const dirsByJobId = new Map();
+	for (const p of projects) {
+		for (const j of matchJobsToProject(p, runInfo)) {
+			if (!dirsByJobId.has(j.id)) { dirsByJobId.set(j.id, []); }
+			dirsByJobId.get(j.id).push(p.project);
+		}
+	}
+
+	// Jobs with no identifiable test step (shard aggregators whose only step is a
+	// "Check test results" gate). Their failed steps cannot be ordered against a
+	// test run, so they are reported as-is rather than as setup failures.
+	const unpositioned = jobs
+		.filter(j => j.steps.failedUnpositioned?.length)
+		.map(j => `${j.name}: ${j.steps.failedUnpositioned.map(st => `#${st.number} "${st.name}"`).join(', ')}`);
+	const unpositionedNote = unpositioned.length
+		? ['', '', 'Failed steps in jobs with no identifiable test step (usually a shard-aggregator job\'s results gate -- a consequence of the shard failures, not a cause):',
+			...unpositioned.map(l => `- ${l}`)].join('\n')
+		: '';
+
+	const affected = jobs.filter(j => j.steps.failedBeforeTest?.length);
+	if (affected.length === 0) {
+		const checked = jobs.map(j => j.name).join(', ');
+		return `(none -- every failed job's setup steps completed before its test step ran. Checked: ${checked})${unpositionedNote}`;
+	}
+
+	const out = [
+		'The jobs below kept running after a SETUP step failed, so their tests ran',
+		'against an incomplete environment. Their test failures are environment',
+		'defects until proven otherwise -- see the rubric section "Check the job\'s',
+		'own setup steps before blaming the product".',
+		'',
+	];
+	for (const j of affected) {
+		const s = j.steps;
+		const dirs = dirsByJobId.get(j.id) || [];
+		out.push(`- Job: ${j.name} (id ${j.id})`);
+		out.push(`  Evidence bundle: ${dirs.length ? dirs.join(', ') : '(could not be matched to a project directory)'}`);
+		// A SKIPPED test step is its own finding: the shard's tests never ran at
+		// all, so this run's coverage is incomplete rather than something having
+		// regressed -- and there will be no evidence bundle to explain it.
+		out.push(`  Test step: ${s.testStep ? `#${s.testStep.number} "${s.testStep.name}" -- ${s.testStep.conclusion}${s.testStep.conclusion === 'skipped' ? ' (its tests NEVER RAN: report this as missing coverage caused by the setup failure, not as a test failure)' : ''}` : '(not identified -- the failed steps below could not be placed relative to the test run)'}`);
+		out.push(`  FAILED before the tests ran:`);
+		for (const st of s.failedBeforeTest) {
+			out.push(`    - #${st.number} "${st.name}"`);
+			if (st.log) { out.push(indent(st.log, '        ')); }
+		}
+		if (s.skippedAfterFailure?.length) {
+			// GitHub never reports WHY a step was skipped, so this mixes fallout
+			// from the failure above with ordinary matrix/`if` skips. Say so.
+			out.push(`  Skipped after that failure (the API does not say why -- some are fallout, some are ordinary matrix/\`if\` skips): ${s.skippedAfterFailure.map(st => `#${st.number} "${st.name}"`).join(', ')}`);
+		}
+		if (s.failedAfterTest?.length) {
+			out.push(`  Failed after the tests ran (post-processing, e.g. report upload): ${s.failedAfterTest.map(st => `#${st.number} "${st.name}"`).join(', ')}`);
+		}
+	}
+	const clean = jobs
+		.filter(j => !j.steps.failedBeforeTest?.length && !j.steps.failedUnpositioned?.length)
+		.map(j => j.name);
+	if (clean.length) {
+		out.push('');
+		out.push(`Failed jobs whose setup DID complete (so their failures are not explained by this): ${clean.join(', ')}`);
+	}
+	return out.join('\n') + unpositionedNote;
+}
+
+/**
+ * Pre-compute deterministic severity per test: HARD = appears in result.failures
+ * (failed all retries); FLAKY = only appears in failedTests (recovered on retry).
+ * This must be computed here -- the model will misclassify if asked to count attempts.
+ * Match on (title, normalizedSpecPath). failures.file is a playwright-normalized
+ * absolute path while testDetails.file is project-relative; we strip up to the
+ * `tests/` root so the suffixes can be compared directly. Using the full project-
+ * relative suffix (not just basename) avoids false matches when two test files in
+ * different directories happen to share a basename and a test title.
+ */
+function classifyTests(result) {
+	const hardKeys = new Set((result.failures || []).map(f => `${f.title}|||${normalizeSpecPath(f.file)}`));
+	return (result.testDetails || []).map(t => ({
+		test: t,
+		severity: hardKeys.has(`${t.title}|||${normalizeSpecPath(t.file)}`) ? 'HARD' : 'FLAKY',
+	}));
+}
+
+function renderProjectFailures(projects, historyMap, runInfo) {
+	if (projects.length === 0) { return '(no e2e projects)'; }
+	const out = [];
+	for (const p of projects) {
+		const { project, result } = p;
+		out.push(`### Project: ${project}`);
+		// Repeat the setup warning at the project header: the model reads this
+		// section per-failure, and the run-level section is easy to lose track of
+		// once it is deep in one project's screenshots and traces.
+		const brokenSetup = matchJobsToProject(p, runInfo)
+			.flatMap(j => (j.steps?.failedBeforeTest || []).map(st => `#${st.number} "${st.name}"`));
+		if (brokenSetup.length) {
+			out.push(`**SETUP FAILED for this project's job before its tests ran: ${brokenSetup.join(', ')}.** Every failure below inherits that doubt -- see "Job setup step failures" above and the rubric.`);
+		}
+		const finalFailures = result.failures || [];
+		const allAttempts = result.failedTests || [];
+		out.push(`Hard failures (failed all retries): ${finalFailures.length}`);
+		out.push(`Total failed attempts (incl. flaky recoveries): ${allAttempts.length}`);
+
+		// Flaky tests (passed on retry) get a compact one-line mention -- name +
+		// history -- and are collected here; hard failures get the full evidence
+		// block inline. A flaky test did NOT break this run (it went green on
+		// retry), so the run-centric analyzer does not deep-analyze it: that is
+		// the test-centric debug-e2e-test skill's job. This keeps flakies visible
+		// for handoff while restricting the dominant token cost (per-attempt image
+		// and trace evidence, which the model reads) to hard failures only.
+		const flakyLines = [];
+		for (const { test: t, severity } of classifyTests(result)) {
+			if (severity !== 'HARD') {
+				const hist = findHistoryFor(historyMap, t.title, t.file);
+				flakyLines.push(`- ${t.title} (${t.file})${hist ? ` -- ${historyOneLiner(hist)}` : ''}`);
+				continue;
+			}
+
+			out.push('');
+			out.push(`- Test: ${t.title}`);
+			out.push(`  File: ${t.file}`);
+			out.push(`  Severity: ${severity} (${severity === 'HARD' ? 'failed all retries' : 'passed on retry'})`);
+			out.push(`  Status: ${t.status} (${t.attemptCount} attempt${t.attemptCount === 1 ? '' : 's'})`);
+			if (Array.isArray(t.siblingTests) && t.siblingTests.length) {
+				// A PASSED sibling that shares this test's fixture/setup proves setup
+				// ran and the fixture was provisioned -- so a "not found" failure here
+				// is a mid-run lifecycle/race, not a provisioning bug. See rubric.
+				const sib = t.siblingTests.map(s => `${s.title} [${s.status}]`).join('; ');
+				out.push(`  Other tests in this file: ${sib}`);
+			}
+			const hist = findHistoryFor(historyMap, t.title, t.file);
+			if (hist) {
+				out.push(indent(renderHistoryForTest(hist), '  '));
+			} else if (historyMap.size > 0) {
+				out.push(`  History: no entry for this test (${historyMap.size} tests in history blob)`);
+			}
+			for (let i = 0; i < (t.attempts || []).length; i++) {
+				const a = t.attempts[i];
+				out.push(`  Attempt ${i + 1}:`);
+				// Prefer the chronological array; fall back to the single legacy path.
+				const shots = Array.isArray(a.screenshotPaths) && a.screenshotPaths.length
+					? a.screenshotPaths
+					: (a.screenshotPath ? [a.screenshotPath] : []);
+				if (shots.length === 1) {
+					out.push(`    screenshot: ${shots[0]}`);
+				} else if (shots.length > 1) {
+					out.push(`    screenshots (chronological, last is failure-state):`);
+					for (let j = 0; j < shots.length; j++) {
+						out.push(`      [${j}] ${shots[j]}`);
+					}
+				}
+				if (a.errorContextPath) { out.push(`    errorContext: ${a.errorContextPath}`); }
+				if (a.trace?.timeline) {
+					const tl = capTimeline(String(a.trace.timeline));
+					out.push(`    trace timeline:\n${indent(tl, '      ')}`);
+				}
+				if (Array.isArray(a.trace?.errors) && a.trace.errors.length) {
+					out.push(`    trace errors: ${a.trace.errors.slice(0, 3).map(e => String(e).split('\n')[0]).join(' | ')}`);
+				}
+			}
+			if (t.logExcerpt) {
+				// Attached logs, time-sliced to the failing action's wait: ALL
+				// severities inside the window plus a derived "went quiet before the
+				// deadline" report. Carries detail the trace lacks (a kernel's resolved
+				// file path, a provider's successful model fetch) and, crucially,
+				// negative evidence -- a log falling silent exactly when the UI should
+				// have appeared, which no error grep can surface.
+				out.push(`  Log excerpt (attached logs, sliced to the failure window):`);
+				out.push(indent(capTimeline(String(t.logExcerpt)), '    '));
+			}
+		}
+
+		if (flakyLines.length) {
+			out.push('');
+			out.push(`#### Flaky (passed on retry) -- listed for awareness, NOT deep-analyzed`);
+			out.push(`These recovered on retry and did not break the run. Do not fetch their evidence or write a detailed analysis for them; if one looks like a real intermittent product bug, note it in one line and recommend the debug-e2e-test skill.`);
+			out.push(...flakyLines);
+		}
+	}
+	return out.join('\n');
+}
+
+/** One-line history summary for a flaky test's compact mention. */
+function historyOneLiner(entry) {
+	const h = entry.history || {};
+	const passRate = h.pass_rate != null ? `${(h.pass_rate * 100).toFixed(0)}% pass` : 'pass rate n/a';
+	const insight = entry.insight?.type ? `, ${entry.insight.type}` : '';
+	return `history: ${passRate} over ${h.total_runs ?? '?'} runs${insight}`;
+}
+
+/**
+ * Normalize an e2e spec file path to the canonical "test/e2e/tests/..." form
+ * used by the e2e-test-insights API. Handles four input shapes:
+ *
+ *   "../C:\\a\\positron\\test\\e2e\\tests\\foo\\bar.test.ts"  (failures.file: absolute)
+ *   "tests\\foo\\bar.test.ts"                                  (testDetails.file: relative)
+ *   "test/e2e/tests/foo/bar.test.ts"                           (already canonical)
+ *   "tests/foo/tests/bar.test.ts"                              (nested `tests/` subdir)
+ *
+ * All normalize to "test/e2e/tests/<rest>". Used for both severity lookup AND
+ * matching against history API keys -- using the full project-relative suffix
+ * (not just basename) avoids false matches when two test files in different
+ * directories happen to share a basename and a title.
+ *
+ * Anchors on the specific "/test/e2e/tests/" substring rather than a generic
+ * "/tests/" so paths with nested `tests/` subdirectories aren't truncated.
+ */
+function normalizeSpecPath(file) {
+	const fwd = String(file || '').replace(/\\/g, '/');
+	// Prefer the most specific anchor: matches absolute Playwright-normalized
+	// paths regardless of how deep a `tests/` subdir is nested afterwards.
+	const idx = fwd.indexOf('/test/e2e/tests/');
+	if (idx >= 0) { return fwd.slice(idx + 1); }
+	if (fwd.startsWith('test/e2e/')) { return fwd; }
+	if (fwd.startsWith('tests/')) { return `test/e2e/${fwd}`; }
+	return fwd;
+}
+
+function buildHistoryByKey(history) {
+	const map = new Map();
+	if (history && Array.isArray(history.tests)) {
+		// The API reports the query window once, at the top level, not per test.
+		// Carry it onto each entry so the per-test history line can state it:
+		// without the window bounds, a "Started today" onset is indistinguishable
+		// from a first-seen date censored by the start of the window.
+		const queryWindow = {
+			lookback_days: history.lookback_days,
+			window_start: history.window_start,
+			branch: history.branch,
+		};
+		for (const t of history.tests) {
+			if (t.test_key) { map.set(t.test_key, { ...queryWindow, ...t }); }
+		}
+	}
+	return map;
+}
+
+function findHistoryFor(historyMap, title, file) {
+	if (!historyMap || historyMap.size === 0) { return null; }
+	const specPath = normalizeSpecPath(file);
+
+	// Fast path: the composed key matches an entry outright. Works when the blob
+	// title is already the full Playwright title path, or when the API keys tests
+	// by their leaf title.
+	const exact = historyMap.get(`${title}|||${specPath}`);
+	if (exact) { return exact; }
+
+	// Fall back to spec-path + leaf-title-suffix matching. The e2e-test-insights
+	// API keys tests by their FULL Playwright title path (suite ancestors joined
+	// with " > "), e.g. "Console Pane: Python > Python - Verify ...", while the
+	// blob report yields only the leaf title "Python - Verify ...". The normalized
+	// spec path uniquely narrows the file, so within that file a testName equal to
+	// the leaf title -- or ending in "> <leaf title>" -- is the same test. This
+	// keeps history matching working regardless of whether either side prefixes
+	// the suite chain.
+	//
+	// Fail closed on ambiguity: two tests in the same file can share a leaf title
+	// under different suites, and the leaf-only blob title can't tell them apart.
+	// Returning the first hit could attach the wrong history, so require exactly
+	// one candidate; otherwise return null and let the caller show "no entry".
+	const suffix = `> ${title}`;
+	const candidates = [];
+	for (const entry of historyMap.values()) {
+		if (normalizeSpecPath(entry.specPath) !== specPath) { continue; }
+		const name = entry.testName || '';
+		if (name === title || name.endsWith(suffix)) { candidates.push(entry); }
+	}
+	return candidates.length === 1 ? candidates[0] : null;
+}
+
+function renderHistoryForTest(entry) {
+	const h = entry.history || {};
+	const lines = [];
+	const passed = h.pass_count ?? 0;
+	const total = h.total_runs ?? 0;
+	const failRate = h.fail_rate != null ? `${(h.fail_rate * 100).toFixed(0)}%` : '?';
+	const passRate = h.pass_rate != null ? `${(h.pass_rate * 100).toFixed(0)}%` : '?';
+	const windowStart = entry.window_start ? `, window_start ${entry.window_start}` : '';
+	lines.push(`History (last ${entry.lookback_days || '?'} days${windowStart}, branch ${entry.branch || '?'}):`);
+	lines.push(`  passed ${passed}/${total} (${passRate}), failed ${h.fail_count ?? 0} (${failRate}), flaky ${h.flaky_count ?? 0}, last_status=${h.last_status || '?'}`);
+	if (entry.insight) {
+		const ins = entry.insight;
+		lines.push(`  insight: ${ins.type || '?'}${ins.message ? ` -- "${String(ins.message).slice(0, 80)}"` : ''}${ins.occurrences ? `, ${ins.occurrences} occurrences` : ''}${ins.timing_value ? `, ${ins.timing_label || 'first seen'} ${ins.timing_value}` : ''}`);
+	}
+	if (Array.isArray(entry.environment_breakdown) && entry.environment_breakdown.length) {
+		lines.push('  environments:');
+		for (const e of entry.environment_breakdown) {
+			const er = e.pass_rate != null ? `${(e.pass_rate * 100).toFixed(0)}%` : '?';
+			lines.push(`    ${e.os}/${e.browser}: ${e.passed}/${e.total_runs} (${er}, ${e.failed} failed, ${e.flaky} flaky)`);
+		}
+	}
+	if (Array.isArray(entry.failure_patterns) && entry.failure_patterns.length) {
+		const top = entry.failure_patterns[0];
+		const pct = top.percentage != null ? ` (${(top.percentage * 100).toFixed(0)}%)` : '';
+		lines.push(`  top failure pattern${pct}: "${String(top.pattern || '').replace(/\n/g, ' ').slice(0, 140)}"`);
+	}
+	return lines.join('\n');
+}
+
+function indent(text, prefix) {
+	return String(text).split('\n').map(l => prefix + l).join('\n');
+}
+
+
+/**
+ * Cap a per-attempt timeline so a single pathological test can't dominate the
+ * prompt. Keeps the head AND tail (failures usually hit the tail; the head
+ * shows where the test started) and drops the middle with a marker.
+ *
+ * Guarantees `result.length <= MAX_TIMELINE_CHARS`. Falls back to a hard
+ * truncate (with an ellipsis) if the configured cap is too small for a
+ * meaningful head+tail split.
+ */
+function capTimeline(text) {
+	const max = MAX_TIMELINE_CHARS;
+	if (text.length <= max) { return text; }
+
+	// Reserve a generous fixed budget for the elision marker. The marker is
+	// `\n\n[... N chars elided to fit prompt budget ...]\n\n` where N's digit
+	// count is bounded by realistic input sizes; 80 chars covers up to ~10^20.
+	const MARKER_RESERVE = 80;
+
+	if (max <= MARKER_RESERVE + 2) {
+		// Cap is so small there's no room for head + tail + marker. Hard truncate.
+		const ellipsis = '...';
+		if (max <= ellipsis.length) { return text.slice(0, max); }
+		return text.slice(0, max - ellipsis.length) + ellipsis;
+	}
+
+	const half = Math.floor((max - MARKER_RESERVE) / 2);
+	const head = text.slice(0, half);
+	const tail = text.slice(-half);
+	const elided = Math.max(0, text.length - 2 * half);
+	const marker = `\n\n[... ${elided} chars elided to fit prompt budget ...]\n\n`;
+
+	let result = head + marker + tail;
+	// Hard guard: if the marker exceeded MARKER_RESERVE (e.g. astronomical input
+	// size with many digits), trim from the tail rather than blowing the budget.
+	if (result.length > max) { result = result.slice(0, max); }
+	return result;
+}
+
+function renderHistorySummary(history, historyMap) {
+	if (!history) { return '(no historical data; e2e-test-insights API unavailable or no key)'; }
+	if (history.error) { return `(history query error: ${history.error})`; }
+	const total = historyMap.size;
+	if (total === 0) { return '(history blob present but empty)'; }
+	return `Per-test history pre-rendered inline with each failure below. (${total} tests in history blob, lookback ${history.lookback_days || '?'} days, branch ${history.branch || '?'}.)`;
+}
+
+const SYSTEM_PROMPT_HEAD = `You are an e2e test failure triage analyst for the Positron IDE project. You produce concise, evidence-based markdown reports for GitHub Actions step summaries.
+
+Apply the analysis rubric below to every failure. It is the shared source of truth for root-cause categories and the reasoning that distinguishes a stale test selector from a real product bug; the e2e-failure-analyzer skill uses the same rubric file, so local triage and this Action reason identically.`;
+
+// Runner-specific instructions appended after the shared rubric: pre-computed
+// severity (the Action computes it; the model must not second-guess it) and the
+// exact step-summary output contract.
+const SYSTEM_PROMPT_TAIL = `This run deep-analyzes HARD failures (failed all retries) only, and requires a specific output format.
+
+- Each hard failure in the input is labeled "Severity: HARD" and carries full evidence (screenshots, trace, error-context). Analyze these fully.
+- Flaky tests (passed on retry) are NOT deep-analyzed. They appear only in the input's compact "Flaky (passed on retry)" list -- name + history, no evidence. Do NOT fetch evidence or write a detailed analysis for them: they went green on retry so they did not break this run, and per-test flaky investigation is the debug-e2e-test skill's job. If one's history clearly reads as a real intermittent product bug, you may flag it in a single line pointing to that skill; otherwise just list it.
+- Product source is checked out under \`$REPO_ROOT/{src,extensions}\` (see the REPO_ROOT line). Use it to settle a code-vs-test attribution for a hard failure -- but ONLY to confirm a hypothesis the trace / page snapshot / console digest / logs already point to. Prefer Grep, read narrowly, and do not go spelunking; if the evidence doesn't already implicate a specific area, don't go hunting through the tree.
+
+Output the FINAL REPORT as your last message. The report MUST be valid GitHub-flavored markdown starting with the heading \`## Summary\`. Do not include images, raw JSON, or commentary outside the report. Do not include any text before \`## Summary\` in the final message.
+
+Report structure:
+
+## Summary
+
+| Test | Platform | Root cause |
+|------|----------|------------|
+| <test name> | <project / OS> | <category> |
+
+List every HARD failure as a row. Write each Root cause cell as just the rubric category name, spelled exactly as the rubric spells it (prefix "suspected" for a suspected product regression) -- no parenthetical; the explanation belongs in Detailed Analysis. The Action rebuilds this table after you write it: it adds a colored category icon to each row, counts rows by category for a callout above the table and the Slack post, and adds a legend. So do not add icons, emoji, a legend, or a count yourself. Keep failures from the same test file adjacent. Non-e2e job failures (unit tests, build failures, etc.) are hard by definition -- include them as rows with the job name as the test name. Do NOT put flaky tests in this table.
+
+Read the input's \`## Job setup step failures\` section FIRST and let it settle the root cause before you open any screenshot or trace. A test in a job whose setup failed does not get the same row as the same test in a job whose setup was clean -- give them separate rows with their separate root causes.
+
+## Detailed Analysis
+
+One section per distinct HARD failure (or group of the same test across platforms), in this exact layout, with a \`---\` line between sections:
+
+### <test name>
+
+<sub><platform(s)> &middot; <root cause category, with confidence if suspected></sub>
+
+**What happened:** <1-2 short sentences in plain language that someone who has never seen this test can follow: what the test was trying to do, what went wrong, and whether the problem is in the product, the test, or the CI environment. No selectors, CSS classes, file paths, line numbers, or rubric terms -- those belong in Evidence. Example: "The test opens the Output panel and scrolls to the top, but new log lines kept arriving and pulled the view back to the bottom. The product is fine; the test needs to wait for the output to stop.">
+
+**Setup:** <include this paragraph ONLY when the failure's job had a pre-test setup step failure; name the step and what it was installing. Omit it entirely otherwise -- do not write "setup ok">
+
+**Action:** <the single next step and who owns it, in at most 2 sentences and about 50 words. When the cause is unconfirmed, name the one check that would confirm or refute it -- not a full investigation plan; the reasoning behind it belongs in Evidence detail.>
+
+**Evidence:** <at most 2 short sentences: the single most decisive observation from the screenshot/trace/page snapshot>
+
+<details><summary>Evidence detail</summary>
+
+<the full evidence reasoning: what each screenshot, trace step, DOM-presence line, page snapshot, and log line shows, and what it rules in or out>
+
+</details>
+
+<sub>**Commit:** <relevant changed files, or "no related changes"> &middot; **History:** <one short line: pass rate, and onset or trend if it matters, or "no data available"></sub>
+
+Layout rules:
+- The \`###\` heading is the test name exactly as it appears in the Summary table's Test cell, with nothing before it -- the Action matches the heading to the row to add its icon.
+- Keep a blank line after the \`<summary>\` line and before \`</details>\`; GitHub only renders the markdown inside the block with that spacing. Omit the block when the short Evidence line already says everything.
+- Keep the Evidence line itself short -- the detail block is where the reasoning goes.
+
+## Flaky (passed on retry)
+
+One sentence noting these recovered on retry and were not deep-analyzed. Then list each flaky test as a compact bullet (name + the one-line history from the input). Recommend the debug-e2e-test skill for any worth per-test investigation. Omit this whole section if the input had no flaky tests.
+
+Constraints:
+- Keep the report focused. For runs with many failures, group related ones.
+- Use Posit / Positron terminology (workbench, console, runtime, plot view, etc.).
+- Do not embed image markdown -- screenshots aren't rendered in step summaries.
+- Do not invent file paths, test names, or error messages -- only cite what's in the input.`;
+
+// Minimal degraded-mode rubric used only if rubric.md cannot be read. Keep it
+// short and obviously partial -- it is NOT a parallel source of truth.
+const RUBRIC_FALLBACK = `## Analysis rubric (fallback -- rubric.md could not be loaded)
+
+For each failure determine: (1) root cause -- one of flaky test | infrastructure issue | product regression | locator drift / stale selector | test environment issue | timeout | test logic bug; (2) a 1-2 sentence evidence-based explanation; (3) a suggested action. For any locator-not-found / not-visible / attribute / text failure, read the error-context page snapshot (errorContextPath) FIRST and decide locator drift (the target's stable text/label is present under different markup -- the test selector is stale) vs product regression (the target is genuinely absent). A bootstrapped extension floated to latest main (e.g. Posit Assistant) is a common drift source with no Positron-side change.`;
+
+/**
+ * Load the shared analysis rubric (.claude/skills/e2e-failure-analyzer/rubric.md).
+ * Resolves it the same way action.yml resolves the helper scripts -- under
+ * REPO_ROOT -- with a fallback relative to this file for ad-hoc runs, and a
+ * minimal inline fallback so a missing/moved file never silently drops the rubric.
+ */
+function loadRubric() {
+	const candidates = [
+		REPO_ROOT ? join(REPO_ROOT, '.claude/skills/e2e-failure-analyzer/rubric.md') : null,
+		fileURLToPath(new URL('../../../.claude/skills/e2e-failure-analyzer/rubric.md', import.meta.url)),
+	].filter(Boolean);
+	for (const p of candidates) {
+		try {
+			const text = readFileSync(p, 'utf8').trim();
+			if (text) {
+				console.log(`[analyzer] loaded analysis rubric from ${p}`);
+				return text;
+			}
+		} catch { /* try next candidate */ }
+	}
+	console.warn('[analyzer] WARN: could not load rubric.md from any known location; using minimal inline fallback');
+	return RUBRIC_FALLBACK;
+}
+
+const SYSTEM_PROMPT = `${SYSTEM_PROMPT_HEAD}
+
+--- BEGIN ANALYSIS RUBRIC (.claude/skills/e2e-failure-analyzer/rubric.md) ---
+${loadRubric()}
+--- END ANALYSIS RUBRIC ---
+
+${SYSTEM_PROMPT_TAIL}`;
+
+async function main() {
+	const runInfo = readJsonIfExists(join(WORK_DIR, 'run-info.json'));
+	const history = readJsonIfExists(join(WORK_DIR, 'history.json'));
+	const projects = discoverProjectDirs(WORK_DIR);
+
+	const historyMap = buildHistoryByKey(history);
+	const repoRootLine = REPO_ROOT
+		? `REPO_ROOT: ${REPO_ROOT} (test source at $REPO_ROOT/test/e2e/{tests,pages,fixtures,infra}; PRODUCT source at $REPO_ROOT/{src,extensions}. Read product source only to CONFIRM a code-vs-test hypothesis the evidence already points to -- prefer Grep, read narrowly, don't spelunk.)`
+		: 'REPO_ROOT: not set (source not available; analyze from screenshots/traces only)';
+	const sections = [
+		'## Run metadata',
+		renderRunHeader(runInfo),
+		repoRootLine,
+		'',
+		'## Job setup step failures (read this before the test evidence)',
+		renderJobSetupFailures(runInfo, projects),
+		'',
+		'## Non-e2e job failures',
+		renderNonE2eFailures(runInfo),
+		'',
+		'## Historical test health (e2e-test-insights)',
+		renderHistorySummary(history, historyMap),
+		'',
+		'## E2E project failures',
+		renderProjectFailures(projects, historyMap, runInfo),
+		'',
+		'---',
+		'Analyze the failures above. Read all referenced screenshots in parallel before writing the report. Output the final markdown report as instructed.',
+	];
+	const oversizedBanner = sections.join('\n').length > PROMPT_WARN_CHARS
+		? `\n> WARNING: This run produced an unusually large evidence bundle (>${Math.round(PROMPT_WARN_CHARS / 1000)}KB of context). Be especially focused -- group related failures aggressively, prefer the most-revealing screenshot per attempt over reading every frame, and keep the report concise.\n`
+		: '';
+	const userPrompt = oversizedBanner ? `${oversizedBanner}\n${sections.join('\n')}` : sections.join('\n');
+
+	if (userPrompt.length > PROMPT_WARN_CHARS) {
+		console.warn(`[analyzer] WARN: prompt size ${userPrompt.length} chars exceeds soft threshold ${PROMPT_WARN_CHARS}. Model may struggle or fail.`);
+	}
+
+	console.log(`[analyzer] WORK_DIR=${WORK_DIR}`);
+	console.log(`[analyzer] REPO_ROOT=${REPO_ROOT || '(unset)'}`);
+	console.log(`[analyzer] model=${MODEL} maxTurns=${MAX_TURNS} claudePath=${CLAUDE_CODE_PATH || '(default)'}`);
+	console.log(`[analyzer] projects=${projects.map(p => p.project).join(', ') || '(none)'}`);
+	console.log(`[analyzer] user prompt (${userPrompt.length} chars):\n${userPrompt.slice(0, 4000)}${userPrompt.length > 4000 ? '\n...(truncated)' : ''}`);
+
+	const assistantMessages = [];
+	let turnCount = 0;
+	// Shown under the Summary table. `model` starts as the requested alias and
+	// is replaced by the resolved model ID from the SDK's init message.
+	const runStats = { model: MODEL, turns: undefined, costUsd: undefined };
+
+	for await (const message of query({
+		prompt: userPrompt,
+		options: {
+			model: MODEL,
+			cwd: WORK_DIR,
+			systemPrompt: SYSTEM_PROMPT,
+			allowedTools: ['Read', 'Glob', 'Grep'],
+			permissionMode: 'bypassPermissions',
+			maxTurns: MAX_TURNS,
+			// Extended thinking is disabled. With thinking on (the adaptive
+			// default), cancelling a parallel tool-call batch corrupts the
+			// in-flight thinking blocks and wedges the session with a repeating
+			// 400 ("thinking blocks ... cannot be modified", claude-code#63192).
+			// The report is built from text blocks only, so no output is lost.
+			thinking: { type: 'disabled' },
+			...(CLAUDE_CODE_PATH ? { pathToClaudeCodeExecutable: CLAUDE_CODE_PATH } : {}),
+		},
+	})) {
+		if (message.type === 'assistant') {
+			turnCount++;
+			const content = message.message?.content || [];
+			const textBlocks = content.filter(b => b.type === 'text').map(b => b.text);
+			const toolUses = content.filter(b => b.type === 'tool_use').map(b => `${b.name}(${JSON.stringify(b.input).slice(0, 200)})`);
+			if (textBlocks.length) {
+				const joined = textBlocks.join('\n');
+				assistantMessages.push(joined);
+				console.log(`[turn ${turnCount}] assistant text (${joined.length} chars):\n${joined.slice(0, 1000)}${joined.length > 1000 ? '\n...(truncated)' : ''}`);
+			}
+			if (toolUses.length) {
+				console.log(`[turn ${turnCount}] tool calls: ${toolUses.join(' | ')}`);
+			}
+		} else if (message.type === 'system' && message.subtype === 'init') {
+			runStats.model = message.model || runStats.model;
+		} else if (message.type === 'result') {
+			runStats.turns = message.num_turns;
+			runStats.costUsd = message.total_cost_usd;
+			console.log(`[analyzer] usage: input=${message.usage?.input_tokens} output=${message.usage?.output_tokens} cost_usd=${message.total_cost_usd}`);
+		}
+	}
+
+	const report = pickReport(assistantMessages);
+	const header = renderReportHeader(runInfo);
+	const statsNote = renderRunStats(runStats);
+	if (!report) {
+		console.error('[analyzer] no markdown report produced');
+		writeStepSummary(`${header}\n\n## E2E Failure Analysis\n\n_Analyzer produced no report. Check action logs._\n\n<sub>${statsNote}</sub>\n`);
+		process.exit(1);
+	}
+
+	// Callout, table icons, and the Slack breakdown are built from the Summary
+	// table here rather than by the model, so they are consistent every run.
+	const flakyCount = projects.flatMap(p => classifyTests(p.result)).filter(c => c.severity === 'FLAKY').length;
+	const decorated = decorateReport(report, { flakyCount, note: statsNote });
+	const fullReport = `${header}\n\n${decorated.report}`;
+	writeStepSummary(fullReport);
+	writeFileSync(join(WORK_DIR, 'analysis-report.md'), fullReport);
+	console.log(`[analyzer] wrote ${fullReport.length} chars to step summary`);
+
+	// One-line issue breakdown for the Slack thread post in action.yml. Skipped
+	// when the Summary table can't be parsed; the post then omits the breakdown.
+	if (decorated.slack) {
+		writeFileSync(join(WORK_DIR, 'slack-summary.txt'), decorated.slack);
+		console.log(`[analyzer] slack summary: ${decorated.slack}`);
+	} else {
+		console.warn('[analyzer] WARN: could not parse the Summary table; Slack post will omit the breakdown');
+	}
+}
+
+function renderReportHeader(runInfo) {
+	const r = runInfo?.run || {};
+	const c = runInfo?.commit || {};
+	const url = r.html_url || '';
+	const runId = runInfo?.runId || '';
+	const branch = r.branch || r.head_branch || '?';
+	const workflow = r.name || 'workflow';
+	const sha = (r.head_sha || '').slice(0, 8);
+	const subject = (c.message || '').split('\n')[0];
+	const linkText = url ? `[${workflow} run #${runId}](${url})` : `${workflow} run #${runId}`;
+	const commitSegment = sha ? ` -- commit \`${sha}\`${subject ? ` "${subject}"` : ''}` : '';
+	return `> Analyzed ${linkText} on \`${branch}\`${commitSegment}`;
+}
+
+/** Inline note on what the analysis itself took: model, turns, and cost. */
+function renderRunStats({ model, turns, costUsd }) {
+	const parts = [`\`${model}\``];
+	if (Number.isFinite(turns)) { parts.push(`${turns} turn${turns === 1 ? '' : 's'}`); }
+	if (Number.isFinite(costUsd)) { parts.push(`$${costUsd.toFixed(2)}`); }
+	return `Analysis run: ${parts.join(', ')}`;
+}
+
+function pickReport(messages) {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		const idx = m.indexOf('## Summary');
+		if (idx >= 0) { return m.slice(idx); }
+	}
+	return messages.length ? messages[messages.length - 1] : null;
+}
+
+function writeStepSummary(markdown) {
+	if (STEP_SUMMARY) {
+		appendFileSync(STEP_SUMMARY, markdown + '\n');
+	} else {
+		console.log('--- BEGIN REPORT ---');
+		console.log(markdown);
+		console.log('--- END REPORT ---');
+	}
+}
+
+main().catch(err => {
+	console.error('[analyzer] fatal:', err);
+	process.exit(1);
+});

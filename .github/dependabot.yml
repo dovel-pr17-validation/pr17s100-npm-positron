@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+  - package-ecosystem: "devcontainers" # https://containers.dev/guide/dependabot
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  # --- Start Positron ---
+  # Upstream bumps @vscode/markdown-editor daily; we take it via upstream merges instead.
+  # - package-ecosystem: "npm"
+  #   directory: "/extensions/markdown-language-features"
+  #   schedule:
+  #     interval: "daily"
+  #   allow:
+  #     - dependency-name: "@vscode/markdown-editor"
+  # --- End Positron ---

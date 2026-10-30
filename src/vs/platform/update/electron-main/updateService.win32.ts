@@ -1,0 +1,1117 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { ChildProcess, spawn } from 'child_process';
+import { app } from 'electron';
+import { unlinkSync, writeFileSync } from 'fs';
+import { mkdir, readFile, unlink } from 'fs/promises';
+import { release, tmpdir } from 'os';
+import { Delayer, ProcessTimeRunOnceScheduler, timeout } from '../../../base/common/async.js';
+import { VSBuffer } from '../../../base/common/buffer.js';
+import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
+import { memoize } from '../../../base/common/decorators.js';
+import { isCancellationError } from '../../../base/common/errors.js';
+import { hash } from '../../../base/common/hash.js';
+import * as path from '../../../base/common/path.js';
+import { basename } from '../../../base/common/path.js';
+import { transform } from '../../../base/common/stream.js';
+import { URI } from '../../../base/common/uri.js';
+import { checksum } from '../../../base/node/crypto.js';
+import * as pfs from '../../../base/node/pfs.js';
+import { killTree } from '../../../base/node/processes.js';
+import { getWindowsRelease } from '../../../base/node/windowsVersion.js';
+import { IConfigurationService } from '../../configuration/common/configuration.js';
+import { IEnvironmentMainService } from '../../environment/electron-main/environmentMainService.js';
+import { IFileService } from '../../files/common/files.js';
+import { ILifecycleMainService, IRelaunchHandler, IRelaunchOptions } from '../../lifecycle/electron-main/lifecycleMainService.js';
+import { ILogService } from '../../log/common/log.js';
+import { IMeteredConnectionService } from '../../meteredConnection/common/meteredConnection.js';
+import { INativeHostMainService } from '../../native/electron-main/nativeHostMainService.js';
+import { IProductService } from '../../product/common/productService.js';
+import { asJson, IRequestService } from '../../request/common/request.js';
+import { IApplicationStorageMainService } from '../../storage/electron-main/storageMainService.js';
+import { ITelemetryService } from '../../telemetry/common/telemetry.js';
+import { DisablementReason, IUpdate, State, StateType, UpdateType } from '../common/update.js';
+import { AbstractUpdateService, createUpdateURL, getUpdateRequestHeaders, UpdateErrorClassification } from './abstractUpdateService.js';
+import { getRelaunchArguments } from './updateRelaunchArguments.js';
+import { getWin32UpdateType } from './win32UpdateType.js';
+// --- Start Positron ---
+import { hasUpdate } from '../common/positronVersion.js';
+import { IStateService } from '../../state/node/state.js';
+import { ICodeWindow } from '../../window/electron-main/window.js';
+import { IWindowsMainService } from '../../windows/electron-main/windows.js';
+// --- End Positron ---
+
+interface IAvailableUpdate {
+	packagePath: string;
+	updateFilePath?: string;
+	/** File path used to signal the Inno Setup installer to cancel */
+	cancelFilePath?: string;
+	/** The Inno Setup process that is applying the update in the background */
+	updateProcess?: ChildProcess;
+}
+
+const RELAUNCH_ARGUMENTS_FILE_PREFIX = 'relaunch-args-';
+
+export class Win32UpdateService extends AbstractUpdateService implements IRelaunchHandler {
+
+	private availableUpdate: IAvailableUpdate | undefined;
+	private updateCancellationTokenSource: CancellationTokenSource | undefined;
+	/** Cancels an in-flight check/download chain (e.g. when updates are disabled at runtime). */
+	private checkCancellationTokenSource: CancellationTokenSource | undefined;
+	/** Settles when the in-flight check/download chain has fully unwound; used by the cancel path. */
+	private checkPromise: Promise<unknown> | undefined;
+
+	private readonly readyMutexName: string;
+	private readonly updatingMutexName: string;
+	private readonly setupMutexName: string;
+
+	private get cachePathSync(): string {
+		// --- Start Positron ---
+		// Route through the Positron-specific cache path so the update installer and the
+		// relaunch-arguments file share one directory.
+		return this.cachePathValue;
+		// --- End Positron ---
+	}
+
+	@memoize
+	get cachePath(): Promise<string> {
+		// --- Start Positron ---
+		// Use Positron specific cache path
+		const result = this.cachePathValue;
+		// --- End Positron ---
+		return mkdir(result, { recursive: true }).then(() => result);
+	}
+
+	// --- Start Positron ---
+	/**
+	 * The cache directory, without creating it. `cachePath` mkdirs as a side effect, which is not
+	 * wanted on paths that run before we know whether updates are even enabled.
+	 */
+	private get cachePathValue(): string {
+		return path.join(tmpdir(), `positron-${this.productService.target}-${process.arch}`);
+	}
+	// --- End Positron ---
+
+	@memoize
+	private get mutex(): Promise<typeof import('@vscode/windows-mutex')> {
+		return import('@vscode/windows-mutex');
+	}
+
+	constructor(
+		@ILifecycleMainService lifecycleMainService: ILifecycleMainService,
+		@IConfigurationService configurationService: IConfigurationService,
+		@ITelemetryService telemetryService: ITelemetryService,
+		@IEnvironmentMainService environmentMainService: IEnvironmentMainService,
+		@IRequestService requestService: IRequestService,
+		@ILogService logService: ILogService,
+		@IFileService private readonly fileService: IFileService,
+		// --- Start Positron ---
+		// nativeHostMainService is declared as `protected readonly` on AbstractUpdateService
+		// (Positron-only field), so this subclass receives it via super(); no need to redeclare.
+		@INativeHostMainService nativeHostMainService: INativeHostMainService,
+		// --- End Positron ---
+		@IProductService productService: IProductService,
+		@IApplicationStorageMainService applicationStorageMainService: IApplicationStorageMainService,
+		@IMeteredConnectionService meteredConnectionService: IMeteredConnectionService,
+		// --- Start Positron ---
+		@IStateService stateService: IStateService,
+		@IWindowsMainService private readonly windowsMainService: IWindowsMainService,
+		// --- End Positron ---
+	) {
+		// --- Start Positron ---
+		// The final argument is `supportsUpdateOverwrite`. It is back to upstream's `true`, which arms
+		// the five-minute overwrite check in `setState()`, now that the overwrite round installs the
+		// newer update instead of dropping the staged one. #16083 set this to `false` because
+		// `cancelPendingUpdate()` cleared `availableUpdate` and left `Ready`, so the check could strand
+		// a pending update that "Restart to Update" then declined to install. `restorePendingUpdate()`
+		// closes that hole: every overwrite round ends either staging the newer build or putting the
+		// pending one back, flag file included.
+		super(lifecycleMainService, configurationService, environmentMainService, requestService, logService, telemetryService, applicationStorageMainService, meteredConnectionService, productService, nativeHostMainService, stateService, true);
+		// --- End Positron ---
+
+		this.readyMutexName = `${productService.win32MutexName}-ready`;
+		this.updatingMutexName = `${productService.win32MutexName}-updating`;
+		this.setupMutexName = `${productService.win32MutexName}setup`;
+
+		lifecycleMainService.setRelaunchHandler(this);
+	}
+
+	handleRelaunch(options?: IRelaunchOptions): boolean {
+		if (options?.addArgs || options?.removeArgs) {
+			return false; // we cannot apply an update and restart with different args
+		}
+
+		// --- Start Positron ---
+		// Dev update testing never downloads an installer, so `availableUpdate` is unset; still
+		// handle the relaunch, so `doQuitAndInstall()` can log which version it would have used.
+		// if (this.state.type !== StateType.Ready || !this.availableUpdate) {
+		if (this.state.type !== StateType.Ready || (!this.availableUpdate && !this.devUpdateTesting)) {
+			// --- End Positron ---
+			return false; // we only handle the relaunch when we have a pending update
+		}
+
+		this.logService.trace('update#handleRelaunch(): running raw#quitAndInstall()');
+		this.doQuitAndInstall();
+
+		return true;
+	}
+
+	protected override async initialize(): Promise<void> {
+		// --- Start Positron ---
+		// Before the disabled checks below, and without touching disk, so that the listeners are in
+		// place even if updates are turned on later in the session.
+		await this.installSessionEndFlagHandler();
+		// --- End Positron ---
+
+		if (this.productService.win32VersionedUpdate) {
+			const cachePath = await this.cachePath;
+			app.setPath('appUpdate', cachePath);
+			await this.unlink(path.join(cachePath, 'session-ending.flag'));
+		}
+
+
+		// Send telemetry
+		type WindowsUpdateInitEvent = {
+			osRelease: string;
+			osNodeRelease: string;
+		};
+		type WindowsUpdateInitClassification = {
+			osRelease: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The Windows OS release version from registry.' };
+			osNodeRelease: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The Windows OS release version from os.release().' };
+			owner: 'dmitriv';
+			comment: 'Tracks Windows OS release information during update initialization.';
+		};
+		const osRelease = await getWindowsRelease();
+		const osNodeRelease = release();
+		this.telemetryService.publicLog2<WindowsUpdateInitEvent, WindowsUpdateInitClassification>('windowsUpdateInit', { osRelease, osNodeRelease });
+
+		if (this.productService.target === 'user' && await this.nativeHostMainService.isAdmin(undefined)) {
+			this.setState(State.Disabled(DisablementReason.RunningAsAdmin));
+			this.logService.info('update#ctor - updates are disabled due to running as Admin in user setup');
+			return;
+		}
+
+		await super.initialize();
+	}
+
+	// --- Start Positron ---
+	/**
+	 * Maintains the session-end flag file that `doApplyUpdate()` passes to the installer as
+	 * `/sessionend`. While that flag exists, build/win32/positron.iss skips the file swap, so that
+	 * the OS cannot kill inno_updater partway through an update and leave a half-swapped install.
+	 */
+	private async installSessionEndFlagHandler(): Promise<void> {
+		// `cachePathValue` rather than `cachePath`, so that a disabled update service does not create
+		// the cache directory just by starting up.
+		// Must match the path passed as `/sessionend` in `doApplyUpdate()`.
+		const sessionEndFlagPath = path.join(this.cachePathValue, 'session-ending.flag');
+
+		// Clear a flag left behind by a previous shutdown. The upstream cleanup in `initialize()`
+		// is gated on `win32VersionedUpdate`, which Positron does not set, so without this a single
+		// OS shutdown would leave the flag on disk and every later background update would be
+		// skipped for good. `doApplyUpdate()` clears it again before each spawn.
+		await this.unlink(sessionEndFlagPath);
+
+		// Written synchronously: the OS is tearing the process down and will not wait for us.
+		const onSessionEnd = () => {
+			this.logService.info('update#onSessionEnd: OS session is ending, flagging the update swap to be skipped');
+			try {
+				writeFileSync(sessionEndFlagPath, 'session-end');
+			} catch (err) {
+				this.logService.error('update#onSessionEnd: failed to write the session end flag', err);
+			}
+		};
+
+		// `session-end` is a window event rather than an app event, so it has to be attached to every
+		// window. Whichever window fires first is enough, since all the handler does is write a flag.
+		// The listeners are owned by their BrowserWindow and go away when the window is destroyed.
+		const listenForSessionEnd = (window: ICodeWindow) => {
+			window.win?.on('session-end', onSessionEnd);
+		};
+		for (const window of this.windowsMainService.getWindows()) {
+			listenForSessionEnd(window);
+		}
+		this._register(this.windowsMainService.onDidOpenWindow(listenForSessionEnd));
+	}
+	// --- End Positron ---
+
+	// --- Start Positron ---
+	// 1.107.0 - Disabled pending further investigation into adapting this code for Positron.
+	/*
+	protected override async postInitialize(): Promise<void> {
+		if (this.productService.quality !== 'insider') {
+			return;
+		}
+		// Check for pending update from previous session
+		// This can happen if the app is quit right after the update has been
+		// downloaded and before the update has been applied.
+		const exePath = app.getPath('exe');
+		const exeDir = path.dirname(exePath);
+		const updatingVersionPath = path.join(exeDir, 'updating_version');
+		if (await pfs.Promises.exists(updatingVersionPath)) {
+			try {
+				const updatingVersion = (await readFile(updatingVersionPath, 'utf8')).trim();
+				this.logService.info(`update#doCheckForUpdates - application was updating to version ${updatingVersion}`);
+				const updatePackagePath = await this.getUpdatePackagePath(updatingVersion);
+				if (await pfs.Promises.exists(updatePackagePath)) {
+					await this._applySpecificUpdate(updatePackagePath, updatingVersion);
+					this.logService.info(`update#doCheckForUpdates - successfully applied update to version ${updatingVersion}`);
+				}
+			} catch (e) {
+				this.logService.error(`update#doCheckForUpdates - could not read ${updatingVersionPath}`, e);
+			} finally {
+				// updatingVersionPath will be deleted by inno setup.
+			}
+		} else {
+			await this.collectGarbage();
+		}
+	}
+	*/
+	// --- End Positron ---
+
+	private async collectGarbage(): Promise<void> {
+		if (!this.productService.win32VersionedUpdate) {
+			return;
+		}
+
+		const fastUpdatesEnabled = this.configurationService.getValue('update.enableWindowsBackgroundUpdates');
+		// GC for background updates in system setup happens via inno_setup since it requires elevated permissions.
+		if (!fastUpdatesEnabled || this.productService.target !== 'user' || !this.productService.commit) {
+			return;
+		}
+
+		const exePath = app.getPath('exe');
+		const exeDir = path.dirname(exePath);
+		const versionedResourcesFolder = this.productService.commit.substring(0, 10);
+		const innoUpdater = path.join(exeDir, versionedResourcesFolder, 'tools', 'inno_updater.exe');
+		const exeName = basename(exePath);
+		await new Promise<void>(resolve => {
+			const child = spawn(innoUpdater, ['--gc', exePath, versionedResourcesFolder, exeName], {
+				stdio: ['ignore', 'ignore', 'ignore'],
+				windowsHide: true,
+				timeout: 2 * 60 * 1000
+			});
+			// Resolve on 'error' too (missing inno_updater / permission denied) so the awaited promise always settles.
+			child.once('error', err => {
+				this.logService.error('update#collectGarbage - failed to spawn inno_updater', err);
+				resolve();
+			});
+			child.once('exit', () => resolve());
+		});
+	}
+
+	// --- Start Positron ---
+	// Positron builds the update feed URL from the release channel rather than quality+commit.
+	protected buildUpdateFeedUrl(channel: string): string | undefined {
+		const platform = `win/${process.arch === 'x64' ? 'x86_64' : 'arm64'}`;
+		const prefix = this.productService.target;
+		const baseUrl = createUpdateURL(platform, channel, this.productService);
+
+		const url = `${baseUrl}/${prefix}-releases.json`;
+
+		return url;
+	}
+	// --- End Positron ---
+
+	protected doCheckForUpdates(explicit: boolean, pendingCommit?: string): void {
+		// --- Start Positron ---
+		// In Positron this runs only for the overwrite path (`checkForOverwriteUpdates`); the
+		// regular check flow goes through `AbstractUpdateService.checkForUpdates` -> `updateAvailable`.
+		// Positron resolves the feed from the release channel, so it needs neither the quality
+		// gate nor the commit/internalOrg URL parameters.
+		// if (!this.quality) {
+		// 	return;
+		// }
+
+		// const internalOrg = this.getInternalOrg();
+		// const background = !explicit && !internalOrg;
+		// const url = this.buildUpdateFeedUrl(this.quality, pendingCommit ?? this.productService.commit!, { background, internalOrg });
+		const url = this.buildUpdateFeedUrl(this.getUpdateChannel());
+		// --- End Positron ---
+
+		// Only set CheckingForUpdates if we're not already in Overwriting state
+		if (this.state.type !== StateType.Overwriting) {
+			this.setState(State.CheckingForUpdates(explicit));
+		}
+
+		// Track this check/download chain so it can be cancelled if updates are disabled at runtime.
+		this.checkCancellationTokenSource?.dispose(true);
+		const cts = this.checkCancellationTokenSource = new CancellationTokenSource();
+		const token = cts.token;
+
+		const headers = getUpdateRequestHeaders(this.productService.version);
+		const promise = this.requestService.request({ url, headers, disableCache: true, callSite: 'updateService.win32.checkForUpdates' }, token)
+			// --- Start Positron ---
+			// .then<IUpdate | null>(asJson)
+			.then<IUpdate | null>(async context => {
+				const update = await asJson<IUpdate>(context);
+				return update && this.withProductVersion(update);
+			})
+			// --- End Positron ---
+			.then(update => {
+				const updateType = this.getUpdateType();
+
+				if (token.isCancellationRequested) {
+					return Promise.resolve(null);
+				}
+
+				// --- Start Positron ---
+				// Positron's feed has no `productVersion`; `version` is the calver.
+				// if (!update || !update.url || !update.version || !update.productVersion) {
+				if (!update || !update.url || !update.version) {
+					// --- End Positron ---
+					// If we were checking for an overwrite update and found nothing newer,
+					// restore the Ready state with the pending update
+					if (this.state.type === StateType.Overwriting) {
+						// --- Start Positron ---
+						// this._overwrite = false;
+						// this.setState(State.Ready(this.state.update, this.state.explicit, false));
+						// Say so: the overwrite round ends by re-staging the same pending update it
+						// started with, which is indistinguishable in the logs from a successful
+						// overwrite unless the reason is written down.
+						this.logService.info('update#doCheckForUpdates - the overwrite check got no usable update from the feed, keeping the pending update', update);
+						return this.restorePendingUpdate(this.state.update, this.state.explicit).then(() => null);
+						// --- End Positron ---
+					} else {
+						this.setState(State.Idle(updateType, undefined, explicit || undefined));
+					}
+					return Promise.resolve(null);
+				}
+
+				// --- Start Positron ---
+				// Positron's feed always returns the latest release rather than answering "no
+				// content" for an up-to-date version like upstream's server does. If the feed no
+				// longer advertises anything newer than the pending update (a race with the
+				// `isLatestVersion` pre-check in `checkForOverwriteUpdates`), restore Ready
+				// instead of downloading the same installer again.
+				if (this.state.type === StateType.Overwriting && pendingCommit && !hasUpdate(update, pendingCommit)) {
+					this.logService.info(`update#doCheckForUpdates - the overwrite check found ${update.version}, which is not newer than the pending ${pendingCommit}; keeping the pending update`);
+					return this.restorePendingUpdate(this.state.update, this.state.explicit).then(() => null);
+				}
+				// --- End Positron ---
+
+				// --- Start Positron ---
+				// The version actually being staged, so a later log can be matched against what
+				// ends up installed. Especially for the overwrite round, where a wrong answer here
+				// is the difference between installing the newest build and re-installing the
+				// pending one.
+				this.logService.info(`update#doCheckForUpdates - staging ${update.version}${pendingCommit ? ` over the pending ${pendingCommit}` : ''}`);
+				// --- End Positron ---
+
+				// --- Start Positron ---
+				// A source build has no Inno install to hand an installer to, so walk the simulated
+				// download instead. This also has to come before the `UpdateType.Archive` branch
+				// below, which a source build always lands in for want of `unins000.exe` and which
+				// would abandon the overwrite flow at `AvailableForDownload`.
+				if (this.devUpdateTesting) {
+					this.simulateStagedUpdate(update, explicit);
+					return Promise.resolve(null);
+				}
+				// --- End Positron ---
+
+				if (updateType === UpdateType.Archive) {
+					this.setState(State.AvailableForDownload(update));
+					return Promise.resolve(null);
+				}
+
+				if (this.deferAutomaticDownload(update, explicit)) {
+					return Promise.resolve(null);
+				}
+
+				const startTime = Date.now();
+				this.setState(State.Downloading(update, explicit, this._overwrite, 0, undefined, startTime));
+
+				return this.cleanup(update.version).then(() => {
+					return this.getUpdatePackagePath(update.version).then(updatePackagePath => {
+						return pfs.Promises.exists(updatePackagePath).then(exists => {
+							if (exists) {
+								return Promise.resolve(updatePackagePath);
+							}
+
+							if (this.deferAutomaticDownload(update, explicit)) {
+								return undefined;
+							}
+
+							const downloadPath = `${updatePackagePath}.tmp`;
+
+							return this.requestService.request({ url: update.url, callSite: 'updateService.win32.downloadUpdate' }, token)
+								.then(context => {
+									// Get total size from Content-Length header
+									const contentLengthHeader = context.res.headers['content-length'];
+									const contentLength = typeof contentLengthHeader === 'string' ? contentLengthHeader : undefined;
+									const totalBytes = contentLength ? parseInt(contentLength, 10) : undefined;
+
+									// Track downloaded bytes and update state periodically using Delayer
+									let downloadedBytes = 0;
+									const progressDelayer = new Delayer<void>(500);
+									const progressStream = transform<VSBuffer, VSBuffer>(
+										context.stream,
+										{
+											data: data => {
+												downloadedBytes += data.byteLength;
+												progressDelayer.trigger(() => {
+													this.setState(State.Downloading(update, explicit, this._overwrite, downloadedBytes, totalBytes, startTime));
+												});
+												return data;
+											}
+										},
+										chunks => VSBuffer.concat(chunks)
+									);
+
+									return this.fileService.writeFile(URI.file(downloadPath), progressStream)
+										.finally(() => progressDelayer.dispose());
+								})
+								.then(update.sha256hash ? () => checksum(downloadPath, update.sha256hash) : () => undefined)
+								.then(() => pfs.Promises.rename(downloadPath, updatePackagePath, false /* no retry */))
+								.then(() => updatePackagePath);
+						});
+					}).then(packagePath => {
+						if (!packagePath || token.isCancellationRequested) {
+							return;
+						}
+
+						this.availableUpdate = { packagePath };
+						this.saveUpdateMetadata(update);
+						this.setState(State.Downloaded(update, explicit, this._overwrite));
+
+						const fastUpdatesEnabled = this.configurationService.getValue('update.enableWindowsBackgroundUpdates');
+						if (fastUpdatesEnabled && this.productService.target === 'user') {
+							this.doApplyUpdate();
+						} else {
+							this.setState(State.Ready(update, explicit, this._overwrite));
+						}
+					});
+				});
+			})
+			.then(undefined, err => {
+				// The chain was cancelled because updates are being disabled; leave state to the disable flow.
+				if (token.isCancellationRequested || isCancellationError(err)) {
+					return;
+				}
+
+				this.telemetryService.publicLog2<{ messageHash: string }, UpdateErrorClassification>('update:error', { messageHash: String(hash(String(err))) });
+				this.logService.error(err);
+
+				// only show message when explicitly checking for updates
+				const message: string | undefined = explicit ? (err.message || err) : undefined;
+
+				// If we were checking for an overwrite update and it failed,
+				// restore the Ready state with the pending update
+				if (this.state.type === StateType.Overwriting) {
+					// --- Start Positron ---
+					// this._overwrite = false;
+					// this.setState(State.Ready(this.state.update, this.state.explicit, false));
+					return this.restorePendingUpdate(this.state.update, this.state.explicit);
+					// --- End Positron ---
+				} else {
+					this.setState(State.Idle(this.getUpdateType(), message));
+					return;
+				}
+			});
+
+		this.checkPromise = promise;
+
+		promise.finally(() => {
+			if (this.checkCancellationTokenSource === cts) {
+				this.checkCancellationTokenSource = undefined;
+			}
+			if (this.checkPromise === promise) {
+				this.checkPromise = undefined;
+			}
+			cts.dispose();
+		});
+	}
+
+	// --- Start Positron ---
+	protected override updateAvailable(update: IUpdate): void {
+		// Notify about updates for now. Do not download or install them.
+		// Dev update testing simulates the staging, so it runs whether or not auto-update is on:
+		// there is nothing for a download page to install from a source build either.
+		if (!this.enableAutoUpdate && !this.devUpdateTesting) {
+			this.setState(State.AvailableForDownload(update));
+			return;
+		}
+
+		this.stageUpdate(update);
+	}
+
+	/**
+	 * Developer hook: download and stage the build advertised by an arbitrary feed document as
+	 * the pending update. The channel feed is left alone, so the pending update's next re-check
+	 * compares against the real latest release and the overwrite flow runs end to end without
+	 * waiting for two builds to publish.
+	 */
+	override async _stageUpdateFromFeed(feedUrl: string): Promise<void> {
+		this.logService.info('update#_stageUpdateFromFeed - staging the update advertised by', feedUrl);
+
+		// Allowed from Ready as well, replacing the pending update: the regular check runs 30
+		// seconds after launch, so by the time a tester reaches the command something is usually
+		// already staged.
+		if (this.state.type !== StateType.Idle && this.state.type !== StateType.Ready) {
+			this.logService.warn('update#_stageUpdateFromFeed - ignored, the update service is neither idle nor holding a pending update', this.state.type);
+			return;
+		}
+
+		if (this.state.type === StateType.Ready) {
+			try {
+				await this.cancelPendingUpdate();
+			} catch (err) {
+				this.logService.error('update#_stageUpdateFromFeed - failed to cancel the pending update', err);
+				return;
+			}
+		}
+
+		this._overwrite = false;
+		this.setState(State.CheckingForUpdates(true));
+
+		try {
+			const headers = getUpdateRequestHeaders(this.productService.version);
+			const context = await this.requestService.request({ url: feedUrl, headers, disableCache: true, callSite: 'updateService.win32._stageUpdateFromFeed' }, CancellationToken.None);
+			const update = await asJson<IUpdate>(context);
+			if (!update || !update.url || !update.version) {
+				this.logService.warn('update#_stageUpdateFromFeed - the feed does not advertise an update', update);
+				this.setState(State.Idle(this.getUpdateType()));
+				return;
+			}
+			this.stageUpdate(update);
+		} catch (err) {
+			this.logService.error('update#_stageUpdateFromFeed - failed to fetch the feed', err);
+			this.setState(State.Idle(this.getUpdateType(), String(err)));
+		}
+	}
+
+	/**
+	 * Positron's feed carries no `productVersion`, but the update notification and the release
+	 * notes link both bail without one, so fill it in from the calver the feed does carry.
+	 */
+	private withProductVersion(update: IUpdate): IUpdate {
+		return update.productVersion ? update : { ...update, productVersion: update.version };
+	}
+
+	/** Downloads the installer for `update` into the cache and lands in `Ready` (or applies it in the background). */
+	private stageUpdate(update: IUpdate): void {
+		update = this.withProductVersion(update);
+
+		// A source build cannot install what it downloads, and a mock feed's `url` points at
+		// nothing, so walk the simulated download instead.
+		if (this.devUpdateTesting) {
+			this.simulateStagedUpdate(update, false);
+			return;
+		}
+
+		// TODO: Code for installing updates is disabled due to this.enableAutoUpdate being false
+		this.setState(State.Downloading(update, false, false));
+
+		this.cleanup(update.version).then(() => {
+			return this.getUpdatePackagePath(update.version).then(updatePackagePath => {
+				return pfs.Promises.exists(updatePackagePath).then(exists => {
+					if (exists) {
+						return Promise.resolve(updatePackagePath);
+					}
+
+					const downloadPath = `${updatePackagePath}.tmp`;
+
+					return this.requestService.request({ url: update.url, callSite: 'update.downloadUpdate' }, CancellationToken.None)
+						.then(context => this.fileService.writeFile(URI.file(downloadPath), context.stream))
+						.then(update.sha256hash ? () => checksum(downloadPath, update.sha256hash) : () => undefined)
+						.then(() => pfs.Promises.rename(downloadPath, updatePackagePath, false /* no retry */))
+						.then(() => updatePackagePath);
+				});
+			}).then(packagePath => {
+				this.availableUpdate = { packagePath };
+				this.setState(State.Downloaded(update, false, false));
+
+				const fastUpdatesEnabled = this.configurationService.getValue('update.enableWindowsBackgroundUpdates');
+				if (fastUpdatesEnabled) {
+					if (this.productService.target === 'user') {
+						this.doApplyUpdate();
+					}
+				} else {
+					this.setState(State.Ready(update, false, false));
+				}
+			});
+		});
+	}
+	// --- End Positron ---
+
+	// --- Start Positron ---
+	/**
+	 * Puts back a pending update that `cancelPendingUpdate()` tore down for an overwrite check that
+	 * turned out to have nothing newer to install.
+	 *
+	 * Restoring `Ready` on its own is not enough: `cancelPendingUpdate()` clears `availableUpdate`
+	 * and deletes the flag file the waiting installer relaunches from, so the next "Restart to
+	 * Update" would fall through `doQuitAndInstall()`'s `availableUpdate` guard and relaunch without
+	 * installing anything. The downloaded installer itself survives cancellation, so re-stage it the
+	 * same way the download path does.
+	 */
+	private async restorePendingUpdate(update: IUpdate, explicit: boolean): Promise<void> {
+		this.logService.info('update#restorePendingUpdate: re-staging the pending update', update.version);
+		this._overwrite = false;
+
+		// Dev update testing downloaded nothing, so there is no installer to re-stage and no flag
+		// file to rewrite; the simulated pending update is whole as soon as `Ready` is back.
+		if (this.devUpdateTesting) {
+			this.setState(State.Ready(update, explicit, false));
+			return;
+		}
+
+		try {
+			const packagePath = await this.getUpdatePackagePath(update.version);
+
+			if (await pfs.Promises.exists(packagePath)) {
+				this.availableUpdate = { packagePath };
+				this.setState(State.Downloaded(update, explicit, false));
+
+				const fastUpdatesEnabled = this.configurationService.getValue('update.enableWindowsBackgroundUpdates');
+				if (fastUpdatesEnabled && this.productService.target === 'user') {
+					// Rewrites the flag file that `cancelPendingUpdate()` deleted and ends in `Ready`.
+					await this.doApplyUpdate();
+				} else {
+					this.setState(State.Ready(update, explicit, false));
+				}
+				return;
+			}
+
+			this.logService.warn('update#restorePendingUpdate: the downloaded installer is gone, dropping to Idle');
+		} catch (err) {
+			this.logService.error('update#restorePendingUpdate: failed to restore the pending update', err);
+		}
+
+		// Advertising no update is better than a `Ready` one that cannot be installed; the next check
+		// downloads it again.
+		this.setState(State.Idle(this.getUpdateType()));
+	}
+	// --- End Positron ---
+
+	protected override resumeDeferredDownload(): void {
+		this.setState(State.Idle(this.getUpdateType()));
+		void this.checkForUpdates(false);
+	}
+
+	private async getUpdatePackagePath(version: string): Promise<string> {
+		const cachePath = await this.cachePath;
+		return path.join(cachePath, `CodeSetup-${this.productService.quality}-${version}.exe`);
+	}
+
+	private async cleanup(exceptVersion: string | null = null): Promise<void> {
+		const relaunchArgumentsFileName = exceptVersion ? `${RELAUNCH_ARGUMENTS_FILE_PREFIX}${exceptVersion}` : undefined;
+		const filter = exceptVersion
+			? (one: string) => one !== relaunchArgumentsFileName && !(new RegExp(`${this.productService.quality}-${exceptVersion}\\.exe$`).test(one))
+			: () => true;
+
+		const cachePath = await this.cachePath;
+		const versions = await pfs.Promises.readdir(cachePath);
+
+		const promises = versions.filter(filter).map(one => this.unlink(path.join(cachePath, one)));
+		await Promise.all(promises);
+	}
+
+	protected override async doApplyUpdate(): Promise<void> {
+		if (this.state.type !== StateType.Downloaded) {
+			return Promise.resolve(undefined);
+		}
+
+		if (!this.availableUpdate) {
+			return Promise.resolve(undefined);
+		}
+
+		const update = this.state.update;
+		const explicit = this.state.explicit;
+		this.setState(State.Updating(update, explicit));
+
+		const cachePath = await this.cachePath;
+		const sessionEndFlagPath = path.join(cachePath, 'session-ending.flag');
+		const cancelFilePath = path.join(cachePath, `cancel.flag`);
+		const progressFilePath = path.join(cachePath, `update-progress`);
+
+		this.availableUpdate.updateFilePath = path.join(cachePath, `CodeSetup-${this.productService.quality}-${update.version}.flag`);
+		this.availableUpdate.cancelFilePath = cancelFilePath;
+
+		const mutex = await this.mutex;
+		const skippedSpawn = this.isInstallerActive(mutex);
+
+		// Skip the spawn if another Inno Setup is already running for this product (background update or a manual installer);
+		// otherwise Inno's "Setup is already running" modal pops up. The `-ready` mutex poll below still advances our state when it finishes.
+		if (skippedSpawn) {
+			this.logService.info('update#doApplyUpdate: another instance is already running setup, waiting for it to finish');
+		} else {
+			await this.unlink(cancelFilePath);
+			await this.unlink(progressFilePath);
+			// --- Start Positron ---
+			// Clear the session-end flag here as well as at startup. Windows sends WM_ENDSESSION with
+			// `wParam = FALSE` when a shutdown is queried and then cancelled, so the process can outlive
+			// its own `session-end` event. A flag left over from that would make the installer skip the
+			// swap for the rest of the session, silently, on every later update.
+			await this.unlink(sessionEndFlagPath);
+			// --- End Positron ---
+			await pfs.Promises.writeFile(this.availableUpdate.updateFilePath, 'flag');
+
+			const installerArgs = [
+				'/verysilent',
+				'/log',
+				`/update="${this.availableUpdate.updateFilePath}"`,
+				`/progress="${progressFilePath}"`,
+				`/sessionend="${sessionEndFlagPath}"`,
+				`/cancel="${cancelFilePath}"`,
+				'/nocloseapplications',
+				'/mergetasks=runcode,!desktopicon,!quicklaunchicon'
+			];
+
+			// --- Start Positron ---
+			// Pass the current install directory so Inno Setup does not fall back to
+			// the hardcoded default path when Positron was installed to a custom location.
+			installerArgs.push(`/DIR="${path.dirname(process.execPath)}"`);
+			// --- End Positron ---
+
+			// The restarting instance populates this file immediately before releasing the installer.
+			const relaunchArgsFilePath = this.getRelaunchArgumentsFilePath(cachePath, update.version);
+			installerArgs.push(`/relaunchargs="${relaunchArgsFilePath}"`);
+
+			const child = spawn(this.availableUpdate.packagePath,
+				installerArgs,
+				{
+					detached: true,
+					stdio: ['ignore', 'ignore', 'ignore'],
+					windowsVerbatimArguments: true,
+					env: { ...process.env, __COMPAT_LAYER: 'RunAsInvoker' }
+				}
+			);
+			// --- End Positron ---
+
+			// Track the process so we can cancel it if needed
+			this.availableUpdate.updateProcess = child;
+
+			child.once('exit', () => {
+				this.availableUpdate = undefined;
+				this.setState(State.Idle(this.getUpdateType()));
+			});
+		}
+
+		this.updateCancellationTokenSource?.dispose(true);
+		const cts = this.updateCancellationTokenSource = new CancellationTokenSource();
+		const token = cts.token;
+
+		const poll = async () => {
+			// If we skipped the spawn, the foreign installer was active when we started; treat that as having seen it run
+			// so a quick exit (cancel/fail) before the first poll iteration still drops us to Idle.
+			let seenRunning = skippedSpawn;
+			while (this.state.type === StateType.Updating && !token.isCancellationRequested) {
+				if (mutex.isActive(this.readyMutexName)) {
+					this.setState(State.Ready(update, explicit, this._overwrite));
+					return;
+				}
+
+				// Inno gone without `-ready` => install cancelled/failed; drop to Idle.
+				if (this.isInstallerActive(mutex)) {
+					seenRunning = true;
+				} else if (seenRunning) {
+					if (!this.availableUpdate?.updateProcess) {
+						this.availableUpdate = undefined;
+						this.setState(State.Idle(this.getUpdateType()));
+					}
+					return;
+				}
+
+				try {
+					const progressContent = await readFile(progressFilePath, 'utf8');
+					if (!token.isCancellationRequested) {
+						const [currentStr, maxStr] = progressContent.split(',');
+						const currentProgress = parseInt(currentStr, 10);
+						const maxProgress = parseInt(maxStr, 10);
+						if (!isNaN(currentProgress) && !isNaN(maxProgress) && this.state.type === StateType.Updating) {
+							if (this.state.currentProgress !== currentProgress || this.state.maxProgress !== maxProgress) {
+								this.setState(State.Updating(update, explicit, currentProgress, maxProgress));
+							}
+						}
+					}
+				} catch {
+					// Progress file may not exist yet or be locked, ignore
+				}
+
+				await timeout(500);
+			}
+		};
+
+		const cancelTimeout = new ProcessTimeRunOnceScheduler(() => {
+			this.logService.warn('update#doApplyUpdate: polling timed out waiting for update to be ready');
+			this.setState(State.Idle(this.getUpdateType(), 'Update did not complete within expected time'));
+		}, 60 * 60 * 1000);
+
+		// Poll for progress and ready mutex for 1 hour.
+		cancelTimeout.schedule();
+		poll().finally(() => {
+			cancelTimeout.dispose();
+			if (this.updateCancellationTokenSource === cts) {
+				this.updateCancellationTokenSource = undefined;
+			}
+			cts.dispose();
+		});
+	}
+
+	protected override async cancelUpdate(): Promise<void> {
+		// Abort an in-flight check/download so it never reaches the background installer.
+		const hadInFlightCheck = !!this.checkCancellationTokenSource;
+		const hadPendingUpdate = !!this.availableUpdate;
+		this.checkCancellationTokenSource?.dispose(true);
+		this.checkCancellationTokenSource = undefined;
+
+		// Only clean up if a check/download was in flight; avoids creating the cache dir when just disabled.
+		if (hadInFlightCheck) {
+			try {
+				await this.checkPromise;
+			} catch {
+				// the chain swallows its own errors; ignore
+			}
+			await this.cleanupTempFiles();
+		}
+
+		// Tear down any pending (downloaded/applying) update.
+		await this.cancelPendingUpdate();
+
+		// Reclaim a partial versioned-resource folder a cancelled update may leave; only after real teardown.
+		if (hadInFlightCheck || hadPendingUpdate) {
+			this.collectGarbage().catch(err => this.logService.error('update#collectGarbage - failed to collect garbage', err));
+		}
+	}
+
+	private async cleanupTempFiles(): Promise<void> {
+		try {
+			const cachePath = await this.cachePath;
+			const files = await pfs.Promises.readdir(cachePath);
+			await Promise.all(files.filter(file => file.endsWith('.tmp')).map(file => this.unlink(path.join(cachePath, file))));
+		} catch (err) {
+			this.logService.warn('update#cleanupTempFiles: failed to remove temporary download files', err);
+		}
+	}
+
+	protected override async cancelPendingUpdate(): Promise<void> {
+		if (!this.availableUpdate) {
+			return;
+		}
+
+		const { updateProcess, updateFilePath, cancelFilePath } = this.availableUpdate;
+
+		// Another instance owns the installer: abort if it's still running so we don't start a new
+		// update cycle on top of it; keep `availableUpdate` so quit-and-install can still complete.
+		if (!updateProcess && this.isInstallerActive(await this.mutex)) {
+			throw new Error('Cannot cancel pending update: another instance is still running setup');
+		}
+
+		// Cancel the polling loop
+		this.updateCancellationTokenSource?.dispose(true);
+		this.updateCancellationTokenSource = undefined;
+
+		if (updateProcess && updateProcess.exitCode === null) {
+			this.logService.trace('update#cancelPendingUpdate: cancelling pending update');
+
+			// Remove all listeners to prevent the exit handler from changing state
+			updateProcess.removeAllListeners();
+			const exitPromise = new Promise<boolean>(resolve => updateProcess.once('exit', () => resolve(true)));
+
+			// Write the cancel file to signal Inno Setup to exit gracefully
+			if (cancelFilePath) {
+				try {
+					await pfs.Promises.writeFile(cancelFilePath, 'cancel');
+				} catch (err) {
+					this.logService.warn('update#cancelPendingUpdate: failed to write cancel file', err);
+				}
+			}
+
+			// Wait for the process to exit gracefully, then force-kill if needed
+			const pid = updateProcess.pid;
+			const exited = await Promise.race([exitPromise, timeout(30 * 1000).then(() => false)]);
+			if (pid && !exited) {
+				this.logService.trace('update#cancelPendingUpdate: process did not exit gracefully, killing process tree');
+				await killTree(pid, true);
+			}
+		}
+
+		// Clean up the flag file
+		await this.unlink(updateFilePath);
+
+		// Clean up the cancel file
+		await this.unlink(cancelFilePath);
+
+		this.availableUpdate = undefined;
+	}
+
+	// --- Start Positron ---
+	protected override async prepareForQuitAndInstall(): Promise<void> {
+		// Deleting the flag file is what tells the waiting installer to relaunch Positron once the
+		// swap finishes (see `LockFileExists` in build/win32/positron.iss). It has to happen before
+		// the shutdown starts, because the app mutex the installer waits on is released during
+		// `onWillShutdown`, and the installer reads the flag as soon as that mutex clears.
+		await this.unlink(this.availableUpdate?.updateFilePath);
+	}
+
+	protected override async undoPrepareForQuitAndInstall(): Promise<void> {
+		// The quit was vetoed, so the user is staying in this session after all. Restore the flag so
+		// that a later plain quit does not relaunch Positron behind their back after the swap.
+		const updateFilePath = this.availableUpdate?.updateFilePath;
+		if (!updateFilePath) {
+			return;
+		}
+
+		try {
+			await pfs.Promises.writeFile(updateFilePath, 'flag');
+		} catch (err) {
+			this.logService.warn('update#undoPrepareForQuitAndInstall: failed to restore the update flag', err);
+		}
+	}
+	// --- End Positron ---
+
+	protected override doQuitAndInstall(): void {
+		// --- Start Positron ---
+		// A source build has nothing staged, so there is no installer to spawn. Log the version the
+		// real install would have used instead: this is the evidence that a restart installs
+		// whatever was latest at restart time, not the version that was pending when the update was
+		// first found.
+		if (this.devUpdateTesting) {
+			const update = (this.state.type === StateType.Ready || this.state.type === StateType.Restarting) ? this.state.update : undefined;
+			this.logService.info('update#doQuitAndInstall - dev update testing, would install', update?.productVersion, update?.version);
+			return;
+		}
+		// --- End Positron ---
+
+		if ((this.state.type !== StateType.Ready && this.state.type !== StateType.Restarting) || !this.availableUpdate) {
+			return;
+		}
+
+		this.logService.trace('update#quitAndInstall(): running raw#quitAndInstall()');
+
+		if (this.availableUpdate.updateFilePath) {
+			this.writeRelaunchArgumentsFile(this.cachePathSync, this.state.update.version);
+			try {
+				// --- Start Positron ---
+				// Normally already deleted by `prepareForQuitAndInstall()`. This remains the only
+				// deletion on the relaunch path, where `handleRelaunch()` calls us straight from
+				// `app.on('quit')`, which is after the app mutex has been released.
+				// --- End Positron ---
+				unlinkSync(this.availableUpdate.updateFilePath);
+			} catch {
+				// ignore
+			}
+		} else {
+			const installerArgs = ['/silent', '/log', '/mergetasks=runcode,!desktopicon,!quicklaunchicon'];
+
+			// --- Start Positron ---
+			// Pass the current install directory so Inno Setup does not fall back to
+			// the hardcoded default path when Positron was installed to a custom location.
+			installerArgs.push(`/DIR="${path.dirname(process.execPath)}"`);
+			// --- End Positron ---
+
+			// Preserve session defining arguments (e.g. --extensions-dir) across the installer relaunch (see #322663).
+			const relaunchArgsFilePath = this.writeRelaunchArgumentsFile(this.cachePathSync, this.state.update.version);
+			if (relaunchArgsFilePath) {
+				installerArgs.push(`/relaunchargs="${relaunchArgsFilePath}"`);
+			}
+
+			spawn(this.availableUpdate.packagePath, installerArgs, {
+				detached: true,
+				stdio: ['ignore', 'ignore', 'ignore'],
+				windowsVerbatimArguments: true,
+				env: { ...process.env, __COMPAT_LAYER: 'RunAsInvoker' }
+			});
+		}
+	}
+
+	private getRelaunchArgumentsFilePath(cachePath: string, version: string): string {
+		return path.join(cachePath, `${RELAUNCH_ARGUMENTS_FILE_PREFIX}${version}`);
+	}
+
+	/**
+	 * Writes the arguments from {@link getRelaunchArguments} to a file in the update cache and returns its path (or
+	 * `undefined` when there is nothing to carry forward). The installer reads it and passes the arguments to `Code.exe`.
+	 */
+	private writeRelaunchArgumentsFile(cachePath: string, version: string): string | undefined {
+		const relaunchArguments = getRelaunchArguments(this.environmentMainService.args, process.argv);
+		const relaunchArgsFilePath = this.getRelaunchArgumentsFilePath(cachePath, version);
+
+		if (!relaunchArguments) {
+			try {
+				unlinkSync(relaunchArgsFilePath); // remove any stale file from a previous relaunch
+			} catch {
+				// ignore
+			}
+			return undefined;
+		}
+
+		try {
+			writeFileSync(relaunchArgsFilePath, relaunchArguments);
+			return relaunchArgsFilePath;
+		} catch (err) {
+			this.logService.error('update#writeRelaunchArgumentsFile: failed to write relaunch arguments', err);
+			return undefined;
+		}
+	}
+
+	private async saveUpdateMetadata(update: IUpdate): Promise<void> {
+		try {
+			const cachePath = await this.cachePath;
+			const metadataPath = path.join(cachePath, 'update-metadata.json');
+			await pfs.Promises.writeFile(metadataPath, JSON.stringify(update));
+		} catch (e) {
+			this.logService.error('update#saveUpdateMetadata: failed to save', e);
+		}
+	}
+
+	private async loadUpdateMetadata(): Promise<IUpdate | undefined> {
+		try {
+			const cachePath = await this.cachePath;
+			const metadataPath = path.join(cachePath, 'update-metadata.json');
+			if (await pfs.Promises.exists(metadataPath)) {
+				const content = await readFile(metadataPath, 'utf8');
+				return JSON.parse(content);
+			}
+		} catch (e) {
+			this.logService.error('update#loadUpdateMetadata: failed to load', e);
+		}
+		return undefined;
+	}
+
+	protected override getUpdateType(): UpdateType {
+		return getWin32UpdateType(this.productService.target);
+	}
+
+	override async _applySpecificUpdate(packagePath: string, commit?: string): Promise<void> {
+		if (this.state.type !== StateType.Idle) {
+			return;
+		}
+
+		const fastUpdatesEnabled = this.configurationService.getValue('update.enableWindowsBackgroundUpdates');
+		const update: IUpdate = await this.loadUpdateMetadata() ?? { version: commit ?? 'unknown', productVersion: 'unknown' };
+
+		this.setState(State.Downloading(update, true, false));
+		this.availableUpdate = { packagePath };
+		this.setState(State.Downloaded(update, false, false));
+
+		if (fastUpdatesEnabled && this.productService.target === 'user') {
+			this.doApplyUpdate();
+		} else {
+			this.setState(State.Ready(update, false, false));
+		}
+	}
+
+	private isInstallerActive(mutex: typeof import('@vscode/windows-mutex')): boolean {
+		return mutex.isActive(this.updatingMutexName) || mutex.isActive(this.setupMutexName);
+	}
+
+	private async unlink(path: string | undefined): Promise<void> {
+		if (path) {
+			try {
+				await unlink(path);
+			} catch (err) {
+				const error = err as NodeJS.ErrnoException;
+				if (error && error.code === 'ENOENT') {
+					return;
+				} else {
+					this.logService.warn(`update#unlink: failed to unlink ${basename(path)}`, err);
+				}
+			}
+		}
+	}
+}

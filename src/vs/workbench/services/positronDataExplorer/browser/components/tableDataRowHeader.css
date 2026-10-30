@@ -1,0 +1,28 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2024-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
+ * Placeholder bar standing in for the row label while it loads. Centered like the label it stands
+ * in for, and sized as a fraction of the row headers so it tracks their width as the user resizes.
+ */
+.data-grid-row-header
+.content
+.label-placeholder {
+	width: 60%;
+	margin: 0 auto;
+}
+
+.data-grid-row-header
+.content
+.text {
+	font-size: 75%;
+	font-weight: 600;
+	overflow: hidden;
+	text-align: center;
+	margin: 0 4px 0 4px;
+	white-space: nowrap;
+	line-height: normal;
+	text-overflow: ellipsis;
+}

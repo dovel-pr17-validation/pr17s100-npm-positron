@@ -1,0 +1,47 @@
+name: "Upload Playwright Report to S3"
+description: "Configures AWS credentials and uploads the Playwright report to S3"
+inputs:
+  role-to-assume:
+    description: "The AWS role to assume"
+    required: true
+  report-dir:
+    description: "The path to the directory containing the Playwright report"
+    required: true
+  working-directory:
+    description: "The optional working directory to run the command in"
+    required: false
+    default: ""
+  source-dir:
+    description: "Directory to upload. Defaults to the Playwright report directory."
+    required: false
+    default: "playwright-report"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v6
+      if: ${{ !cancelled() }}
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: "us-east-1"
+
+    - name: Upload Playwright Report to S3 Bucket
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        WORKDIR=${{ inputs.working-directory }}
+        if [[ -n "$WORKDIR" ]]; then
+          cd "$WORKDIR"
+        fi
+        SOURCE_DIR="${{ inputs.source-dir }}"
+        if [[ -z "$SOURCE_DIR" ]]; then
+          echo "upload-report-to-s3: source-dir resolved to an empty string. Refusing to upload; this would otherwise become 'aws s3 cp \"/.\" ...' and ship the container root filesystem." >&2
+          exit 1
+        fi
+        REPORT_DIR="${{ inputs.report-dir }}"
+        if [[ -z "$REPORT_DIR" ]]; then
+          echo "upload-report-to-s3: report-dir resolved to an empty string. Refusing to upload; this would otherwise ship to the bucket root." >&2
+          exit 1
+        fi
+        aws s3 cp "$SOURCE_DIR/." "s3://positron-test-reports/$REPORT_DIR" --recursive

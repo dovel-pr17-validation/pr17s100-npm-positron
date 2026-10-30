@@ -1,0 +1,246 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2023-2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { Event } from '../../../../../base/common/event.js';
+import { IDisposable } from '../../../../../base/common/lifecycle.js';
+import { TableDataDataGridInstance } from '../tableDataDataGridInstance.js';
+import { DataExplorerClientInstance } from '../../../languageRuntime/common/languageRuntimeDataExplorerClient.js';
+import { TableSummaryDataGridInstance } from '../tableSummaryDataGridInstance.js';
+import { PositronDataExplorerLayout } from './positronDataExplorerService.js';
+import { CodeSyntaxName } from '../../../languageRuntime/common/positronDataExplorerComm.js';
+import { IDataImportView } from '../../common/positronDataImporterRegistry.js';
+
+/**
+ * Describes what a Data Explorer is showing, where its cursor is, and what is selected. Rows are
+ * identified by their labels and columns by their names.
+ */
+export interface IDataExplorerViewContext {
+	displayName: string;
+	shape: { rows: number; columns: number };
+	unfilteredShape: { rows: number; columns: number };
+	rowFilters: string[];
+	sortKeys: Array<{ column: string; ascending: boolean }>;
+	cursor?: { column: string; row: string };
+	selection?: {
+		kind: 'columns' | 'rows' | 'cells';
+		columnCount: number;
+		rowCount: number;
+		columns?: string[];
+		rows?: string[];
+		values?: string;
+	};
+}
+
+/**
+ * IPositronDataExplorerInstance interface.
+ */
+export interface IPositronDataExplorerInstance extends IDisposable {
+	/**
+	 * Gets the language name.
+	 */
+	readonly languageName: string;
+
+	/**
+	 * Gets the data explorer client instance.
+	 */
+	readonly dataExplorerClientInstance: DataExplorerClientInstance;
+
+	/**
+	 * Gets whether this instance backs an inline/embedded view (e.g. a notebook
+	 * cell output) whose comm is shared and runtime-owned. An editor tab opened
+	 * against such a comm must not dispose it on close.
+	 */
+	readonly isInline: boolean;
+
+	/**
+	 * Gets or sets the layout.
+	 */
+	layout: PositronDataExplorerLayout;
+
+	/**
+	 * Gets or sets a value which indicates whether the summary is collapsed.
+	 */
+	isSummaryCollapsed: boolean;
+
+	/**
+	 * Gets or sets the summary width in pixels.
+	 */
+	summaryWidth: number;
+
+	/**
+	 * Gets the TableSchemaDataGridInstance.
+	 */
+	readonly tableSchemaDataGridInstance: TableSummaryDataGridInstance;
+
+	/**
+	 * Gets the TableDataDataGridInstance.
+	 */
+	readonly tableDataDataGridInstance: TableDataDataGridInstance;
+
+	/**
+	 * Gets a value which indicates whether one or more columns are sorted.
+	 */
+	readonly isColumnSorting: boolean;
+
+	/**
+	 * The onDidClose event.
+	 */
+	readonly onDidClose: Event<void>;
+
+	/**
+	 * The onDidChangeLayout event.
+	 */
+	readonly onDidChangeLayout: Event<PositronDataExplorerLayout>;
+
+	/**
+	 * The onDidChangeSummaryWidth event.
+	 */
+	readonly onDidChangeSummaryWidth: Event<number>;
+
+	/**
+	 * The onDidRequestFocus event.
+	 */
+	readonly onDidRequestFocus: Event<void>;
+
+	/**
+	 * The onDidCollapseSummary event.
+	 */
+	readonly onDidCollapseSummary: Event<void>;
+
+	/**
+	 * The onDidExpandSummary event.
+	 */
+	readonly onDidExpandSummary: Event<void>;
+
+	/**
+	 * The onDidChangeColumnSorting event.
+	 */
+	readonly onDidChangeColumnSorting: Event<boolean>;
+
+	/**
+	 * Requests focus for the instance.
+	 */
+	requestFocus(): void;
+
+	/**
+	 * Collapses the summary.
+	 */
+	collapseSummary(): void;
+
+	/**
+	 * Expands the summary.
+	 */
+	expandSummary(): void;
+
+	/**
+	 * Clears column sorting.
+	 * @returns A Promise<void> that resolves when column sorting has been cleared.
+	 */
+	clearColumnSorting(): Promise<void>;
+
+	/**
+	 * Copies the selection or cursor cell to the clipboard.
+	 */
+	copyToClipboard(): Promise<void>;
+
+	/**
+	 * Copies the table data to the clipboard.
+	 */
+	copyTableDataToClipboard(): Promise<void>;
+
+	/**
+	 * Converts the current data view's filters and sorts to code in the desired syntax.
+	 */
+	convertToCode(desiredSyntax: CodeSyntaxName): Promise<string | undefined>;
+
+	/**
+	 * Applies file import options (header row and, for Excel workbooks, the
+	 * worksheet to read) and reloads the data. Only applicable for files opened
+	 * with the DuckDB backend.
+	 * @param options The file options to apply.
+	 */
+	applyFileOptions(options: { hasHeaderRow: boolean; sheetName?: string }): Promise<void>;
+
+	/**
+	 * Toggles the "has header row" option and reloads the data, preserving the
+	 * currently selected worksheet. Only applicable for files opened with DuckDB.
+	 */
+	toggleFileHasHeaderRow(): Promise<void>;
+
+	/**
+	 * Gets whether this Data Explorer's backend can rebuild its view from its source on request.
+	 */
+	readonly supportsRefresh: boolean;
+
+	/**
+	 * Gets whether a refresh is in progress.
+	 */
+	readonly isRefreshing: boolean;
+
+	/**
+	 * The onDidChangeRefreshing event, fired with the new value of isRefreshing.
+	 */
+	readonly onDidChangeRefreshing: Event<boolean>;
+
+	/**
+	 * Rebuilds the view from its source and reloads the data, keeping the current sort and
+	 * filters. A call made while a refresh is in progress joins it. A failure is reported to the
+	 * user and leaves the existing data in place.
+	 */
+	refresh(): Promise<void>;
+
+	/**
+	 * Whether this Data Explorer is backed by a file on disk (the DuckDB extension backend)
+	 * rather than a kernel object. File-backed explorers offer Import Data; kernel-backed
+	 * explorers offer Convert to Code.
+	 */
+	readonly isFileBacked: boolean;
+
+	/**
+	 * Builds the Import Data view of this explorer's current filters and sorts, with sort-key
+	 * column indexes resolved to names. Undefined when the view is empty (nothing beyond the raw
+	 * file) or the backend state has not arrived yet.
+	 */
+	getImportView(): Promise<IDataImportView | undefined>;
+
+	/**
+	 * Describes the current view, cursor, and selection, for providing context to the assistant.
+	 * Selected values are included only when the selection is small.
+	 */
+	getViewContext(): Promise<IDataExplorerViewContext>;
+
+	/**
+	 * Gets the current "has header row" state for delimited text files and Excel
+	 * workbooks.
+	 */
+	readonly fileHasHeaderRow: boolean;
+
+	/**
+	 * Gets the worksheet names available in the open Excel workbook, in workbook
+	 * order. Empty for non-Excel data sources.
+	 */
+	readonly fileAvailableSheets: string[];
+
+	/**
+	 * Gets the currently selected worksheet for an Excel workbook, or undefined
+	 * when no sheets are known. Defaults to the first available sheet.
+	 */
+	readonly fileSelectedSheet: string | undefined;
+
+	/**
+	 * The onDidChangeFileHasHeaderRow event.
+	 */
+	readonly onDidChangeFileHasHeaderRow: Event<boolean>;
+
+	/**
+	 * Sets the visibility state of the data explorer.
+	 * When not visible, expensive operations like data fetching and profile computation
+	 * are deferred until the explorer becomes visible again.
+	 * Implementations may be reference-counted when multiple editors share
+	 * the same data explorer instance.
+	 * @param visible Whether the data explorer is currently visible.
+	 */
+	setVisible(visible: boolean): void;
+}

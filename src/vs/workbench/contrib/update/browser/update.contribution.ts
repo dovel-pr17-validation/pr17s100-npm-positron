@@ -1,0 +1,404 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import '../../../../platform/update/common/update.config.contribution.js';
+import { localize, localize2 } from '../../../../nls.js';
+import { Registry } from '../../../../platform/registry/common/platform.js';
+import { IWorkbenchContributionsRegistry, Extensions as WorkbenchExtensions } from '../../../common/contributions.js';
+import { Categories } from '../../../../platform/action/common/actionCommonCategories.js';
+import { MenuId, registerAction2, Action2 } from '../../../../platform/actions/common/actions.js';
+import { ICommandService } from '../../../../platform/commands/common/commands.js';
+import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
+import { ProductContribution, UpdateContribution, CONTEXT_UPDATE_STATE, SwitchProductQualityContribution, showReleaseNotesInEditor, DefaultAccountUpdateContribution } from './update.js';
+import { UpdateTitleBarContribution } from './updateTitleBarEntry.js';
+import { PostUpdateWidgetContribution } from './postUpdateWidget.js';
+import { LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
+import product from '../../../../platform/product/common/product.js';
+import { IUpdateService, StateType } from '../../../../platform/update/common/update.js';
+import { IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import { isWindows, isMacintosh } from '../../../../base/common/platform.js';
+import { IFileDialogService } from '../../../../platform/dialogs/common/dialogs.js';
+import { mnemonicButtonLabel } from '../../../../base/common/labels.js';
+import { ShowCurrentReleaseNotesActionId, ShowCurrentReleaseNotesFromCurrentFileActionId } from '../common/update.js';
+import { IsWebContext } from '../../../../platform/contextkey/common/contextkeys.js';
+import { IOpenerService } from '../../../../platform/opener/common/opener.js';
+import { IProductService } from '../../../../platform/product/common/productService.js';
+import { URI } from '../../../../base/common/uri.js';
+
+// --- Start Positron ---
+import { IRuntimeSessionService } from '../../../services/runtimeSession/common/runtimeSessionService.js';
+// eslint-disable-next-line no-duplicate-imports
+import { IsDevelopmentContext } from '../../../../platform/contextkey/common/contextkeys.js';
+import { ContextKeyExpr } from '../../../../platform/contextkey/common/contextkey.js';
+// eslint-disable-next-line no-duplicate-imports
+import { storeLastUpdateVersion } from './update.js';
+// eslint-disable-next-line no-duplicate-imports
+import { isWeb } from '../../../../base/common/platform.js';
+import { INotificationService } from '../../../../platform/notification/common/notification.js';
+import { IPositronDocsService } from '../../../services/positronDocs/browser/positronDocsService.js';
+// --- End Positron ---
+
+const workbench = Registry.as<IWorkbenchContributionsRegistry>(WorkbenchExtensions.Workbench);
+
+workbench.registerWorkbenchContribution(ProductContribution, LifecyclePhase.Restored);
+workbench.registerWorkbenchContribution(UpdateContribution, LifecyclePhase.Restored);
+workbench.registerWorkbenchContribution(SwitchProductQualityContribution, LifecyclePhase.Restored);
+workbench.registerWorkbenchContribution(DefaultAccountUpdateContribution, LifecyclePhase.Eventually);
+workbench.registerWorkbenchContribution(UpdateTitleBarContribution, LifecyclePhase.Restored);
+workbench.registerWorkbenchContribution(PostUpdateWidgetContribution, LifecyclePhase.Restored);
+
+// Release notes
+
+export class ShowReleaseNotesAction extends Action2 {
+
+	static readonly AVAILABLE = !!product.releaseNotesUrl;
+
+	constructor() {
+		super({
+			id: ShowCurrentReleaseNotesActionId,
+			title: {
+				...localize2('showReleaseNotes', "Show Release Notes"),
+				mnemonicTitle: localize({ key: 'mshowReleaseNotes', comment: ['&& denotes a mnemonic'] }, "Show &&Release Notes"),
+			},
+			category: { value: product.nameShort, original: product.nameShort },
+			f1: true,
+			menu: [{
+				id: MenuId.MenubarHelpMenu,
+				group: '1_welcome',
+				order: 5,
+			}]
+		});
+	}
+
+	async run(accessor: ServicesAccessor, version?: string): Promise<void> {
+		const instantiationService = accessor.get(IInstantiationService);
+		const productService = accessor.get(IProductService);
+		// --- Start Positron ---
+		// const openerService = accessor.get(IOpenerService);
+		// In a web context (e.g. Posit Workbench), the local update service
+		// cannot serve release notes, so open the docs URL externally instead.
+		// IPositronDocsService honors POSITRON_DOCS_URL and otherwise falls
+		// back to the public Positron docs site.
+		if (isWeb) {
+			const openerService = accessor.get(IOpenerService);
+			const docsService = accessor.get(IPositronDocsService);
+			await openerService.open(URI.parse(docsService.getUrl('release-notes.html')));
+			return;
+		}
+
+		const targetVersion = version ?? productService.positronVersion;
+
+		try {
+			await showReleaseNotesInEditor(instantiationService, targetVersion, false);
+		} catch (err) {
+			throw new Error(localize('update.noReleaseNotesOnline', "This version of {0} does not have release notes available", productService.nameLong));
+		}
+		// --- End Positron ---
+	}
+}
+
+export class ShowCurrentReleaseNotesFromCurrentFileAction extends Action2 {
+
+	constructor() {
+		super({
+			id: ShowCurrentReleaseNotesFromCurrentFileActionId,
+			title: {
+				...localize2('showReleaseNotesCurrentFile', "Open Current File as Release Notes"),
+				mnemonicTitle: localize({ key: 'mshowReleaseNotes', comment: ['&& denotes a mnemonic'] }, "Show &&Release Notes"),
+			},
+			category: localize2('developerCategory', "Developer"),
+			f1: true,
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const instantiationService = accessor.get(IInstantiationService);
+		const productService = accessor.get(IProductService);
+
+		try {
+			// --- Start Positron ---
+			await showReleaseNotesInEditor(instantiationService, productService.positronVersion, true);
+			// --- End Positron ---
+		} catch (err) {
+			throw new Error(localize('releaseNotesFromFileNone', "Cannot open the current file as Release Notes"));
+		}
+	}
+}
+
+if (ShowReleaseNotesAction.AVAILABLE) {
+	registerAction2(ShowReleaseNotesAction);
+}
+registerAction2(ShowCurrentReleaseNotesFromCurrentFileAction);
+
+// Update
+
+export class CheckForUpdateAction extends Action2 {
+
+	constructor() {
+		super({
+			id: 'update.checkForUpdate',
+			title: localize2('checkForUpdates', 'Check for Updates...'),
+			category: { value: product.nameShort, original: product.nameShort },
+			f1: true,
+			// --- Start Positron ---
+			// Also allowed while an update is pending: the service then re-checks the feed for a
+			// build newer than the one already downloaded.
+			// precondition: CONTEXT_UPDATE_STATE.isEqualTo(StateType.Idle),
+			precondition: ContextKeyExpr.or(CONTEXT_UPDATE_STATE.isEqualTo(StateType.Idle), CONTEXT_UPDATE_STATE.isEqualTo(StateType.Ready)),
+			// --- End Positron ---
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const updateService = accessor.get(IUpdateService);
+		return updateService.checkForUpdates(true);
+	}
+}
+
+class DownloadUpdateAction extends Action2 {
+	constructor() {
+		super({
+			id: 'update.downloadUpdate',
+			title: localize2('downloadUpdate', 'Download Update'),
+			category: { value: product.nameShort, original: product.nameShort },
+			f1: true,
+			precondition: CONTEXT_UPDATE_STATE.isEqualTo(StateType.AvailableForDownload)
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		await accessor.get(IUpdateService).downloadUpdate(true);
+	}
+}
+
+class InstallUpdateAction extends Action2 {
+	constructor() {
+		super({
+			id: 'update.installUpdate',
+			title: localize2('installUpdate', 'Install Update'),
+			category: { value: product.nameShort, original: product.nameShort },
+			f1: true,
+			precondition: CONTEXT_UPDATE_STATE.isEqualTo(StateType.Downloaded)
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		await accessor.get(IUpdateService).applyUpdate();
+	}
+}
+
+class RestartToUpdateAction extends Action2 {
+	constructor() {
+		super({
+			id: 'update.restartToUpdate',
+			title: localize2('restartToUpdate', 'Restart to Update'),
+			category: { value: product.nameShort, original: product.nameShort },
+			f1: true,
+			precondition: CONTEXT_UPDATE_STATE.isEqualTo(StateType.Ready)
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		await accessor.get(IUpdateService).quitAndInstall();
+	}
+}
+
+class DownloadAction extends Action2 {
+
+	static readonly ID = 'workbench.action.download';
+	static readonly AVAILABLE = !!product.downloadUrl;
+
+	constructor() {
+		super({
+			id: DownloadAction.ID,
+			title: localize2('openDownloadPage', "Download {0}", product.nameLong),
+			precondition: IsWebContext, // Only show when running in a web browser
+			f1: true,
+			menu: [{
+				id: MenuId.StatusBarWindowIndicatorMenu,
+				when: IsWebContext
+			}]
+		});
+	}
+
+	run(accessor: ServicesAccessor): void {
+		const productService = accessor.get(IProductService);
+		const openerService = accessor.get(IOpenerService);
+
+		if (productService.downloadUrl) {
+			openerService.open(URI.parse(productService.downloadUrl));
+		}
+	}
+}
+
+// --- Start Positron ---
+class DeveloperRefreshLanguageUsage extends Action2 {
+	constructor() {
+		super({
+			id: 'update.updateLanguageUsage',
+			title: localize2('updateLanguageUsage', 'Update Language Usage'),
+			category: Categories.Developer,
+			f1: true
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const runtimeSessionService = accessor.get(IRuntimeSessionService);
+		runtimeSessionService.updateActiveLanguages();
+	}
+}
+
+registerAction2(DeveloperRefreshLanguageUsage);
+// --- End Positron ---
+
+if (DownloadAction.AVAILABLE) {
+	registerAction2(DownloadAction);
+}
+registerAction2(CheckForUpdateAction);
+registerAction2(DownloadUpdateAction);
+registerAction2(InstallUpdateAction);
+registerAction2(RestartToUpdateAction);
+
+if (isWindows) {
+	class DeveloperApplyUpdateAction extends Action2 {
+		constructor() {
+			super({
+				id: '_update.applyupdate',
+				title: localize2('applyUpdate', 'Apply Update from File...'),
+				category: Categories.Developer,
+				f1: true,
+				precondition: CONTEXT_UPDATE_STATE.isEqualTo(StateType.Idle)
+			});
+		}
+
+		async run(accessor: ServicesAccessor): Promise<void> {
+			const updateService = accessor.get(IUpdateService);
+			const fileDialogService = accessor.get(IFileDialogService);
+
+			const updatePath = await fileDialogService.showOpenDialog({
+				title: localize('pickUpdate', "Apply Update from File"),
+				filters: [{ name: 'Setup', extensions: ['exe'] }],
+				canSelectFiles: true,
+				openLabel: mnemonicButtonLabel(localize({ key: 'updateButton', comment: ['&& denotes a mnemonic'] }, "&&Update"))
+			});
+
+			if (!updatePath || !updatePath[0]) {
+				return;
+			}
+
+			await updateService._applySpecificUpdate(updatePath[0].fsPath);
+		}
+	}
+
+	registerAction2(DeveloperApplyUpdateAction);
+}
+
+// --- Start Positron ---
+class DeveloperSetLastUpdateVersion extends Action2 {
+	constructor() {
+		super({
+			id: 'update.setLastUpdateVersion',
+			title: localize2('setLastUpdateVersion', 'Set Last Update Version'),
+			category: Categories.Developer,
+			f1: true,
+			precondition: IsDevelopmentContext
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const quickInputService = accessor.get(IQuickInputService);
+		const productService = accessor.get(IProductService);
+		const notificationService = accessor.get(INotificationService);
+		const instantiationService = accessor.get(IInstantiationService);
+
+		const version = await quickInputService.input({
+			prompt: localize('enterVersion', "Enter version string"),
+			placeHolder: productService.positronVersion,
+			value: productService.positronVersion
+		});
+
+		if (version) {
+			instantiationService.invokeFunction((accessor) => {
+				storeLastUpdateVersion(accessor, version);
+			});
+		} else {
+			// notify with notification service that a version was not set
+			notificationService.warn(localize('noVersionSet', "No version was set"));
+		}
+	}
+}
+
+registerAction2(DeveloperSetLastUpdateVersion);
+
+if (isMacintosh || isWindows) {
+	/**
+	 * Stages the build advertised by an arbitrary feed document as the pending update, so the
+	 * "newer build shipped while an update was pending" flow can be tested against the real
+	 * channel feed without waiting for two builds to publish: stage an older, still-hosted build
+	 * here, then let the pending update re-check the channel feed and overwrite it.
+	 */
+	class DeveloperStagePendingUpdate extends Action2 {
+		constructor() {
+			super({
+				id: 'update.stagePendingUpdate',
+				title: localize2('stagePendingUpdate', 'Stage Pending Update from Feed URL...'),
+				category: Categories.Developer,
+				f1: true,
+				// From Ready the staged build replaces the pending one.
+				precondition: ContextKeyExpr.or(CONTEXT_UPDATE_STATE.isEqualTo(StateType.Idle), CONTEXT_UPDATE_STATE.isEqualTo(StateType.Ready))
+			});
+		}
+
+		async run(accessor: ServicesAccessor): Promise<void> {
+			const updateService = accessor.get(IUpdateService);
+			const quickInputService = accessor.get(IQuickInputService);
+			const productService = accessor.get(IProductService);
+
+			const feedUrl = await quickInputService.input({
+				prompt: localize('stagePendingUpdatePrompt', "URL of a releases.json document advertising the build to stage as the pending update"),
+				placeHolder: isWindows
+					? `${productService.updateUrl}/dailies/win/x86_64/${productService.target}-releases.json`
+					: `${productService.updateUrl}/dailies/mac/arm64/releases.json`,
+				validateInput: async value => {
+					try {
+						new URL(value);
+						return undefined;
+					} catch {
+						return localize('stagePendingUpdateInvalidUrl', "Enter a valid URL");
+					}
+				}
+			});
+
+			if (feedUrl) {
+				await updateService._stageUpdateFromFeed(feedUrl);
+			}
+		}
+	}
+
+	registerAction2(DeveloperStagePendingUpdate);
+}
+// --- End Positron ---
+
+registerAction2(class ShowUpdateInfoAction extends Action2 {
+	constructor() {
+		super({
+			id: 'update.showUpdateInfo',
+			title: localize2('showUpdateInfo', "Show Update Info"),
+			category: Categories.Developer,
+			f1: true,
+			precondition: IsWebContext.negate(),
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const commandService = accessor.get(ICommandService);
+		const quickInputService = accessor.get(IQuickInputService);
+		const markdown = await quickInputService.input({ prompt: localize('showUpdateInfo.prompt', "Enter markdown to render, or JSON with markdown/buttons (leave empty to load from URL)") });
+		if (markdown === undefined) {
+			return; // cancelled
+		}
+		await commandService.executeCommand('_update.showUpdateInfo', markdown || undefined);
+	}
+});

@@ -1,0 +1,122 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+// CSS.
+import './positronWelcomePage.css';
+
+// React.
+import { useEffect } from 'react';
+
+// Other dependencies.
+import { DisposableResizeObserver, getWindow } from '../../../../../base/browser/dom.js';
+import { PositronReactRenderer } from '../../../../../base/browser/positronReactRenderer.js';
+import { DomSlot } from './components/domSlot.js';
+import { EnvironmentHealthSection } from './components/environmentHealthSection.js';
+import { WalkthroughBanner } from './components/walkthroughBanner.js';
+import { WelcomeHeader } from './components/welcomeHeader.js';
+import { EnvironmentHealthLanguage } from './environmentHealth.js';
+import { IEnvironmentHealthService } from './environmentHealthService.js';
+
+/**
+ * PositronWelcomePageProps interface.
+ */
+export interface PositronWelcomePageProps {
+	/**
+	 * The "Recent" list. Built by the editor pane because it reuses the
+	 * existing GettingStartedIndexList widget.
+	 */
+	readonly recentList: HTMLElement;
+
+	/**
+	 * The "Show welcome page on startup" checkbox row. Built by the editor pane
+	 * because it reuses the existing Toggle widget and its telemetry.
+	 */
+	readonly footer: HTMLElement;
+
+	/**
+	 * Runs the environment health checks and holds their results. Built by the
+	 * editor pane, because it has to outlive this component: the pane rebuilds
+	 * the React tree whenever a walkthrough registers.
+	 */
+	readonly environmentHealthService: IEnvironmentHealthService;
+
+	/**
+	 * Whether each language group is expanded, for the groups the user opened or
+	 * closed themselves. A language with no entry has not been touched, so the
+	 * auto-expand rule decides for it.
+	 */
+	readonly expandedByLanguage: Map<EnvironmentHealthLanguage, boolean>;
+
+	/**
+	 * Called once the page is in the DOM. The editor pane uses this to attach
+	 * click handlers to the elements above, which it can only do after React
+	 * has mounted them.
+	 */
+	readonly onDidMount: () => void;
+
+	/**
+	 * Called whenever the rendered page changes size. The editor pane uses this
+	 * to update the dimensions cached by its scrollbar.
+	 */
+	readonly onDidChangeContentSize: () => void;
+}
+
+/**
+ * PositronWelcomePage component. The contents of the welcome page.
+ * @param props A PositronWelcomePageProps that contains the component properties.
+ * @returns The rendered component.
+ */
+export const PositronWelcomePage = (props: PositronWelcomePageProps) => {
+	const onDidMount = props.onDidMount;
+
+	// Runs after the DomSlot layout effects, so the slotted elements are in the
+	// DOM by the time the editor pane wires up its click handlers.
+	useEffect(() => {
+		onDidMount();
+	}, [onDidMount]);
+
+	// A fragment, not a wrapping div. createPositronWelcomePage puts the
+	// `positron-welcome-page` class on the container React roots into, so the
+	// layout lives on one element instead of two nested ones.
+	return (
+		<>
+			<WelcomeHeader />
+			<EnvironmentHealthSection environmentHealthService={props.environmentHealthService} expandedByLanguage={props.expandedByLanguage} />
+			<div className='positron-welcome-page-columns'>
+				<div className='positron-welcome-page-column-main'>
+					<DomSlot element={props.recentList} />
+				</div>
+				<WalkthroughBanner />
+			</div>
+			<DomSlot className='positron-welcome-page-footer' element={props.footer} />
+		</>
+	);
+};
+
+/**
+ * Renders the Positron welcome page into a container. The container becomes the
+ * page's layout element, so the caller can pass a bare div.
+ * @param container The container HTMLElement.
+ * @param props A PositronWelcomePageProps that contains the component properties.
+ * @returns The PositronReactRenderer. Dispose it to unmount the page.
+ */
+export const createPositronWelcomePage = (
+	container: HTMLElement,
+	props: PositronWelcomePageProps,
+	resizeObserverCtor: typeof ResizeObserver = getWindow(container).ResizeObserver
+): PositronReactRenderer => {
+	container.classList.add('positron-welcome-page');
+	const renderer = new PositronReactRenderer(container);
+	const resizeObserver = new DisposableResizeObserver(
+		'PositronWelcomePage.contentSize',
+		props.onDidChangeContentSize,
+		getWindow(container),
+		{ resizeObserverCtor }
+	);
+	renderer.register(resizeObserver);
+	renderer.register(resizeObserver.observe(container));
+	renderer.render(<PositronWelcomePage {...props} />);
+	return renderer;
+};
